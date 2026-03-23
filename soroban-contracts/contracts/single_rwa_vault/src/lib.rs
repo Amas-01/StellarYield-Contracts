@@ -145,6 +145,8 @@ impl SingleRWAVault {
     pub fn deposit(e: &Env, caller: Address, assets: i128, receiver: Address) -> i128 {
         caller.require_auth();
         require_not_paused(e);
+        require_not_blacklisted(e, &caller);
+        require_not_blacklisted(e, &receiver);
         require_kyc_verified(e, &caller);
         require_active_or_funding(e);
 
@@ -163,7 +165,6 @@ impl SingleRWAVault {
         update_user_snapshot(e, &receiver);
         put_user_deposited(e, &receiver, get_user_deposited(e, &receiver) + assets);
 
-        // Shares = assets (1:1 at start; yield accrual changes the price)
         let shares = preview_deposit(e, assets);
         transfer_asset_to_vault(e, &caller, assets);
         _mint(e, &receiver, shares);
