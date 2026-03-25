@@ -14,7 +14,6 @@ pub use crate::types::*;
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env, String, Vec};
-use soroban_sdk::xdr::ToXdr;
 
 use crate::errors::Error;
 use crate::events::*;
