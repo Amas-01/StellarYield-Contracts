@@ -38,6 +38,11 @@ pub struct SingleRWAVault;
 
 #[contractimpl]
 impl SingleRWAVault {
+    pub const FREEZE_DEPOSIT_MINT: u32 = 1;
+    pub const FREEZE_WITHDRAW_REDEEM: u32 = 2;
+    pub const FREEZE_YIELD: u32 = 4;
+    pub const FREEZE_ALL: u32 = Self::FREEZE_DEPOSIT_MINT | Self::FREEZE_WITHDRAW_REDEEM | Self::FREEZE_YIELD;
+
     // ─────────────────────────────────────────────────────────────────
     // Constructor
     // ─────────────────────────────────────────────────────────────────
@@ -102,6 +107,7 @@ impl SingleRWAVault {
         // Initial state
         put_vault_state(e, VaultState::Funding);
         put_paused(e, false);
+        put_freeze_flags(e, 0u32);
         put_locked(e, false);
         put_current_epoch(e, 0u32);
         put_total_yield_distributed(e, 0i128);
@@ -260,7 +266,7 @@ impl SingleRWAVault {
         // --- Checks ---
         require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_DEPOSIT_MINT);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &receiver);
         require_kyc_verified(e, &caller);
@@ -305,7 +311,7 @@ impl SingleRWAVault {
         // --- Checks ---
         require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_DEPOSIT_MINT);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &receiver);
         require_kyc_verified(e, &caller);
@@ -361,7 +367,7 @@ impl SingleRWAVault {
         // --- Checks ---
         require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &owner);
         require_not_blacklisted(e, &receiver);
@@ -413,7 +419,7 @@ impl SingleRWAVault {
         // --- Checks ---
         require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &owner);
         require_not_blacklisted(e, &receiver);
@@ -574,7 +580,7 @@ impl SingleRWAVault {
         // --- Checks ---
         require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_YIELD);
         // YieldOperator role required — also passes for FullOperator and admin.
         require_role(e, &caller, Role::YieldOperator);
         require_state(e, VaultState::Active);
@@ -611,7 +617,7 @@ impl SingleRWAVault {
         // --- Checks ---
         require_current_schema(e);
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_YIELD);
         require_active_or_matured(e);
         require_not_blacklisted(e, &caller);
 
@@ -648,7 +654,7 @@ impl SingleRWAVault {
         caller.require_auth();
         // --- Checks ---
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_YIELD);
         require_active_or_matured(e);
         require_not_blacklisted(e, &caller);
 
@@ -772,7 +778,7 @@ impl SingleRWAVault {
         caller.require_auth();
         // --- Checks ---
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_state(e, VaultState::Cancelled);
 
         let shares = get_share_balance(e, &caller);
@@ -908,7 +914,7 @@ impl SingleRWAVault {
         caller.require_auth();
         // --- Checks ---
         acquire_lock(e);
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_not_blacklisted(e, &caller);
         require_not_blacklisted(e, &owner);
         require_not_blacklisted(e, &receiver);
@@ -969,7 +975,7 @@ impl SingleRWAVault {
     /// Request early redemption (pending operator approval).
     pub fn request_early_redemption(e: &Env, caller: Address, shares: i128) -> u32 {
         caller.require_auth();
-        require_not_paused(e);
+        require_not_frozen(e, Self::FREEZE_WITHDRAW_REDEEM);
         require_not_closed(e);
         require_not_blacklisted(e, &caller);
 
@@ -1243,6 +1249,7 @@ impl SingleRWAVault {
         // TreasuryManager role required — also passes for FullOperator and admin.
         require_role(e, &caller, Role::TreasuryManager);
         put_paused(e, true);
+        put_freeze_flags(e, Self::FREEZE_ALL);
         emit_emergency_action(e, true, reason);
         bump_instance(e);
     }
@@ -1256,12 +1263,25 @@ impl SingleRWAVault {
         caller.require_auth();
         require_admin(e, &caller);
         put_paused(e, false);
+        put_freeze_flags(e, 0u32);
         emit_emergency_action(e, false, String::from_str(e, ""));
         bump_instance(e);
     }
 
     pub fn paused(e: &Env) -> bool {
         get_paused(e)
+    }
+
+    pub fn freeze_flags(e: &Env) -> u32 {
+        get_freeze_flags(e)
+    }
+
+    pub fn set_freeze_flags(e: &Env, caller: Address, flags: u32) {
+        caller.require_auth();
+        // TreasuryManager role required — also passes for FullOperator and admin.
+        require_role(e, &caller, Role::TreasuryManager);
+        put_freeze_flags(e, flags);
+        bump_instance(e);
     }
 
     /// Drain all vault assets to `recipient` and pause the vault.
@@ -1280,6 +1300,7 @@ impl SingleRWAVault {
 
         // --- Effects (pause before transferring) ---
         put_paused(e, true);
+        put_freeze_flags(e, Self::FREEZE_ALL);
         emit_emergency_action(
             e,
             true,
@@ -1734,7 +1755,7 @@ fn claim_yield_no_auth(e: &Env, caller: &Address) {
     // --- Checks ---
     require_current_schema(e);
     acquire_lock(e);
-    require_not_paused(e);
+    require_not_frozen(e, SingleRWAVault::FREEZE_YIELD);
     require_active_or_matured(e);
     require_not_blacklisted(e, caller);
 
@@ -1786,6 +1807,14 @@ fn require_role(e: &Env, caller: &Address, role: Role) {
 
 fn require_not_paused(e: &Env) {
     if get_paused(e) {
+        panic_with_error!(e, Error::VaultPaused);
+    }
+}
+
+fn require_not_frozen(e: &Env, flag: u32) {
+    let flags = get_freeze_flags(e);
+    if (flags & flag) != 0 {
+        // Reuse VaultPaused error for backwards compatibility with existing tests.
         panic_with_error!(e, Error::VaultPaused);
     }
 }
@@ -2021,6 +2050,9 @@ mod test_redemption;
 mod test_withdraw;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod test_freeze_flags;
 
 #[cfg(test)]
 mod test_close_vault;

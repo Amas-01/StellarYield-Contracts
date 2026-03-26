@@ -69,6 +69,7 @@ pub enum DataKey {
     // --- Vault state ---
     VaultState,
     Paused,
+    FreezeFlags,
     ActivationTimestamp,
     /// Reentrancy lock — true while a guarded function is executing.
     Locked,
@@ -263,6 +264,8 @@ instance_get!(get_vault_state, VaultState, VaultState);
 instance_put!(put_vault_state, VaultState, VaultState);
 instance_get!(get_paused, Paused, bool);
 instance_put!(put_paused, Paused, bool);
+instance_get!(get_freeze_flags, FreezeFlags, u32);
+instance_put!(put_freeze_flags, FreezeFlags, u32);
 instance_get!(get_locked, Locked, bool);
 instance_put!(put_locked, Locked, bool);
 
