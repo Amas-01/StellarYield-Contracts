@@ -13,6 +13,8 @@ mod fuzz_tests;
 mod test_funding_deadline;
 #[cfg(test)]
 mod test_lifecycle;
+#[cfg(test)]
+mod test_convert_erc4626;
 
 pub use crate::types::*;
 
@@ -448,6 +450,29 @@ impl SingleRWAVault {
     }
     pub fn preview_redeem(e: &Env, shares: i128) -> i128 {
         preview_redeem(e, shares)
+    }
+
+    // ERC-4626 pure conversion helpers (floor division)
+    // ─────────────────────────────────────────────────────────────────
+
+    pub fn convert_to_shares(e: &Env, assets: i128) -> i128 {
+        let supply = get_total_supply(e);
+        let ta = total_assets(e);
+        if supply == 0 || ta == 0 {
+            return assets;
+        }
+        // shares = assets * totalSupply / totalAssets (floor)
+        math::mul_div(e, assets, supply, ta)
+    }
+
+    pub fn convert_to_assets(e: &Env, shares: i128) -> i128 {
+        let supply = get_total_supply(e);
+        let ta = total_assets(e);
+        if supply == 0 {
+            return shares;
+        }
+        // assets = shares * totalAssets / totalSupply (floor)
+        math::mul_div(e, shares, ta, supply)
     }
 
     pub fn redemption_request(e: &Env, request_id: u32) -> RedemptionRequest {
