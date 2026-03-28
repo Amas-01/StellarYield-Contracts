@@ -83,6 +83,7 @@ fn make_vault(env: &Env) -> (Address, Address, Address, Address) {
             rwa_document_uri: String::from_str(env, "https://example.com"),
             rwa_category: String::from_str(env, "Bond"),
             expected_apy: 500u32,
+            timelock_delay: 172800u64, // 48 hours
         },),
     );
 

@@ -260,5 +260,6 @@ fn default_params(
         rwa_document_uri: String::from_str(env, "https://example.com/ustb26"),
         rwa_category: String::from_str(env, "Government Bond"),
         expected_apy: 500u32, // 5 %
+        timelock_delay: 172800u64, // 48 hours
     }
 }

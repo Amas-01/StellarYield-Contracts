@@ -1,6 +1,6 @@
 //! Shared types used across the SingleRWA_Vault contract.
 
-use soroban_sdk::{contracttype, Address, String};
+use soroban_sdk::{contracttype, Address, Env, String, Val, IntoVal, TryFromVal, Bytes};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Initialisation parameters struct
@@ -35,6 +35,9 @@ pub struct InitParams {
     pub rwa_document_uri: String,
     pub rwa_category: String,
     pub expected_apy: u32,
+    // Timelock configuration
+    /// Delay in seconds for critical admin operations (default: 48 hours)
+    pub timelock_delay: u64,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -94,7 +97,7 @@ pub struct RwaDetails {
 /// - `TreasuryManager`   → `pause`, `emergency_withdraw`
 /// - `FullOperator`      → all of the above (backward-compatible superrole)
 #[contracttype]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
     /// Can call `distribute_yield` only.
     YieldOperator,
@@ -161,6 +164,32 @@ pub struct UserEpochYield {
     pub claimed: bool,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Timelock mechanism for critical admin operations
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Types of critical operations that require timelock protection.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum ActionType {
+    EmergencyWithdraw,
+    TransferAdmin,
+    Upgrade,
+    WasmHashUpdate,
+}
+
+/// A timelocked action that delays execution of critical operations.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TimelockAction {
+    pub action_type: ActionType,
+    pub data: Bytes,
+    pub proposed_at: u64,
+    pub executable_at: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
 /// A pending multi-sig emergency withdrawal proposal.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -168,4 +197,5 @@ pub struct EmergencyProposal {
     pub recipient: Address,
     pub proposed_at: u64,
     pub executed: bool,
+}
 }

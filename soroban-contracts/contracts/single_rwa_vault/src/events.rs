@@ -206,6 +206,28 @@ pub fn emit_data_migrated(e: &Env, old_version: u32, new_version: u32) {
         .publish((symbol_short!("data_mig"), old_version, new_version), ());
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Timelock events
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Emitted when a timelock action is proposed.
+pub fn emit_action_proposed(e: &Env, action_id: u32, action_type: crate::types::ActionType, executable_at: u64) {
+    e.events()
+        .publish((symbol_short!("act_prp"), action_id), (action_type, executable_at));
+}
+
+/// Emitted when a timelock action is executed.
+pub fn emit_action_executed(e: &Env, action_id: u32, action_type: crate::types::ActionType) {
+    e.events()
+        .publish((symbol_short!("act_exec"), action_id), action_type);
+}
+
+/// Emitted when a timelock action is cancelled.
+pub fn emit_action_cancelled(e: &Env, action_id: u32, action_type: crate::types::ActionType) {
+    e.events()
+        .publish((symbol_short!("act_canc"), action_id), action_type);
+}
+
 /// Emitted by `propose_emergency_withdraw` — a new multi-sig proposal was created.
 pub fn emit_emergency_proposed(e: &Env, proposal_id: u32, proposer: Address, recipient: Address) {
     e.events().publish(
@@ -228,4 +250,5 @@ pub fn emit_emergency_executed(e: &Env, proposal_id: u32, recipient: Address, am
         (symbol_short!("emg_exec"), proposal_id),
         (recipient, amount),
     );
+}
 }

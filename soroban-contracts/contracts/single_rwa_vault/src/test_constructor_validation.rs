@@ -28,6 +28,7 @@ fn get_valid_params(e: &Env) -> InitParams {
         rwa_document_uri: String::from_str(e, "uri"),
         rwa_category: String::from_str(e, "cat"),
         expected_apy: 500,
+        timelock_delay: 172800u64, // 48 hours
     }
 }
 

@@ -62,8 +62,9 @@ mod test_withdraw;
 mod tests;
 
 pub use crate::types::*;
+pub use crate::storage::Key;
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, String, Vec, Val, TryIntoVal, Symbol};
 
 use crate::errors::Error;
 use crate::events::*;
@@ -168,6 +169,10 @@ impl SingleRWAVault {
         // Versioning
         put_contract_version(e, 1u32);
         put_storage_schema_version(e, 1u32);
+
+        // Timelock configuration
+        put_timelock_delay(e, params.timelock_delay);
+        put_timelock_counter(e, 0u32);
 
         e.storage()
             .instance()
@@ -1502,10 +1507,133 @@ impl SingleRWAVault {
     pub fn transfer_admin(e: &Env, caller: Address, new_admin: Address) {
         caller.require_auth();
         require_admin(e, &caller);
-        let old_admin = get_admin(e);
-        put_admin(e, new_admin.clone());
-        emit_admin_transferred(e, old_admin, new_admin);
+
+        // Transfer admin requires timelock - use propose_action instead
+        panic_with_error!(e, Error::TimelockAdminOnly);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Timelock functions
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Propose a timelock action for critical admin operations.
+    /// Returns the action ID.
+    pub fn propose_action(e: &Env, caller: Address, action_type: ActionType, data: soroban_sdk::Bytes) -> u32 {
+        caller.require_auth();
+        require_admin(e, &caller);
+
+        let current_time = e.ledger().timestamp();
+        let delay = get_timelock_delay(e);
+        let executable_at = current_time + delay;
+
+        let action_id = get_timelock_counter(e) + 1;
+        put_timelock_counter(e, action_id);
+
+        let action = TimelockAction {
+            action_type: action_type.clone(),
+            data,
+            proposed_at: current_time,
+            executable_at,
+            executed: false,
+            cancelled: false,
+        };
+
+        put_timelock_action(e, action_id, action);
+        emit_action_proposed(e, action_id, action_type, executable_at);
         bump_instance(e);
+
+        action_id
+    }
+
+    /// Execute a timelock action after the delay has passed.
+    pub fn execute_action(e: &Env, caller: Address, action_id: u32) {
+        caller.require_auth();
+        require_admin(e, &caller);
+
+        let mut action = get_timelock_action(e, action_id)
+            .unwrap_or_else(|| panic_with_error!(e, Error::TimelockActionNotFound));
+
+        if action.executed {
+            panic_with_error!(e, Error::TimelockActionAlreadyExecuted);
+        }
+        if action.cancelled {
+            panic_with_error!(e, Error::TimelockActionCancelled);
+        }
+        if e.ledger().timestamp() < action.executable_at {
+            panic_with_error!(e, Error::TimelockDelayNotPassed);
+        }
+
+        // Execute the action based on its type
+        match action.action_type {
+            ActionType::EmergencyWithdraw => {
+                // For now, we'll implement a simplified version
+                // TODO: Implement proper data deserialization when needed
+                panic_with_error!(e, Error::NotSupported);
+            }
+            ActionType::TransferAdmin => {
+                // For now, we'll implement a simplified version
+                // TODO: Implement proper data deserialization when needed
+                panic_with_error!(e, Error::NotSupported);
+            }
+            ActionType::Upgrade => {
+                // TODO: Implement upgrade functionality when needed
+                panic_with_error!(e, Error::NotSupported);
+            }
+            ActionType::WasmHashUpdate => {
+                // TODO: Implement WASM hash update functionality when needed
+                panic_with_error!(e, Error::NotSupported);
+            }
+        }
+
+        // Mark as executed
+        action.executed = true;
+        put_timelock_action(e, action_id, action);
+        emit_action_executed(e, action_id, action.action_type);
+        bump_instance(e);
+    }
+
+    /// Cancel a pending timelock action.
+    pub fn cancel_action(e: &Env, caller: Address, action_id: u32) {
+        caller.require_auth();
+        require_admin(e, &caller);
+
+        let mut action = get_timelock_action(e, action_id)
+            .unwrap_or_else(|| panic_with_error!(e, Error::TimelockActionNotFound));
+
+        if action.executed {
+            panic_with_error!(e, Error::TimelockActionAlreadyExecuted);
+        }
+        if action.cancelled {
+            panic_with_error!(e, Error::TimelockActionCancelled);
+        }
+
+        action.cancelled = true;
+        let action_type = action.action_type.clone();
+        put_timelock_action(e, action_id, action);
+        emit_action_cancelled(e, action_id, action_type);
+        bump_instance(e);
+    }
+
+    /// Get a timelock action by ID.
+    pub fn get_timelock_action(e: &Env, action_id: u32) -> Option<TimelockAction> {
+        crate::storage::get_timelock_action(e, action_id)
+    }
+
+    /// Internal emergency withdraw function (bypasses timelock when paused).
+    fn emergency_withdraw_internal(e: &Env, recipient: Address, amount: i128) {
+        if amount <= 0 {
+            panic_with_error!(e, Error::ZeroAmount);
+        }
+
+        let asset_address = get_asset(e);
+        let asset_client = soroban_sdk::token::Client::new(e, &asset_address);
+        let balance = asset_client.balance(&e.current_contract_address());
+
+        if amount > balance {
+            panic_with_error!(e, Error::InsufficientBalance);
+        }
+
+        asset_client.transfer(&e.current_contract_address(), &recipient, &amount);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1610,6 +1738,11 @@ impl SingleRWAVault {
 
         // TreasuryManager role required — also passes for FullOperator and admin.
         require_role(e, &caller, Role::TreasuryManager);
+
+        // Emergency withdraw bypasses timelock only when vault is already paused
+        if !get_paused(e) {
+            panic_with_error!(e, Error::TimelockAdminOnly);
+        }
 
         let balance = asset_balance_of_vault(e);
 
@@ -1817,7 +1950,7 @@ impl SingleRWAVault {
 
         let claim_amount = (emergency_balance * user_shares) / total_supply_snapshot;
 
-        put_has_claimed_emergency(e, &caller, true);
+        put_has_claimed_emergency(e, &caller);
         _burn(e, &caller, user_shares);
 
         if claim_amount > 0 {
@@ -2367,6 +2500,7 @@ mod test {
             rwa_document_uri: String::from_str(e, "https://example.com/doc"),
             rwa_category: String::from_str(e, "Bonds"),
             expected_apy: 500,
+            timelock_delay: 172800u64, // 48 hours
         };
 
         let vault_addr = e.register(SingleRWAVault, (params,));
@@ -2392,10 +2526,10 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "Error(Auth, InvalidAction)")]
     fn test_set_blacklisted_non_admin_fails() {
         let e = Env::default();
-        e.mock_all_auths();
+        // Don't mock all auths - we want auth to fail
         let (vault_addr, _admin, _asset) = create_vault(&e);
         let client = SingleRWAVaultClient::new(&e, &vault_addr);
 
@@ -2462,3 +2596,39 @@ mod test {
         client.deposit(&depositor, &10_0000000, &depositor);
     }
 }
+<<<<<<< HEAD
+
+#[cfg(test)]
+mod test_access_control;
+#[cfg(test)]
+mod test_constructor;
+#[cfg(test)]
+mod test_timelock;
+#[cfg(test)]
+pub mod test_helpers;
+#[cfg(test)]
+mod test_rbac;
+#[cfg(test)]
+mod test_redemption;
+#[cfg(test)]
+mod test_withdraw;
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod test_freeze_flags;
+
+#[cfg(test)]
+mod test_close_vault;
+#[cfg(test)]
+mod test_constructor_validation;
+#[cfg(test)]
+mod test_deposit_limits;
+#[cfg(test)]
+mod test_overflow;
+#[cfg(test)]
+mod test_rwa_setters;
+#[cfg(test)]
+mod test_token;
+=======
+>>>>>>> upstream/main

@@ -31,13 +31,12 @@ pub const BALANCE_BUMP_AMOUNT: u32 = 1069000;
 // Storage key enum
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[contracttype]
-#[derive(Clone)]
-pub enum DataKey {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Key {
     // --- Share token metadata ---
     ShareName,
-    ShareSymbol,
-    ShareDecimals,
+    ShrSymb,
+    ShrDec,
 
     // --- Asset ---
     Asset,
@@ -49,80 +48,193 @@ pub enum DataKey {
     Role(Address, Role),
 
     // --- zkMe ---
-    ZkmeVerifier,
-    Cooperator,
+    ZkmeVer,
+    Coop,
 
     // --- RWA details ---
     RwaName,
     RwaSymbol,
-    RwaDocumentUri,
-    RwaCategory,
-    ExpectedApy,
+    RwaDocUri,
+    RwaCat,
+    ExpApy,
 
     // --- Vault config ---
-    FundingTarget,
-    MaturityDate,
-    MinDeposit,
-    MaxDepositPerUser,
-    EarlyRedemptionFeeBps,
+    FundTgt,
+    MatDate,
+    MinDep,
+    MaxDepUsr,
+    ERedFee,
 
     // --- Vault state ---
-    VaultState,
+    VaultSt,
     Paused,
-    FreezeFlags,
-    ActivationTimestamp,
+    FrzFlags,
+    ActTimest,
     /// Reentrancy lock — true while a guarded function is executing.
     Locked,
     /// Unix timestamp deadline for funding; 0 means no deadline.
-    FundingDeadline,
+    FundDeadl,
 
     // --- Versioning ---
-    ContractVersion,
-    StorageSchemaVersion,
+    CtrVers,
+    StorSch,
 
     // --- Epoch / yield ---
-    CurrentEpoch,
-    TotalYieldDistributed,
-    EpochYield(u32),
-    EpochTotalShares(u32),
-    EpochTimestamp(u32),
-    TotalYieldClaimed(Address),
-    HasClaimedEpoch(Address, u32),
+    CurEpoch,
+    TotYield,
+    EpYield(u32),
+    EpTotShr(u32),
+    EpTimest(u32),
+    TotYldClm(Address),
+    HasClmEp(Address, u32),
     /// Cursor: the highest epoch at which all epochs ≤ cursor have been claimed.
     /// Allows pending_yield / claim_yield to scan only new epochs.
-    LastClaimedEpoch(Address),
+    LstClmEp(Address),
 
     // --- User share snapshots ---
-    UserSharesAtEpoch(Address, u32),
-    HasSnapshotForEpoch(Address, u32),
-    LastInteractionEpoch(Address),
+    UsrShrEp(Address, u32),
+    HasSnEp(Address, u32),
+    LstIntEp(Address),
 
     // --- Share token balances / allowances ---
     Balance(Address),
     Allowance(Address, Address), // (owner, spender)
-    TotalSupply,
+    TotSup,
 
     // --- User deposit tracking ---
-    UserDeposited(Address),
+    UsrDep(Address),
 
     // --- Total deposited principal ---
-    TotalDeposited,
+    TotDep,
 
     // --- Early redemption ---
-    RedemptionCounter,
-    RedemptionRequest(u32),
-    EscrowedShares(Address),
+    RedCnt,
+    RedReq(u32),
+    EscShr(Address),
 
     // --- Blacklist ---
-    Blacklisted(Address),
+    Blacklst(Address),
 
     // --- Transfer KYC gate ---
-    TransferRequiresKyc,
+    XferKyc,
 
     // --- Emergency pro-rata distribution ---
-    EmergencyBalance,
-    HasClaimedEmergency(Address),
-    EmergencyTotalSupplySnapshot,
+    EmgBal,
+    HasClmEmg(Address),
+    EmgTotSup,
+
+    // --- Timelock ---
+    TlkDelay,
+    TlkCount,
+    TlkAct(u32),
+}
+
+// Manual serialization for Key enum to avoid contracttype symbol length issues
+impl soroban_sdk::IntoVal<Env, soroban_sdk::Val> for Key {
+    fn into_val(&self, env: &Env) -> soroban_sdk::Val {
+        let n: u32 = match self {
+            Key::ShareName => 0,
+            Key::ShrSymb => 1,
+            Key::ShrDec => 2,
+            Key::Asset => 3,
+            Key::Admin => 4,
+            Key::Role(_, _) => 5,
+            Key::ZkmeVer => 6,
+            Key::Coop => 7,
+            Key::RwaName => 8,
+            Key::RwaSymbol => 9,
+            Key::RwaDocUri => 10,
+            Key::RwaCat => 11,
+            Key::ExpApy => 12,
+            Key::FundTgt => 13,
+            Key::MatDate => 14,
+            Key::MinDep => 15,
+            Key::MaxDepUsr => 16,
+            Key::ERedFee => 17,
+            Key::VaultSt => 18,
+            Key::Paused => 19,
+            Key::FrzFlags => 20,
+            Key::ActTimest => 21,
+            Key::Locked => 22,
+            Key::FundDeadl => 23,
+            Key::CtrVers => 24,
+            Key::StorSch => 25,
+            Key::CurEpoch => 26,
+            Key::TotYield => 27,
+            Key::EpYield(n) => 28 + *n,
+            Key::EpTotShr(n) => 29 + *n,
+            Key::EpTimest(n) => 30 + *n,
+            Key::TotYldClm(_) => 31,
+            Key::HasClmEp(_, _) => 32,
+            Key::LstClmEp(_) => 33,
+            Key::UsrShrEp(_, _) => 34,
+            Key::HasSnEp(_, _) => 35,
+            Key::LstIntEp(_) => 36,
+            Key::Balance(_) => 37,
+            Key::Allowance(_, _) => 38,
+            Key::TotSup => 39,
+            Key::UsrDep(_) => 40,
+            Key::TotDep => 41,
+            Key::RedCnt => 42,
+            Key::RedReq(n) => 43 + *n,
+            Key::EscShr(_) => 44,
+            Key::Blacklst(_) => 45,
+            Key::XferKyc => 46,
+            Key::EmgBal => 47,
+            Key::HasClmEmg(_) => 48,
+            Key::EmgTotSup => 49,
+            Key::TlkDelay => 50,
+            Key::TlkCount => 51,
+            Key::TlkAct(n) => 52 + *n,
+        };
+        n.into_val(env)
+    }
+}
+
+impl soroban_sdk::TryFromVal<Env, soroban_sdk::Val> for Key {
+    type Error = soroban_sdk::Error;
+    fn try_from_val(env: &Env, val: &soroban_sdk::Val) -> Result<Self, Self::Error> {
+        let n = u32::try_from_val(env, val)?;
+        match n {
+            0 => Ok(Key::ShareName),
+            1 => Ok(Key::ShrSymb),
+            2 => Ok(Key::ShrDec),
+            3 => Ok(Key::Asset),
+            4 => Ok(Key::Admin),
+            5 => Ok(Key::Role(Address::from_str(env, "0"), Role::FullOperator)),
+            6 => Ok(Key::ZkmeVer),
+            7 => Ok(Key::Coop),
+            8 => Ok(Key::RwaName),
+            9 => Ok(Key::RwaSymbol),
+            10 => Ok(Key::RwaDocUri),
+            11 => Ok(Key::RwaCat),
+            12 => Ok(Key::ExpApy),
+            13 => Ok(Key::FundTgt),
+            14 => Ok(Key::MatDate),
+            15 => Ok(Key::MinDep),
+            16 => Ok(Key::MaxDepUsr),
+            17 => Ok(Key::ERedFee),
+            18 => Ok(Key::VaultSt),
+            19 => Ok(Key::Paused),
+            20 => Ok(Key::FrzFlags),
+            21 => Ok(Key::ActTimest),
+            22 => Ok(Key::Locked),
+            23 => Ok(Key::FundDeadl),
+            24 => Ok(Key::CtrVers),
+            25 => Ok(Key::StorSch),
+            26 => Ok(Key::CurEpoch),
+            27 => Ok(Key::TotYield),
+            39 => Ok(Key::TotSup),
+            41 => Ok(Key::TotDep),
+            42 => Ok(Key::RedCnt),
+            46 => Ok(Key::XferKyc),
+            47 => Ok(Key::EmgBal),
+            49 => Ok(Key::EmgTotSup),
+            50 => Ok(Key::TlkDelay),
+            51 => Ok(Key::TlkCount),
+            _ => Err(soroban_sdk::Error::from_contract_error(1)),
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,7 +268,18 @@ pub fn bump_instance(e: &Env) {
 }
 
 pub fn bump_balance(e: &Env, addr: &Address) {
-    let key = DataKey::Balance(addr.clone());
+    let key = Key::Balance(addr.clone());
+    if e.storage().persistent().has(&key) {
+        e.storage()
+            .persistent()
+            .extend_ttl(&key, BALANCE_LIFETIME_THRESHOLD, BALANCE_BUMP_AMOUNT);
+    }
+}
+
+/// Extend the TTL for allowance entries to match balance lifetime thresholds.
+/// Call this whenever allowance data is written or read to prevent silent archival.
+pub fn bump_allowance(e: &Env, owner: &Address, spender: &Address) {
+    let key = Key::Allowance(owner.clone(), spender.clone());
     if e.storage().persistent().has(&key) {
         e.storage()
             .persistent()
@@ -188,9 +311,9 @@ pub fn bump_allowance(e: &Env, owner: &Address, spender: &Address) {
 #[allow(dead_code)]
 pub fn bump_user_data(e: &Env, addr: &Address, epoch: u32) {
     let epoch_keys = [
-        DataKey::HasClaimedEpoch(addr.clone(), epoch),
-        DataKey::UserSharesAtEpoch(addr.clone(), epoch),
-        DataKey::HasSnapshotForEpoch(addr.clone(), epoch),
+        Key::HasClmEp(addr.clone(), epoch),
+        Key::UsrShrEp(addr.clone(), epoch),
+        Key::HasSnEp(addr.clone(), epoch),
     ];
     for key in &epoch_keys {
         if e.storage().persistent().has(key) {
@@ -203,9 +326,9 @@ pub fn bump_user_data(e: &Env, addr: &Address, epoch: u32) {
     }
 
     let addr_keys = [
-        DataKey::TotalYieldClaimed(addr.clone()),
-        DataKey::LastInteractionEpoch(addr.clone()),
-        DataKey::LastClaimedEpoch(addr.clone()),
+        Key::TotYldClm(addr.clone()),
+        Key::LstIntEp(addr.clone()),
+        Key::LstClmEp(addr.clone()),
     ];
     for key in &addr_keys {
         if e.storage().persistent().has(key) {
@@ -226,14 +349,14 @@ pub fn bump_user_data(e: &Env, addr: &Address, epoch: u32) {
 macro_rules! instance_get {
     ($fn:ident, $key:ident, $ty:ty) => {
         pub fn $fn(e: &Env) -> $ty {
-            e.storage().instance().get(&DataKey::$key).unwrap()
+            e.storage().instance().get(&Key::$key).unwrap()
         }
     };
 }
 macro_rules! instance_put {
     ($fn:ident, $key:ident, $ty:ty) => {
         pub fn $fn(e: &Env, val: $ty) {
-            e.storage().instance().set(&DataKey::$key, &val);
+            e.storage().instance().set(&Key::$key, &val);
         }
     };
 }
@@ -241,10 +364,10 @@ macro_rules! instance_put {
 // Share token metadata
 instance_get!(get_share_name, ShareName, String);
 instance_put!(put_share_name, ShareName, String);
-instance_get!(get_share_symbol, ShareSymbol, String);
-instance_put!(put_share_symbol, ShareSymbol, String);
-instance_get!(get_share_decimals, ShareDecimals, u32);
-instance_put!(put_share_decimals, ShareDecimals, u32);
+instance_get!(get_share_symbol, ShrSymb, String);
+instance_put!(put_share_symbol, ShrSymb, String);
+instance_get!(get_share_decimals, ShrDec, u32);
+instance_put!(put_share_decimals, ShrDec, u32);
 
 // Asset
 instance_get!(get_asset, Asset, Address);
@@ -255,91 +378,91 @@ instance_get!(get_admin, Admin, Address);
 instance_put!(put_admin, Admin, Address);
 
 // zkMe
-instance_get!(get_zkme_verifier, ZkmeVerifier, Address);
-instance_put!(put_zkme_verifier, ZkmeVerifier, Address);
-instance_get!(get_cooperator, Cooperator, Address);
-instance_put!(put_cooperator, Cooperator, Address);
+instance_get!(get_zkme_verifier, ZkmeVer, Address);
+instance_put!(put_zkme_verifier, ZkmeVer, Address);
+instance_get!(get_cooperator, Coop, Address);
+instance_put!(put_cooperator, Coop, Address);
 
 // RWA
 instance_get!(get_rwa_name, RwaName, String);
 instance_put!(put_rwa_name, RwaName, String);
 instance_get!(get_rwa_symbol, RwaSymbol, String);
 instance_put!(put_rwa_symbol, RwaSymbol, String);
-instance_get!(get_rwa_document_uri, RwaDocumentUri, String);
-instance_put!(put_rwa_document_uri, RwaDocumentUri, String);
-instance_get!(get_rwa_category, RwaCategory, String);
-instance_put!(put_rwa_category, RwaCategory, String);
-instance_get!(get_expected_apy, ExpectedApy, u32);
-instance_put!(put_expected_apy, ExpectedApy, u32);
+instance_get!(get_rwa_document_uri, RwaDocUri, String);
+instance_put!(put_rwa_document_uri, RwaDocUri, String);
+instance_get!(get_rwa_category, RwaCat, String);
+instance_put!(put_rwa_category, RwaCat, String);
+instance_get!(get_expected_apy, ExpApy, u32);
+instance_put!(put_expected_apy, ExpApy, u32);
 
 // Config
-instance_get!(get_funding_target, FundingTarget, i128);
-instance_put!(put_funding_target, FundingTarget, i128);
-instance_get!(get_maturity_date, MaturityDate, u64);
-instance_put!(put_maturity_date, MaturityDate, u64);
+instance_get!(get_funding_target, FundTgt, i128);
+instance_put!(put_funding_target, FundTgt, i128);
+instance_get!(get_maturity_date, MatDate, u64);
+instance_put!(put_maturity_date, MatDate, u64);
 
 pub fn get_funding_deadline(e: &Env) -> u64 {
     e.storage()
         .instance()
-        .get(&DataKey::FundingDeadline)
+        .get(&Key::FundDeadl)
         .unwrap_or(0)
 }
 pub fn put_funding_deadline(e: &Env, val: u64) {
-    e.storage().instance().set(&DataKey::FundingDeadline, &val);
+    e.storage().instance().set(&Key::FundDeadl, &val);
 }
 
-instance_get!(get_min_deposit, MinDeposit, i128);
-instance_put!(put_min_deposit, MinDeposit, i128);
-instance_get!(get_max_deposit_per_user, MaxDepositPerUser, i128);
-instance_put!(put_max_deposit_per_user, MaxDepositPerUser, i128);
-instance_get!(get_early_redemption_fee_bps, EarlyRedemptionFeeBps, u32);
-instance_put!(put_early_redemption_fee_bps, EarlyRedemptionFeeBps, u32);
+instance_get!(get_min_deposit, MinDep, i128);
+instance_put!(put_min_deposit, MinDep, i128);
+instance_get!(get_max_deposit_per_user, MaxDepUsr, i128);
+instance_put!(put_max_deposit_per_user, MaxDepUsr, i128);
+instance_get!(get_early_redemption_fee_bps, ERedFee, u32);
+instance_put!(put_early_redemption_fee_bps, ERedFee, u32);
 
 // State
-instance_get!(get_vault_state, VaultState, VaultState);
-instance_put!(put_vault_state, VaultState, VaultState);
+instance_get!(get_vault_state, VaultSt, VaultState);
+instance_put!(put_vault_state, VaultSt, VaultState);
 instance_get!(get_paused, Paused, bool);
 instance_put!(put_paused, Paused, bool);
-instance_get!(get_freeze_flags, FreezeFlags, u32);
-instance_put!(put_freeze_flags, FreezeFlags, u32);
+instance_get!(get_freeze_flags, FrzFlags, u32);
+instance_put!(put_freeze_flags, FrzFlags, u32);
 instance_get!(get_locked, Locked, bool);
 instance_put!(put_locked, Locked, bool);
 
 pub fn get_activation_timestamp(e: &Env) -> u64 {
     e.storage()
         .instance()
-        .get(&DataKey::ActivationTimestamp)
+        .get(&Key::ActTimest)
         .unwrap_or(0)
 }
 pub fn put_activation_timestamp(e: &Env, val: u64) {
     e.storage()
         .instance()
-        .set(&DataKey::ActivationTimestamp, &val);
+        .set(&Key::ActTimest, &val);
 }
 
 // Epoch / yield (global)
-instance_get!(get_current_epoch, CurrentEpoch, u32);
-instance_put!(put_current_epoch, CurrentEpoch, u32);
-instance_get!(get_total_yield_distributed, TotalYieldDistributed, i128);
-instance_put!(put_total_yield_distributed, TotalYieldDistributed, i128);
+instance_get!(get_current_epoch, CurEpoch, u32);
+instance_put!(put_current_epoch, CurEpoch, u32);
+instance_get!(get_total_yield_distributed, TotYield, i128);
+instance_put!(put_total_yield_distributed, TotYield, i128);
 
 // TotalSupply
-instance_get!(get_total_supply, TotalSupply, i128);
-instance_put!(put_total_supply, TotalSupply, i128);
+instance_get!(get_total_supply, TotSup, i128);
+instance_put!(put_total_supply, TotSup, i128);
 
 // TotalDeposited (principal tracking)
-instance_get!(get_total_deposited, TotalDeposited, i128);
-instance_put!(put_total_deposited, TotalDeposited, i128);
+instance_get!(get_total_deposited, TotDep, i128);
+instance_put!(put_total_deposited, TotDep, i128);
 
 // RedemptionCounter
-instance_get!(get_redemption_counter, RedemptionCounter, u32);
-instance_put!(put_redemption_counter, RedemptionCounter, u32);
+instance_get!(get_redemption_counter, RedCnt, u32);
+instance_put!(put_redemption_counter, RedCnt, u32);
 
 // Versioning
-instance_get!(get_contract_version, ContractVersion, u32);
-instance_put!(put_contract_version, ContractVersion, u32);
-instance_get!(get_storage_schema_version, StorageSchemaVersion, u32);
-instance_put!(put_storage_schema_version, StorageSchemaVersion, u32);
+instance_get!(get_contract_version, CtrVers, u32);
+instance_put!(put_contract_version, CtrVers, u32);
+instance_get!(get_storage_schema_version, StorSch, u32);
+instance_put!(put_storage_schema_version, StorSch, u32);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Operator (instance storage — same lifetime as admin)
@@ -353,7 +476,7 @@ instance_put!(put_storage_schema_version, StorageSchemaVersion, u32);
 pub fn get_role(e: &Env, addr: &Address, role: Role) -> bool {
     e.storage()
         .instance()
-        .get(&DataKey::Role(addr.clone(), role))
+        .get(&Key::Role(addr.clone(), role))
         .unwrap_or(false)
 }
 
@@ -362,9 +485,9 @@ pub fn put_role(e: &Env, addr: Address, role: Role, val: bool) {
     if val {
         e.storage()
             .instance()
-            .set(&DataKey::Role(addr, role), &true);
+            .set(&Key::Role(addr, role), &true);
     } else {
-        e.storage().instance().remove(&DataKey::Role(addr, role));
+        e.storage().instance().remove(&Key::Role(addr, role));
     }
 }
 
@@ -391,37 +514,37 @@ pub fn put_operator(e: &Env, addr: Address, val: bool) {
 pub fn get_epoch_yield(e: &Env, epoch: u32) -> i128 {
     e.storage()
         .instance()
-        .get(&DataKey::EpochYield(epoch))
+        .get(&Key::EpYield(epoch))
         .unwrap_or(0)
 }
 pub fn put_epoch_yield(e: &Env, epoch: u32, val: i128) {
     e.storage()
         .instance()
-        .set(&DataKey::EpochYield(epoch), &val);
+        .set(&Key::EpYield(epoch), &val);
 }
 
 pub fn get_epoch_total_shares(e: &Env, epoch: u32) -> i128 {
     e.storage()
         .instance()
-        .get(&DataKey::EpochTotalShares(epoch))
+        .get(&Key::EpTotShr(epoch))
         .unwrap_or(0)
 }
 pub fn put_epoch_total_shares(e: &Env, epoch: u32, val: i128) {
     e.storage()
         .instance()
-        .set(&DataKey::EpochTotalShares(epoch), &val);
+        .set(&Key::EpTotShr(epoch), &val);
 }
 
 pub fn get_epoch_timestamp(e: &Env, epoch: u32) -> u64 {
     e.storage()
         .instance()
-        .get(&DataKey::EpochTimestamp(epoch))
+        .get(&Key::EpTimest(epoch))
         .unwrap_or(0)
 }
 pub fn put_epoch_timestamp(e: &Env, epoch: u32, val: u64) {
     e.storage()
         .instance()
-        .set(&DataKey::EpochTimestamp(epoch), &val);
+        .set(&Key::EpTimest(epoch), &val);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -444,13 +567,13 @@ pub struct AllowanceData {
 pub fn get_share_balance(e: &Env, addr: &Address) -> i128 {
     e.storage()
         .persistent()
-        .get(&DataKey::Balance(addr.clone()))
+        .get(&Key::Balance(addr.clone()))
         .unwrap_or(0)
 }
 pub fn put_share_balance(e: &Env, addr: &Address, val: i128) {
     e.storage()
         .persistent()
-        .set(&DataKey::Balance(addr.clone()), &val);
+        .set(&Key::Balance(addr.clone()), &val);
 }
 
 /// Returns the current allowance for `(owner, spender)`.
@@ -463,7 +586,7 @@ pub fn put_share_balance(e: &Env, addr: &Address, val: i128) {
 /// This ensures that active allowances remain available and don't unexpectedly
 /// return 0 due to storage archival.
 pub fn get_share_allowance(e: &Env, owner: &Address, spender: &Address) -> i128 {
-    let key = DataKey::Allowance(owner.clone(), spender.clone());
+    let key = Key::Allowance(owner.clone(), spender.clone());
     match e.storage().persistent().get::<_, AllowanceData>(&key) {
         Some(data) => {
             // Bump TTL on read to prevent silent archival of active allowances
@@ -487,7 +610,7 @@ pub fn get_share_allowance(e: &Env, owner: &Address, spender: &Address) -> i128 
 /// Uses standard BALANCE_LIFETIME_THRESHOLD/BALANCE_BUMP_AMOUNT to prevent
 /// silent archival, consistent with other persistent user data.
 pub fn put_share_allowance(e: &Env, owner: &Address, spender: &Address, new_amount: i128) {
-    let key = DataKey::Allowance(owner.clone(), spender.clone());
+    let key = Key::Allowance(owner.clone(), spender.clone());
     // Read back the expiration that was set when the allowance was approved.
     let expiration_ledger = e
         .storage()
@@ -519,7 +642,7 @@ pub fn put_share_allowance_with_expiry(
     amount: i128,
     expiration_ledger: u32,
 ) {
-    let key = DataKey::Allowance(owner.clone(), spender.clone());
+    let key = Key::Allowance(owner.clone(), spender.clone());
     e.storage().persistent().set(
         &key,
         &AllowanceData {
@@ -534,15 +657,15 @@ pub fn put_share_allowance_with_expiry(
 pub fn get_user_deposited(e: &Env, addr: &Address) -> i128 {
     e.storage()
         .persistent()
-        .get(&DataKey::UserDeposited(addr.clone()))
+        .get(&Key::UsrDep(addr.clone()))
         .unwrap_or(0)
 }
 pub fn put_user_deposited(e: &Env, addr: &Address, val: i128) {
     e.storage()
         .persistent()
-        .set(&DataKey::UserDeposited(addr.clone()), &val);
+        .set(&Key::UsrDep(addr.clone()), &val);
     e.storage().persistent().extend_ttl(
-        &DataKey::UserDeposited(addr.clone()),
+        &Key::UsrDep(addr.clone()),
         BALANCE_LIFETIME_THRESHOLD,
         BALANCE_BUMP_AMOUNT,
     );
@@ -551,11 +674,11 @@ pub fn put_user_deposited(e: &Env, addr: &Address, val: i128) {
 pub fn get_total_yield_claimed(e: &Env, addr: &Address) -> i128 {
     e.storage()
         .persistent()
-        .get(&DataKey::TotalYieldClaimed(addr.clone()))
+        .get(&Key::TotYldClm(addr.clone()))
         .unwrap_or(0)
 }
 pub fn put_total_yield_claimed(e: &Env, addr: &Address, val: i128) {
-    let key = DataKey::TotalYieldClaimed(addr.clone());
+    let key = Key::TotYldClm(addr.clone());
     e.storage().persistent().set(&key, &val);
     e.storage()
         .persistent()
@@ -565,11 +688,11 @@ pub fn put_total_yield_claimed(e: &Env, addr: &Address, val: i128) {
 pub fn get_last_claimed_epoch(e: &Env, addr: &Address) -> u32 {
     e.storage()
         .persistent()
-        .get(&DataKey::LastClaimedEpoch(addr.clone()))
+        .get(&Key::LstClmEp(addr.clone()))
         .unwrap_or(0)
 }
 pub fn put_last_claimed_epoch(e: &Env, addr: &Address, val: u32) {
-    let key = DataKey::LastClaimedEpoch(addr.clone());
+    let key = Key::LstClmEp(addr.clone());
     e.storage().persistent().set(&key, &val);
     e.storage()
         .persistent()
@@ -579,11 +702,11 @@ pub fn put_last_claimed_epoch(e: &Env, addr: &Address, val: u32) {
 pub fn get_has_claimed_epoch(e: &Env, addr: &Address, epoch: u32) -> bool {
     e.storage()
         .persistent()
-        .get(&DataKey::HasClaimedEpoch(addr.clone(), epoch))
+        .get(&Key::HasClmEp(addr.clone(), epoch))
         .unwrap_or(false)
 }
 pub fn put_has_claimed_epoch(e: &Env, addr: &Address, epoch: u32, val: bool) {
-    let key = DataKey::HasClaimedEpoch(addr.clone(), epoch);
+    let key = Key::HasClmEp(addr.clone(), epoch);
     e.storage().persistent().set(&key, &val);
     e.storage()
         .persistent()
@@ -593,11 +716,11 @@ pub fn put_has_claimed_epoch(e: &Env, addr: &Address, epoch: u32, val: bool) {
 pub fn get_user_shares_at_epoch(e: &Env, addr: &Address, epoch: u32) -> i128 {
     e.storage()
         .persistent()
-        .get(&DataKey::UserSharesAtEpoch(addr.clone(), epoch))
+        .get(&Key::UsrShrEp(addr.clone(), epoch))
         .unwrap_or(0)
 }
 pub fn put_user_shares_at_epoch(e: &Env, addr: &Address, epoch: u32, val: i128) {
-    let key = DataKey::UserSharesAtEpoch(addr.clone(), epoch);
+    let key = Key::UsrShrEp(addr.clone(), epoch);
     e.storage().persistent().set(&key, &val);
     e.storage()
         .persistent()
@@ -607,11 +730,11 @@ pub fn put_user_shares_at_epoch(e: &Env, addr: &Address, epoch: u32, val: i128) 
 pub fn get_has_snapshot_for_epoch(e: &Env, addr: &Address, epoch: u32) -> bool {
     e.storage()
         .persistent()
-        .get(&DataKey::HasSnapshotForEpoch(addr.clone(), epoch))
+        .get(&Key::HasSnEp(addr.clone(), epoch))
         .unwrap_or(false)
 }
 pub fn put_has_snapshot_for_epoch(e: &Env, addr: &Address, epoch: u32, val: bool) {
-    let key = DataKey::HasSnapshotForEpoch(addr.clone(), epoch);
+    let key = Key::HasSnEp(addr.clone(), epoch);
     e.storage().persistent().set(&key, &val);
     e.storage()
         .persistent()
@@ -621,11 +744,11 @@ pub fn put_has_snapshot_for_epoch(e: &Env, addr: &Address, epoch: u32, val: bool
 pub fn get_last_interaction_epoch(e: &Env, addr: &Address) -> u32 {
     e.storage()
         .persistent()
-        .get(&DataKey::LastInteractionEpoch(addr.clone()))
+        .get(&Key::LstIntEp(addr.clone()))
         .unwrap_or(0)
 }
 pub fn put_last_interaction_epoch(e: &Env, addr: &Address, val: u32) {
-    let key = DataKey::LastInteractionEpoch(addr.clone());
+    let key = Key::LstIntEp(addr.clone());
     e.storage().persistent().set(&key, &val);
     e.storage()
         .persistent()
@@ -639,15 +762,15 @@ pub fn put_last_interaction_epoch(e: &Env, addr: &Address, val: u32) {
 pub fn get_redemption_request(e: &Env, id: u32) -> RedemptionRequest {
     e.storage()
         .persistent()
-        .get(&DataKey::RedemptionRequest(id))
+        .get(&Key::RedReq(id))
         .unwrap_or_else(|| panic_with_error!(e, Error::InvalidRedemptionRequest))
 }
 pub fn put_redemption_request(e: &Env, id: u32, req: RedemptionRequest) {
     e.storage()
         .persistent()
-        .set(&DataKey::RedemptionRequest(id), &req);
+        .set(&Key::RedReq(id), &req);
     e.storage().persistent().extend_ttl(
-        &DataKey::RedemptionRequest(id),
+        &Key::RedReq(id),
         BALANCE_LIFETIME_THRESHOLD,
         BALANCE_BUMP_AMOUNT,
     );
@@ -656,12 +779,12 @@ pub fn put_redemption_request(e: &Env, id: u32, req: RedemptionRequest) {
 pub fn get_escrowed_shares(e: &Env, addr: &Address) -> i128 {
     e.storage()
         .persistent()
-        .get(&DataKey::EscrowedShares(addr.clone()))
+        .get(&Key::EscShr(addr.clone()))
         .unwrap_or(0)
 }
 
 pub fn put_escrowed_shares(e: &Env, addr: &Address, amount: i128) {
-    let key = DataKey::EscrowedShares(addr.clone());
+    let key = Key::EscShr(addr.clone());
     e.storage().persistent().set(&key, &amount);
     e.storage()
         .persistent()
@@ -678,14 +801,14 @@ pub fn put_escrowed_shares(e: &Env, addr: &Address, amount: i128) {
 pub fn get_transfer_requires_kyc(e: &Env) -> bool {
     e.storage()
         .instance()
-        .get(&DataKey::TransferRequiresKyc)
+        .get(&Key::XferKyc)
         .unwrap_or(true)
 }
 
 pub fn put_transfer_requires_kyc(e: &Env, val: bool) {
     e.storage()
         .instance()
-        .set(&DataKey::TransferRequiresKyc, &val);
+        .set(&Key::XferKyc, &val);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -695,16 +818,16 @@ pub fn put_transfer_requires_kyc(e: &Env, val: bool) {
 pub fn get_blacklisted(e: &Env, addr: &Address) -> bool {
     e.storage()
         .persistent()
-        .get(&DataKey::Blacklisted(addr.clone()))
+        .get(&Key::Blacklst(addr.clone()))
         .unwrap_or(false)
 }
 
 pub fn put_blacklisted(e: &Env, addr: &Address, status: bool) {
     e.storage()
         .persistent()
-        .set(&DataKey::Blacklisted(addr.clone()), &status);
+        .set(&Key::Blacklst(addr.clone()), &status);
     e.storage().persistent().extend_ttl(
-        &DataKey::Blacklisted(addr.clone()),
+        &Key::Blacklst(addr.clone()),
         BALANCE_LIFETIME_THRESHOLD,
         BALANCE_BUMP_AMOUNT,
     );
@@ -717,40 +840,82 @@ pub fn put_blacklisted(e: &Env, addr: &Address, status: bool) {
 pub fn get_emergency_balance(e: &Env) -> i128 {
     e.storage()
         .instance()
-        .get(&DataKey::EmergencyBalance)
+        .get(&Key::EmgBal)
         .unwrap_or(0)
 }
 
 pub fn put_emergency_balance(e: &Env, val: i128) {
-    e.storage().instance().set(&DataKey::EmergencyBalance, &val);
+    e.storage().instance().set(&Key::EmgBal, &val);
 }
 
 pub fn get_emergency_total_supply_snapshot(e: &Env) -> i128 {
     e.storage()
         .instance()
-        .get(&DataKey::EmergencyTotalSupplySnapshot)
+        .get(&Key::EmgTotSup)
         .unwrap_or(0)
 }
 
 pub fn put_emergency_total_supply_snapshot(e: &Env, val: i128) {
     e.storage()
         .instance()
-        .set(&DataKey::EmergencyTotalSupplySnapshot, &val);
+        .set(&Key::EmgTotSup, &val);
 }
 
 pub fn get_has_claimed_emergency(e: &Env, addr: &Address) -> bool {
     e.storage()
         .persistent()
-        .get(&DataKey::HasClaimedEmergency(addr.clone()))
+        .get(&Key::HasClmEmg(addr.clone()))
         .unwrap_or(false)
 }
 
-pub fn put_has_claimed_emergency(e: &Env, addr: &Address, val: bool) {
-    let key = DataKey::HasClaimedEmergency(addr.clone());
-    e.storage().persistent().set(&key, &val);
+pub fn put_has_claimed_emergency(e: &Env, addr: &Address) {
+    let key = Key::HasClmEmg(addr.clone());
+    e.storage().persistent().set(&key, &true);
+    bump_balance(e, addr);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Timelock storage functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub fn get_timelock_delay(e: &Env) -> u64 {
     e.storage()
-        .persistent()
-        .extend_ttl(&key, BALANCE_LIFETIME_THRESHOLD, BALANCE_BUMP_AMOUNT);
+        .instance()
+        .get(&Key::TlkDelay)
+        .unwrap_or(172800) // Default: 48 hours
+}
+
+pub fn put_timelock_delay(e: &Env, delay: u64) {
+    e.storage().instance().set(&Key::TlkDelay, &delay);
+}
+
+pub fn get_timelock_counter(e: &Env) -> u32 {
+    e.storage()
+        .instance()
+        .get(&Key::TlkCount)
+        .unwrap_or(0)
+}
+
+pub fn put_timelock_counter(e: &Env, counter: u32) {
+    e.storage().instance().set(&Key::TlkCount, &counter);
+}
+
+pub fn get_timelock_action(e: &Env, action_id: u32) -> Option<crate::types::TimelockAction> {
+    e.storage()
+        .instance()
+        .get(&Key::TlkAct(action_id))
+}
+
+pub fn put_timelock_action(e: &Env, action_id: u32, action: crate::types::TimelockAction) {
+    e.storage()
+        .instance()
+        .set(&Key::TlkAct(action_id), &action);
+}
+
+pub fn has_timelock_action(e: &Env, action_id: u32) -> bool {
+    e.storage()
+        .instance()
+        .has(&Key::TlkAct(action_id))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
