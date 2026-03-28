@@ -11,9 +11,9 @@ mod types;
 #[cfg(test)]
 mod fuzz_tests;
 #[cfg(test)]
-mod test_allowance_ttl;
-#[cfg(test)]
 mod test_access_control;
+#[cfg(test)]
+mod test_allowance_ttl;
 #[cfg(test)]
 mod test_burn_snapshot;
 #[cfg(test)]
@@ -63,10 +63,13 @@ mod test_withdraw;
 #[cfg(test)]
 mod tests;
 
-pub use crate::types::*;
 pub use crate::storage::Key;
+pub use crate::types::*;
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, String, Vec, Val, TryIntoVal, Symbol};
+use soroban_sdk::{
+    contract, contractimpl, panic_with_error, token, Address, Env, String, Symbol, TryIntoVal, Val,
+    Vec,
+};
 
 use crate::errors::Error;
 use crate::events::*;
@@ -1520,7 +1523,12 @@ impl SingleRWAVault {
 
     /// Propose a timelock action for critical admin operations.
     /// Returns the action ID.
-    pub fn propose_action(e: &Env, caller: Address, action_type: ActionType, data: soroban_sdk::Bytes) -> u32 {
+    pub fn propose_action(
+        e: &Env,
+        caller: Address,
+        action_type: ActionType,
+        data: soroban_sdk::Bytes,
+    ) -> u32 {
         caller.require_auth();
         require_admin(e, &caller);
 
@@ -2105,8 +2113,7 @@ impl SingleRWAVault {
         if get_transfer_requires_kyc(e) {
             require_kyc_verified(e, &to);
         }
-        update_user_snapshot(e, &from);
-        update_user_snapshot(e, &to);
+        update_user_snapshots_for_transfer(e, &from, &to);
         spend_share_balance(e, &from, amount);
         receive_share_balance(e, &to, amount);
         emit_transfer(e, from, to, amount);
@@ -2121,8 +2128,7 @@ impl SingleRWAVault {
         if get_transfer_requires_kyc(e) {
             require_kyc_verified(e, &to);
         }
-        update_user_snapshot(e, &from);
-        update_user_snapshot(e, &to);
+        update_user_snapshots_for_transfer(e, &from, &to);
         let allowance = get_share_allowance(e, &from, &spender);
         if allowance < amount {
             panic_with_error!(e, Error::InsufficientAllowance);
@@ -2313,6 +2319,13 @@ fn update_user_snapshot(e: &Env, user: &Address) {
     }
     put_last_interaction_epoch(e, user, current_epoch);
     bump_balance(e, user);
+}
+
+/// Refresh snapshots for both parties before moving shares (`transfer` / `transfer_from`).
+/// Order is `from` then `to` so each records their pre-transfer balance for epoch yield.
+fn update_user_snapshots_for_transfer(e: &Env, from: &Address, to: &Address) {
+    update_user_snapshot(e, from);
+    update_user_snapshot(e, to);
 }
 
 fn _get_user_shares_for_epoch(e: &Env, user: &Address, epoch: u32) -> i128 {
