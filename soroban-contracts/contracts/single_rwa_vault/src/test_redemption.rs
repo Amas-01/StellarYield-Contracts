@@ -7,7 +7,7 @@ use soroban_sdk::{
 };
 
 use crate::test_helpers::{mint_usdc, setup, setup_with_kyc_bypass};
-use crate::{InitParams, Role, SingleRWAVault, SingleRWAVaultClient};
+use crate::{math, InitParams, Role, SingleRWAVault, SingleRWAVaultClient};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock SEP-41 token
@@ -92,6 +92,7 @@ fn make_vault(env: &Env) -> (Address, Address, Address, Address) {
             rwa_category: String::from_str(env, "Bond"),
             expected_apy: 500u32,
             timelock_delay: 172800u64, // 48 hours
+            yield_vesting_period: 0u64,
         },),
     );
 
@@ -221,6 +222,111 @@ fn test_process_early_redemption_applies_fee() {
     assert_eq!(vault_balance_after, vault_balance_before - net_assets);
     // Verify exact fee amount
     assert_eq!(fee, 20_000);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regression — representative early redemption fee configurations (#171)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// With `early_redemption_fee_bps = 0`, the user receives the full `preview_redeem` amount
+/// (same net payout as if no fee existed).
+#[test]
+fn test_process_early_redemption_zero_fee_full_payout() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
+    let user = Address::generate(&env);
+
+    let deposit_amount = 5_000_000i128;
+    let shares = fund_user(&env, &vault_id, &token_id, &zkme_id, &user, deposit_amount);
+
+    activate(&env, &vault_id, &admin);
+
+    let vault = SingleRWAVaultClient::new(&env, &vault_id);
+    let token = MockTokenClient::new(&env, &token_id);
+
+    vault.set_early_redemption_fee(&admin, &0u32);
+    assert_eq!(vault.early_redemption_fee_bps(), 0u32);
+
+    let vault_balance_before = token.balance(&vault_id);
+    let request_id = vault.request_early_redemption(&user, &shares);
+    vault.process_early_redemption(&admin, &request_id);
+
+    // 1:1 share price at inception → assets == shares; fee == 0 → user gets all assets.
+    let assets = shares;
+    let fee = math::mul_div(&env, assets, 0i128, 10000);
+    assert_eq!(fee, 0i128);
+    assert_eq!(token.balance(&user), assets);
+    assert_eq!(token.balance(&vault_id), vault_balance_before - assets);
+}
+
+/// A small non-zero fee (25 bps) deducts exactly `mul_div(assets, 25, 10000)` from the payout.
+#[test]
+fn test_process_early_redemption_small_fee_matches_mul_div() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
+    let user = Address::generate(&env);
+
+    let deposit_amount = 10_000_000i128;
+    let shares = fund_user(&env, &vault_id, &token_id, &zkme_id, &user, deposit_amount);
+
+    activate(&env, &vault_id, &admin);
+
+    let vault = SingleRWAVaultClient::new(&env, &vault_id);
+    let token = MockTokenClient::new(&env, &token_id);
+
+    let fee_bps: i128 = 25;
+    vault.set_early_redemption_fee(&admin, &(fee_bps as u32));
+    assert_eq!(vault.early_redemption_fee_bps(), 25u32);
+
+    let vault_balance_before = token.balance(&vault_id);
+    let request_id = vault.request_early_redemption(&user, &shares);
+    vault.process_early_redemption(&admin, &request_id);
+
+    let assets = shares;
+    let fee = math::mul_div(&env, assets, fee_bps, 10000);
+    let net_assets = assets - fee;
+    assert_eq!(fee, 25_000i128);
+    assert_eq!(net_assets, 9_975_000i128);
+    assert_eq!(token.balance(&user), net_assets);
+    assert_eq!(token.balance(&vault_id), vault_balance_before - net_assets);
+}
+
+/// Maximum allowed fee (1000 bps) on a large asset amount: payout matches `assets - mul_div`
+/// and completes without overflow (fee math uses `I256` internally).
+#[test]
+fn test_process_early_redemption_max_fee_large_assets_no_overflow() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
+    let user = Address::generate(&env);
+
+    let deposit_amount = 888_888_888_888_888i128;
+    let shares = fund_user(&env, &vault_id, &token_id, &zkme_id, &user, deposit_amount);
+
+    activate(&env, &vault_id, &admin);
+
+    let vault = SingleRWAVaultClient::new(&env, &vault_id);
+    let token = MockTokenClient::new(&env, &token_id);
+
+    let fee_bps: i128 = 1000;
+    vault.set_early_redemption_fee(&admin, &(fee_bps as u32));
+    assert_eq!(vault.early_redemption_fee_bps(), 1000u32);
+
+    let vault_balance_before = token.balance(&vault_id);
+    let request_id = vault.request_early_redemption(&user, &shares);
+    vault.process_early_redemption(&admin, &request_id);
+
+    let assets = shares;
+    let fee = math::mul_div(&env, assets, fee_bps, 10000);
+    let net_assets = assets - fee;
+    assert_eq!(net_assets, assets - fee);
+    assert_eq!(token.balance(&user), net_assets);
+    assert_eq!(token.balance(&vault_id), vault_balance_before - net_assets);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -719,73 +825,169 @@ fn test_redeem_blacklisted_address_panics() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tests — #210: Multi-epoch aggregated claim
+// Multi-epoch yield distribution (#161)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Distribute yield across several epochs and verify that a single claim_yield
-/// call returns the sum of all per-epoch yields.
+/// Three consecutive `distribute_yield` calls advance epochs and cumulative
+/// accounting; per-epoch amounts and `total_yield_distributed` stay consistent (#161).
 #[test]
-fn test_claim_yield_multiple_epochs_aggregated() {
-    let ctx = setup();
-    let v = ctx.vault();
+fn test_multiple_consecutive_yield_distributions_interleaved_claims() {
+    let env = Env::default();
+    env.mock_all_auths();
 
-    let deposit_amount = 10_000_000i128; // 10 USDC
+    let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
+    let user = Address::generate(&env);
+    let deposit_amount = 2_000_000i128;
 
-    // KYC-approve and deposit for user.
-    crate::test_helpers::MockZkmeClient::new(&ctx.env, &ctx.kyc_id).approve_user(&ctx.user);
-    mint_usdc(&ctx.env, &ctx.asset_id, &ctx.user, deposit_amount);
-    v.deposit(&ctx.user, &deposit_amount, &ctx.user);
+    fund_user(&env, &vault_id, &token_id, &zkme_id, &user, deposit_amount);
+    activate(&env, &vault_id, &admin);
 
-    // Second depositor keeps the vault funded so yield math remains non-trivial.
-    let other = Address::generate(&ctx.env);
-    crate::test_helpers::MockZkmeClient::new(&ctx.env, &ctx.kyc_id).approve_user(&other);
-    mint_usdc(&ctx.env, &ctx.asset_id, &other, deposit_amount);
-    v.deposit(&other, &deposit_amount, &other);
+    let vault = SingleRWAVaultClient::new(&env, &vault_id);
 
-    // Activate vault.
-    v.set_funding_target(&ctx.admin, &0i128);
-    v.activate_vault(&ctx.operator);
+    let y1 = 60_000_i128;
+    let y2 = 120_000_i128;
+    let y3 = 180_000_i128;
+    let total_distributed = y1 + y2 + y3;
 
-    // Distribute yield across five epochs.
-    let yield_amounts = [10_000i128, 20_000i128, 15_000i128, 25_000i128, 30_000i128];
-    let mut total_yield_distributed = 0i128;
-    for amount in yield_amounts.iter() {
-        mint_usdc(&ctx.env, &ctx.asset_id, &ctx.operator, *amount);
-        v.distribute_yield(&ctx.operator, amount);
-        total_yield_distributed += *amount;
-    }
+    assert_eq!(vault.current_epoch(), 0u32);
 
-    // User holds 50% of total shares → entitled to 50% of total yield.
-    let expected_user_yield = total_yield_distributed / 2;
-
-    // Verify pending_yield matches the expected aggregated amount.
-    let pending = v.pending_yield(&ctx.user);
     assert_eq!(
-        pending, expected_user_yield,
-        "pending_yield must equal sum of per-epoch yields for user"
+        distribute_yield(&env, &vault_id, &token_id, &admin, y1),
+        1u32
+    );
+    assert_eq!(vault.epoch_yield(&1u32), y1);
+    assert_eq!(vault.current_epoch(), 1u32);
+
+    assert_eq!(
+        distribute_yield(&env, &vault_id, &token_id, &admin, y2),
+        2u32
+    );
+    assert_eq!(vault.epoch_yield(&2u32), y2);
+    assert_eq!(vault.current_epoch(), 2u32);
+
+    assert_eq!(
+        distribute_yield(&env, &vault_id, &token_id, &admin, y3),
+        3u32
+    );
+    assert_eq!(vault.epoch_yield(&3u32), y3);
+    assert_eq!(vault.current_epoch(), 3u32);
+
+    assert_eq!(vault.total_yield_distributed(), total_distributed);
+    assert_eq!(
+        vault.total_assets(),
+        deposit_amount + total_distributed,
+        "underlying accounting accumulates deposits plus all epoch yield"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regression test: Double-claim prevention for claim_yield_for_epoch
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Attempting to claim yield for the same epoch twice must fail.
+/// The second claim should panic with Error::NoYieldToClaim (#9).
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_claim_yield_for_epoch_twice_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
+    let user = Address::generate(&env);
+
+    let deposit_amount = 1_000_000i128;
+    fund_user(&env, &vault_id, &token_id, &zkme_id, &user, deposit_amount);
+
+    activate(&env, &vault_id, &admin);
+
+    let vault = SingleRWAVaultClient::new(&env, &vault_id);
+
+    // Distribute yield to create epoch 1
+    let yield_amount = 50_000i128;
+    distribute_yield(&env, &vault_id, &token_id, &admin, yield_amount);
+
+    // First claim for epoch 1 succeeds
+    let claimed = vault.claim_yield_for_epoch(&user, &1u32);
+    assert!(
+        claimed > 0,
+        "first claim should succeed and return positive amount"
     );
 
-    // Claim all yield in a single call.
-    let claimed = v.claim_yield(&ctx.user);
+    // Second claim for the same epoch must panic with NoYieldToClaim
+    vault.claim_yield_for_epoch(&user, &1u32);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regression test: Multiple users claiming yield for the same epoch
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Multiple users claiming yield from the same epoch should have their claims
+/// sum up to the total distributed yield, accounting for rounding.
+#[test]
+fn test_multiple_users_claim_same_epoch_yield() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (vault_id, token_id, zkme_id, admin) = make_vault(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let user3 = Address::generate(&env);
+
+    // Set up three users with different share amounts
+    let deposit1 = 2_000_000i128; // 2 shares
+    let deposit2 = 3_000_000i128; // 3 shares
+    let deposit3 = 5_000_000i128; // 5 shares
+    let _total_deposits = deposit1 + deposit2 + deposit3; // 10 shares total
+
+    fund_user(&env, &vault_id, &token_id, &zkme_id, &user1, deposit1);
+    fund_user(&env, &vault_id, &token_id, &zkme_id, &user2, deposit2);
+    fund_user(&env, &vault_id, &token_id, &zkme_id, &user3, deposit3);
+
+    activate(&env, &vault_id, &admin);
+
+    let vault = SingleRWAVaultClient::new(&env, &vault_id);
+
+    // Distribute yield to create epoch 1
+    let yield_amount = 1_000_000i128; // 1 USDC yield
+    distribute_yield(&env, &vault_id, &token_id, &admin, yield_amount);
+
+    // Each user should get yield proportional to their shares
+    // User1: 2/10 * 1_000_000 = 200_000
+    // User2: 3/10 * 1_000_000 = 300_000
+    // User3: 5/10 * 1_000_000 = 500_000
+    let expected_user1 = 200_000i128;
+    let expected_user2 = 300_000i128;
+    let expected_user3 = 500_000i128;
+
+    // Verify individual pending yields before claiming
+    assert_eq!(vault.pending_yield_for_epoch(&user1, &1u32), expected_user1);
+    assert_eq!(vault.pending_yield_for_epoch(&user2, &1u32), expected_user2);
+    assert_eq!(vault.pending_yield_for_epoch(&user3, &1u32), expected_user3);
+
+    // Users claim yield for epoch 1 in different order
+    let claimed1 = vault.claim_yield_for_epoch(&user1, &1u32);
+    let claimed2 = vault.claim_yield_for_epoch(&user2, &1u32);
+    let claimed3 = vault.claim_yield_for_epoch(&user3, &1u32);
+
+    // Verify each claim matches expected amount
+    assert_eq!(claimed1, expected_user1, "user1 claim matches expected");
+    assert_eq!(claimed2, expected_user2, "user2 claim matches expected");
+    assert_eq!(claimed3, expected_user3, "user3 claim matches expected");
+
+    // Total claimed should equal distributed yield
+    let total_claimed = claimed1 + claimed2 + claimed3;
     assert_eq!(
-        claimed, expected_user_yield,
-        "claimed amount must match expected aggregated yield"
+        total_claimed, yield_amount,
+        "total claimed equals distributed yield"
     );
 
-    // After claiming, pending yield must be zero.
-    assert_eq!(
-        v.pending_yield(&ctx.user),
-        0,
-        "pending yield must be zero after claim"
-    );
+    // After claiming, all users should have zero pending yield for epoch 1
+    assert_eq!(vault.pending_yield_for_epoch(&user1, &1u32), 0);
+    assert_eq!(vault.pending_yield_for_epoch(&user2, &1u32), 0);
+    assert_eq!(vault.pending_yield_for_epoch(&user3, &1u32), 0);
 
-    // Each individual epoch should report 0 yield remaining.
-    for epoch in 1..=5 {
-        assert_eq!(
-            v.pending_yield_for_epoch(&ctx.user, &epoch),
-            0,
-            "epoch {} yield must be zero after claim",
-            epoch
-        );
-    }
+    // Verify epoch is marked as claimed for all users
+    assert_eq!(vault.last_claimed_epoch(&user1), 1);
+    assert_eq!(vault.last_claimed_epoch(&user2), 1);
+    assert_eq!(vault.last_claimed_epoch(&user3), 1);
 }

@@ -451,4 +451,4 @@ panic!("This should never happen");
 - **Security concerns**: Email security@stellaryield.io
 - **General chat**: Join our Discord community
 
-Thank you for contributing to StellarYield! 🚀
+Thank you for contributing to StellarYield 🚀

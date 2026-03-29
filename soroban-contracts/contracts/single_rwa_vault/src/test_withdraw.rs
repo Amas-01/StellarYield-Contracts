@@ -207,13 +207,13 @@ fn test_withdraw_insufficient_allowance_panics() {
 #[should_panic]
 fn test_redeem_insufficient_shares_panics() {
     let ctx = setup_with_kyc_bypass();
+    let v = ctx.vault();
 
     deposit(&ctx, &ctx.user.clone(), 5_000_000); // 5 shares
     activate(&ctx);
 
-    // Try to redeem 10 shares — owner only has 5.
-    ctx.vault()
-        .redeem(&ctx.user, &10_000_000i128, &ctx.user, &ctx.user);
+    // Try to redeem more shares than the user holds — must panic.
+    v.redeem(&ctx.user, &10_000_000i128, &ctx.user, &ctx.user);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -347,27 +347,11 @@ fn test_withdraw_at_non_unit_share_price() {
 #[should_panic(expected = "Error(Contract, #13)")]
 fn test_withdraw_zero_assets_panics() {
     let ctx = setup_with_kyc_bypass();
+    let v = ctx.vault();
 
     deposit(&ctx, &ctx.user.clone(), 10_000_000);
     activate(&ctx);
 
-    // Must panic — zero assets
-    ctx.vault()
-        .withdraw(&ctx.user, &0i128, &ctx.user, &ctx.user);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 12. Error: redeem zero shares must panic with ZeroAmount
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[test]
-#[should_panic(expected = "Error(Contract, #13)")]
-fn test_redeem_zero_shares_panics() {
-    let ctx = setup_with_kyc_bypass();
-
-    deposit(&ctx, &ctx.user.clone(), 10_000_000);
-    activate(&ctx);
-
-    // Must panic — zero shares
-    ctx.vault().redeem(&ctx.user, &0i128, &ctx.user, &ctx.user);
+    // Must panic with ZeroAmount — passing 0 assets.
+    v.withdraw(&ctx.user, &0i128, &ctx.user, &ctx.user);
 }

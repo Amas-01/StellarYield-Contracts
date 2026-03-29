@@ -199,6 +199,7 @@ fn deploy_underfunded(funding_deadline: u64) -> (Env, Address, Address, Address,
         rwa_category: String::from_str(&env, "Government Bond"),
         expected_apy: 500u32,
         timelock_delay: 172800u64, // 48 hours
+        yield_vesting_period: 0u64,
     };
 
     let vault_id = env.register(SingleRWAVault, (params,));
@@ -245,7 +246,11 @@ fn test_underfunded_escrow_refund_behavior() {
         deposit1,
         "User 1 token balance did not increase by deposit amount"
     );
-    assert_eq!(vault.balance(&user1), 0, "User 1 share balance should be 0 after refund");
+    assert_eq!(
+        vault.balance(&user1),
+        0,
+        "User 1 share balance should be 0 after refund"
+    );
 
     // User 2 refunds.
     let returned2 = vault.refund(&user2);
@@ -256,7 +261,11 @@ fn test_underfunded_escrow_refund_behavior() {
         deposit2,
         "User 2 token balance did not increase by deposit amount"
     );
-    assert_eq!(vault.balance(&user2), 0, "User 2 share balance should be 0 after refund");
+    assert_eq!(
+        vault.balance(&user2),
+        0,
+        "User 2 share balance should be 0 after refund"
+    );
 
     // Verify vault token balance decreased by exactly the total deposits.
     let vault_bal_after = asset.balance(&vault_id);
@@ -267,7 +276,11 @@ fn test_underfunded_escrow_refund_behavior() {
     );
 
     // Verify total supply is 0 after all refunds.
-    assert_eq!(vault.total_supply(), 0, "Total supply should be 0 after all refunds");
+    assert_eq!(
+        vault.total_supply(),
+        0,
+        "Total supply should be 0 after all refunds"
+    );
 }
 
 /// Test: single user deposits below target, deadline passes, cancel_funding,
@@ -301,7 +314,11 @@ fn test_underfunded_single_user_refund_and_double_refund_prevented() {
         deposit,
         "User token balance should increase by deposit amount"
     );
-    assert_eq!(vault.balance(&user1), 0, "Share balance should be 0 after refund");
+    assert_eq!(
+        vault.balance(&user1),
+        0,
+        "Share balance should be 0 after refund"
+    );
 
     // Second refund should panic with NoSharesToRefund.
     // (We cannot use #[should_panic] here because we need setup logic before the panic,

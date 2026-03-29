@@ -341,7 +341,7 @@ fn test_deposit_exact_fill_succeeds() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #41)")]
+#[should_panic(expected = "Error(Contract, #46)")] // FundingTargetExceeded
 fn test_deposit_exceeds_funding_target_panics() {
     let ctx = setup_with_kyc_bypass();
     mint_usdc(&ctx.env, &ctx.asset_id, &ctx.user, 100_000_001);
