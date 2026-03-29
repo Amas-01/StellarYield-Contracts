@@ -910,9 +910,9 @@ fn test_claim_yield_for_epoch_twice_panics() {
     let claimed = vault.claim_yield_for_epoch(&user, &1u32);
     assert!(claimed > 0, "first claim should succeed and return positive amount");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Regression test: Zero-share users cannot claim yield
-// ─────────────────────────────────────────────────────────────────────────────
+    // Second claim for the same epoch must panic with NoYieldToClaim
+    vault.claim_yield_for_epoch(&user, &1u32);
+}
 
 /// Users who never deposited (zero shares) cannot claim any yield.
 /// claim_yield should return 0 and not panic.
