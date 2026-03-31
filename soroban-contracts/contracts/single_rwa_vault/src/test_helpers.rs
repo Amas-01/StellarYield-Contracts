@@ -107,6 +107,7 @@ mod _bypass {
         pub fn has_approved(_e: Env, _cooperator: Address, _user: Address) -> bool {
             true
         }
+        pub fn approve_user(_e: Env, _user: Address) {}
     }
 }
 pub use _bypass::AlwaysApproveZkme;
@@ -222,6 +223,14 @@ pub fn setup_with_kyc_bypass() -> TestContext {
 /// Mint `amount` of the mock USDC token to `recipient`.
 pub fn mint_usdc(env: &Env, asset_id: &Address, recipient: &Address, amount: i128) {
     MockUsdcClient::new(env, asset_id).mint(recipient, &amount);
+}
+
+/// Create a test user, grant KYC approval, and mint a default USDC balance.
+pub fn create_user_with_balance(ctx: &TestContext, balance: i128) -> Address {
+    let user = Address::generate(&ctx.env);
+    MockZkmeClient::new(&ctx.env, &ctx.kyc_id).approve_user(&user);
+    mint_usdc(&ctx.env, &ctx.asset_id, &user, balance);
+    user
 }
 
 /// Convert a human-readable amount into on-chain integer units.

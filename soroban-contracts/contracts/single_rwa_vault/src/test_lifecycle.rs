@@ -3,7 +3,7 @@
 //! Verifies the state machine: Funding -> Active -> Matured.
 //! Transitions require preconditions (funding target, maturity date) and guards (operator-only).
 
-use crate::test_helpers::{advance_time, mint_usdc, setup_with_kyc_bypass};
+use crate::test_helpers::{advance_time, mint_usdc, setup_with_kyc_bypass, create_user_with_balance};
 use crate::VaultState;
 use soroban_sdk::testutils::Ledger;
 
@@ -22,8 +22,8 @@ fn test_activate_vault_transitions_to_active() {
 
     // 2. Meet funding target (100 USDC in default_params)
     let amount = 100_000_000i128;
-    mint_usdc(&ctx.env, &ctx.asset_id, &ctx.user, amount);
-    v.deposit(&ctx.user, &amount, &ctx.user);
+    let user_a = create_user_with_balance(&ctx, amount);
+    v.deposit(&user_a, &amount, &user_a);
 
     assert!(v.is_funding_target_met());
 
@@ -54,6 +54,25 @@ fn test_mature_vault_transitions_to_matured() {
 
     // 4. Verify state
     assert_eq!(v.vault_state(), VaultState::Matured);
+}
+
+#[test]
+fn test_exact_funding_target_met_and_activated() {
+    let ctx = setup_with_kyc_bypass();
+    let v = ctx.vault();
+
+    let target = v.funding_target();
+
+    // User deposits exactly the target
+    let user_exact = create_user_with_balance(&ctx, target);
+    v.deposit(&user_exact, &target, &user_exact);
+
+    // Target exactly met, activate the vault
+    v.activate_vault(&ctx.operator);
+
+    // Verify final state and balances
+    assert_eq!(v.vault_state(), VaultState::Active);
+    assert_eq!(v.balance(&user_exact), target);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
