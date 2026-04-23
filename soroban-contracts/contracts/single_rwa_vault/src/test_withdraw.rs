@@ -317,9 +317,11 @@ fn test_redeem_at_non_unit_share_price() {
     // The virtual offset makes the calculation slightly different from exact 60
     // Just verify it's close to the expected amount (within 1M tolerance for 60M)
     assert!(
-        preview_assets >= expected_total_assets - 1_000_000 && preview_assets <= expected_total_assets,
+        preview_assets >= expected_total_assets - 1_000_000
+            && preview_assets <= expected_total_assets,
         "Preview should be close to expected with virtual offset: got {}, expected {}",
-        preview_assets, expected_total_assets
+        preview_assets,
+        expected_total_assets
     );
 
     // Actually redeem all shares; user should receive close to 60 USDC.
@@ -346,7 +348,7 @@ fn test_withdraw_at_non_unit_share_price() {
     let yield_amount = normalize_amount(40.0, 6);
     let withdraw_amount = normalize_amount(20.0, 6);
     let expected_shares = normalize_amount(10.0, 6);
-    let remaining_shares = normalize_amount(30.0, 6);
+    let _remaining_shares = normalize_amount(30.0, 6);
 
     // 40 USDC → 40 shares.
     deposit(&ctx, &ctx.user.clone(), deposit_amount);
@@ -365,7 +367,8 @@ fn test_withdraw_at_non_unit_share_price() {
     assert!(
         shares_needed >= expected_shares - 200_000 && shares_needed <= expected_shares + 200_000,
         "Shares needed should be close to expected with virtual offset: got {}, expected {}",
-        shares_needed, expected_shares
+        shares_needed,
+        expected_shares
     );
 
     let shares_burned = v.withdraw(&ctx.user, &withdraw_amount, &ctx.user, &ctx.user);
