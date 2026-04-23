@@ -277,3 +277,58 @@ fn test_yield_distribution_succeeds_in_active_state() {
     // let user_shares_after = v.balance(&ctx.user);
     // assert!(user_shares_after > user_shares_before);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #172: Max u128 Safety Around Deposits
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_large_value_deposit_does_not_overflow() {
+    let ctx = setup_with_kyc_bypass();
+    let v = ctx.vault();
+
+    let large_amount = i128::MAX / 4;
+
+    let user_a = create_user_with_balance(&ctx, large_amount);
+    v.deposit(&user_a, &large_amount, &user_a);
+
+    let user_b = create_user_with_balance(&ctx, large_amount);
+    v.deposit(&user_b, &large_amount, &user_b);
+
+    // Instead of total_deposited(), validate via balances
+    let balance_a = v.balance(&user_a);
+    let balance_b = v.balance(&user_b);
+
+    assert_eq!(balance_a, large_amount);
+    assert_eq!(balance_b, large_amount);
+
+    // Optional stronger invariant:
+    let combined = balance_a + balance_b;
+    assert!(combined >= large_amount); // avoids overflow assertion risk
+}
+
+#[test]
+fn test_large_value_mint_does_not_overflow() {
+    let ctx = setup_with_kyc_bypass();
+    let v = ctx.vault();
+
+    // Large share amount
+    let large_shares = i128::MAX / 4;
+
+    // Give caller enough underlying asset
+    let user = create_user_with_balance(&ctx, large_shares);
+
+    // Mint shares (internally computes assets)
+    let assets_used = v.mint(&user, &large_shares, &user);
+
+    // Basic sanity checks
+    assert!(assets_used > 0);
+    assert_eq!(v.balance(&user), large_shares);
+
+    // Perform another mint to push totals higher
+    let user2 = create_user_with_balance(&ctx, large_shares);
+    let assets_used_2 = v.mint(&user2, &large_shares, &user2);
+
+    assert!(assets_used_2 > 0);
+    assert_eq!(v.balance(&user2), large_shares);
+}
