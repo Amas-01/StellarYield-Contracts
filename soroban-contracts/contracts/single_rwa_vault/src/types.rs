@@ -27,6 +27,7 @@ pub struct InitParams {
     pub min_deposit: i128,
     pub max_deposit_per_user: i128,
     pub early_redemption_fee_bps: u32,
+    pub operator_fee_bps: u32,
     /// Unix timestamp after which funding can be cancelled if target not met.
     pub funding_deadline: u64,
     // RWA details
@@ -184,6 +185,15 @@ pub struct UserEpochYield {
     pub claimed: bool,
 }
 
+/// Result of a single user's redemption preflight check.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RedemptionPreflight {
+    pub user: Address,
+    pub shares: i128,
+    pub assets_out: i128,
+    pub can_redeem: bool,
+    pub reason: String,
 /// Composite epoch metadata for efficient indexer queries.
 /// Returns yield, total shares, and timestamp in a single call.
 #[contracttype]

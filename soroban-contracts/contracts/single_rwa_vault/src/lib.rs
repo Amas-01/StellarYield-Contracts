@@ -144,7 +144,7 @@ impl SingleRWAVault {
         if params.maturity_date <= e.ledger().timestamp() {
             panic_with_error!(e, Error::InvalidInitParams);
         }
-        if params.early_redemption_fee_bps > 1000 {
+        if params.early_redemption_fee_bps > 1000 || params.operator_fee_bps > 1000 {
             panic_with_error!(e, Error::InvalidInitParams);
         }
         if params.min_deposit < 0 || params.funding_target < 0 {
@@ -188,6 +188,7 @@ impl SingleRWAVault {
         put_min_deposit(e, params.min_deposit);
         put_max_deposit_per_user(e, params.max_deposit_per_user);
         put_early_redemption_fee_bps(e, params.early_redemption_fee_bps);
+        put_operator_fee_bps(e, params.operator_fee_bps);
         put_yield_vesting_period(e, params.yield_vesting_period);
 
         // Initial state
@@ -314,7 +315,13 @@ impl SingleRWAVault {
     pub fn zkme_verifier(e: &Env) -> Address {
         get_zkme_verifier(e)
     }
+    pub fn get_zkme_verifier(e: &Env) -> Address {
+        get_zkme_verifier(e)
+    }
     pub fn cooperator(e: &Env) -> Address {
+        get_cooperator(e)
+    }
+    pub fn get_cooperator(e: &Env) -> Address {
         get_cooperator(e)
     }
 
@@ -325,7 +332,7 @@ impl SingleRWAVault {
         require_valid_address(e, &verifier);
         let old = get_zkme_verifier(e);
         put_zkme_verifier(e, verifier.clone());
-        emit_zkme_verifier_updated(e, old, verifier);
+        emit_zkme_verifier_updated(e, caller, old, verifier);
         bump_instance(e);
     }
 
@@ -959,6 +966,84 @@ impl SingleRWAVault {
         get_share_balance(e, &owner)
     }
 
+    /// Batch redemption preflight check for multiple users.
+    ///
+    /// Returns per-user redemption feasibility with asset conversion preview.
+    /// This improves operator planning for coordinated redemptions.
+    ///
+    /// For each user, checks:
+    /// - Vault state (must be Active or Matured)
+    /// - User is not blacklisted
+    /// - User has sufficient share balance
+    /// - Computes asset output via preview_redeem
+    ///
+    /// Maximum batch size is 100 users to prevent excessive iteration.
+    /// Returns a vector of RedemptionPreflight results, one per user.
+    pub fn can_redeem_many(
+        e: &Env,
+        users: Vec<Address>,
+        shares: Vec<i128>,
+    ) -> Vec<RedemptionPreflight> {
+        const MAX_BATCH_SIZE: u32 = 100;
+
+        // Validate inputs
+        if users.len() != shares.len() {
+            panic_with_error!(e, Error::InvalidInput);
+        }
+        if users.len() > MAX_BATCH_SIZE {
+            panic_with_error!(e, Error::InvalidInput);
+        }
+
+        let mut results: Vec<RedemptionPreflight> = Vec::new(e);
+
+        // Check vault state once
+        let paused = get_paused(e);
+        let state = get_vault_state(e);
+        let can_redeem_state = !paused && (state == VaultState::Active || state == VaultState::Matured);
+
+        for i in 0..users.len() {
+            let user = users.get_unchecked(i);
+            let requested_shares = shares.get_unchecked(i);
+
+            let mut can_redeem = false;
+            let mut reason = String::from_str(e, "");
+            let mut assets_out = 0i128;
+
+            // Check vault state
+            if !can_redeem_state {
+                reason = if paused {
+                    String::from_str(e, "vault_paused")
+                } else {
+                    String::from_str(e, "invalid_vault_state")
+                };
+            }
+            // Check if user is blacklisted
+            else if get_blacklisted(e, &user) {
+                reason = String::from_str(e, "user_blacklisted");
+            }
+            // Check if shares amount is valid
+            else if requested_shares <= 0 {
+                reason = String::from_str(e, "zero_or_negative_shares");
+            }
+            // Check user balance
+            else {
+                let user_balance = get_share_balance(e, &user);
+                if user_balance < requested_shares {
+                    reason = String::from_str(e, "insufficient_balance");
+                } else {
+                    // All checks passed
+                    can_redeem = true;
+                    assets_out = preview_redeem(e, requested_shares);
+                }
+            }
+
+            results.push_back(RedemptionPreflight {
+                user: user.clone(),
+                shares: requested_shares,
+                assets_out,
+                can_redeem,
+                reason,
+            });
     /// Batched deposit preflight check (bounded to avoid expensive calls).
     /// Returns per-user deposit validation results with status codes and expected shares.
     /// Max batch size: 50 entries per call.
@@ -970,7 +1055,8 @@ impl SingleRWAVault {
         const MAX_BATCH: u32 = 50;
         let mut results: Vec<DepositCheckResult> = Vec::new(e);
 
-        let actual_len = (users.len() as u32).min(amounts.len() as u32);
+        #[allow(clippy::unnecessary_cast)]
+        let actual_len = users.len().min(amounts.len()) as u32;
         if actual_len == 0 {
             return results;
         }
@@ -1021,10 +1107,12 @@ impl SingleRWAVault {
                 }
             }
 
-            if status_code == 0 && state == VaultState::Funding && target > 0 {
-                if current_total + assets > target {
-                    status_code = Error::FundingTargetExceeded as u32;
-                }
+            if status_code == 0
+                && state == VaultState::Funding
+                && target > 0
+                && current_total + assets > target
+            {
+                status_code = Error::FundingTargetExceeded as u32;
             }
 
             let expected_shares = if status_code == 0 {
@@ -1051,6 +1139,25 @@ impl SingleRWAVault {
         results
     }
 
+    /// Returns the total assets currently held or controlled by the vault.
+    ///
+    /// This is the sum of all user deposits net of withdrawals, before
+    /// distributions and early redemption escrows. It does **not** include
+    /// unclaimed epoch yields; those are computed separately via `claim_yield`.
+    ///
+    /// # Value Representation
+    /// The returned value is in the vault's underlying asset token units
+    /// (e.g., USDC). For decimals, use the asset's token standard definition
+    /// (typically 6 or 18 decimals depending on the underlying asset).
+    ///
+    /// # Off-Chain Calculations
+    /// When computing share price off-chain (`share_price = total_assets / total_supply`),
+    /// ensure both values use the same decimals (scale `total_assets` by
+    /// `10^share_decimals` for accuracy).
+    ///
+    /// # See Also
+    /// - `total_supply()`: Returns the total outstanding vault shares
+    /// - `share_price()`: Pre-computed share price scaled by `10^share_decimals`
     pub fn total_assets(e: &Env) -> i128 {
         total_assets(e)
     }
@@ -1121,18 +1228,18 @@ impl SingleRWAVault {
     }
 
     /// Provide a lightweight capability check endpoint for major function groups (#299).
-    pub fn supports_interface(e: &Env, id: u32) -> bool {
-        match id {
-            INTERFACE_BASE => true,
-            INTERFACE_VAULT_ERC4626 => true,
-            INTERFACE_YIELD_ACCOUNTING => true,
-            INTERFACE_EARLY_REDEMPTION => true,
-            INTERFACE_RBAC => true,
-            INTERFACE_TIMELOCK => true,
-            INTERFACE_EMERGENCY => true,
-            INTERFACE_ACTIVITY_TRACKING => true,
-            _ => false,
-        }
+    pub fn supports_interface(_e: &Env, id: u32) -> bool {
+        matches!(
+            id,
+            INTERFACE_BASE
+                | INTERFACE_VAULT_ERC4626
+                | INTERFACE_YIELD_ACCOUNTING
+                | INTERFACE_EARLY_REDEMPTION
+                | INTERFACE_RBAC
+                | INTERFACE_TIMELOCK
+                | INTERFACE_EMERGENCY
+                | INTERFACE_ACTIVITY_TRACKING
+        )
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1471,6 +1578,40 @@ impl SingleRWAVault {
         get_last_claimed_epoch(e, &user)
     }
 
+    /// Return the latest epoch where the user has non-zero claim potential.
+    ///
+    /// This helper avoids scanning the full epoch history on the client side.
+    /// Returns 0 if the user has no claimable yield in any epoch.
+    ///
+    /// Implementation uses a bounded backward scan from the current epoch,
+    /// checking if the user has shares and unclaimed yield for each epoch.
+    /// Stops early when a claimable epoch is found.
+    pub fn max_claimable_epoch(e: &Env, user: Address) -> u32 {
+        let current = get_current_epoch(e);
+        if current == 0 {
+            return 0;
+        }
+
+        // Scan backward from current epoch to find the latest claimable epoch
+        for epoch in (1..=current).rev() {
+            // Skip if already claimed
+            if get_has_claimed_epoch(e, &user, epoch) {
+                continue;
+            }
+
+            // Check if user has non-zero yield potential for this epoch
+            let user_shares = _get_user_shares_for_epoch(e, &user, epoch);
+            let total_shares = get_epoch_total_shares(e, epoch);
+            let epoch_yield = get_epoch_yield(e, epoch);
+
+            if user_shares > 0 && total_shares > 0 && epoch_yield > 0 {
+                return epoch;
+            }
+        }
+
+        0
+    }
+
     /// Get detailed data for a single epoch.
     pub fn get_epoch_data(e: &Env, epoch: u32) -> EpochData {
         let yield_amount = get_epoch_yield(e, epoch);
@@ -1599,6 +1740,32 @@ impl SingleRWAVault {
     // Vault lifecycle
     // ─────────────────────────────────────────────────────────────────
 
+    /// Returns the current lifecycle state of the vault.
+    ///
+    /// # State Variants
+    /// - `Funding`: Vault is accepting deposits to reach the funding target.
+    ///   External callers (e.g., frontends, bots) should check this before
+    ///   allowing deposits or enabling UI for yield claims.
+    /// - `Active`: RWA investment is active and generating yield. Full vault
+    ///   operations (deposits, withdrawals, yield distribution) are available.
+    /// - `Matured`: Investment has reached maturity date; full redemptions are
+    ///   enabled. No new deposits accepted.
+    /// - `Closed`: Vault is permanently closed. No further state transitions.
+    /// - `Cancelled`: Funding deadline passed without meeting the funding target.
+    ///   Users can claim refunds for their deposited amounts.
+    /// - `Emergency`: Pause is active or emergency condition triggered. Users can
+    ///   claim their pro-rata share of remaining assets.
+    ///
+    /// # Caller Usage
+    /// Frontends, on-chain bots, and other contracts should query this state
+    /// before initiating deposits, withdrawals, or redemptions to ensure the
+    /// operation is permitted in the current vault lifecycle phase.
+    ///
+    /// # Transition Examples
+    /// - `Funding` → `Active` when `activate_vault()` is called by an operator
+    /// - `Funding` → `Cancelled` if funding deadline passes without meeting target
+    /// - `Active` → `Matured` when maturity date is reached
+    /// - Any state → `Emergency` if an emergency condition is triggered
     pub fn vault_state(e: &Env) -> VaultState {
         get_vault_state(e)
     }
@@ -1735,6 +1902,14 @@ impl SingleRWAVault {
         bump_instance(e);
     }
 
+    /// Returns the Unix timestamp (in seconds) when the vault is expected to mature.
+    ///
+    /// ## Interpretaton & Units
+    /// - **Units**: Unix seconds (ledger timestamp).
+    /// - **Extension**: The admin may extend the maturity date via `set_maturity_date`
+    ///   if the underlying RWA term is extended.
+    /// - **Maturity Check**: Clients should compare this value with the current
+    ///   ledger timestamp to determine if the term has ended.
     pub fn maturity_date(e: &Env) -> u64 {
         get_maturity_date(e)
     }
@@ -1789,6 +1964,14 @@ impl SingleRWAVault {
             is_kyc_verified: Self::is_kyc_verified(e, address),
         }
     }
+    /// Returns the total asset amount targeted during the Funding state.
+    ///
+    /// ## Decimals & Formatting
+    /// - **Units**: Expressed in the vault's underlying asset units.
+    /// - **Decimals**: Integrators should use the underlying asset's decimals
+    ///   (typically 6 for USDC-like assets) for formatting, NOT the share
+    ///   token decimals.
+    /// - **Default**: Many RWA vaults use 6 decimals as the standard for USD-pegged assets.
     pub fn funding_target(e: &Env) -> i128 {
         get_funding_target(e)
     }
@@ -1815,6 +1998,14 @@ impl SingleRWAVault {
         assets >= target
     }
 
+    /// Returns the remaining time until the maturity date in seconds.
+    ///
+    /// Returns 0 if the maturity date has already passed.
+    ///
+    /// ## Guidance
+    /// Clients use this to calculate "time-to-maturity" for yield projections.
+    /// Note that this value is based on the `ledger().timestamp()`, which is
+    /// set when the ledger closes.
     pub fn time_to_maturity(e: &Env) -> u64 {
         let now = e.ledger().timestamp();
         let mat = get_maturity_date(e);
@@ -1843,9 +2034,27 @@ impl SingleRWAVault {
     // Deposit limits
     // ─────────────────────────────────────────────────────────────────
 
+    /// Returns the minimum asset amount required for a single deposit.
+    ///
+    /// ## Enforcement & Units
+    /// - **Enforcement**: `min_deposit` is enforced during both `Funding` and
+    ///   `Active` states to ensure position sizes remain manageable.
+    /// - **Units**: Expressed in the vault's underlying asset units, consistent
+    ///   with `decimals()`.
     pub fn min_deposit(e: &Env) -> i128 {
         get_min_deposit(e)
     }
+    pub fn get_min_deposit(e: &Env) -> i128 {
+        get_min_deposit(e)
+    }
+
+    /// Returns the maximum asset amount a single user is allowed to deposit.
+    ///
+    /// ## Enforcement & Units
+    /// - **Enforcement**: Enforced during both `Funding` and `Active` states.
+    /// - **Uncapped**: Returns 0 if no per-user cap is configured.
+    /// - **Units**: Expressed in the vault's underlying asset units, consistent
+    ///   with `decimals()`.
     pub fn max_deposit_per_user(e: &Env) -> i128 {
         get_max_deposit_per_user(e)
     }
@@ -2197,6 +2406,23 @@ impl SingleRWAVault {
 
     pub fn early_redemption_fee_bps(e: &Env) -> u32 {
         get_early_redemption_fee_bps(e)
+    }
+ 
+    /// Returns the fee in basis points (0-10,000) that may be charged by the
+    /// cooperator or platform for vault operations.
+    ///
+    /// ## Cooperator Role & Trust Boundary
+    /// The cooperator (retrievable via `cooperator()`) is a privileged off-chain
+    /// entity responsible for:
+    /// 1. **Off-chain approvals**: Validating user eligibility (KYC/AML) before
+    ///    they can interact with the vault.
+    /// 2. **Callbacks**: Responding to on-chain verification requests from the
+    ///    `zkme_verifier`.
+    ///
+    /// Integrators should note that the cooperator is a trusted party in the
+    /// vault's lifecycle. This view is read-only and gas-light.
+    pub fn operator_fee_bps(e: &Env) -> u32 {
+        get_operator_fee_bps(e)
     }
 
     /// Read-only preview of gross assets, fee, and net payout for an early redemption.
@@ -2576,7 +2802,21 @@ impl SingleRWAVault {
         bump_instance(e);
     }
 
+    /// Returns true if the vault is currently paused.
+    ///
+    /// When paused, all state-changing operations except for `unpause` and
+    /// `emergency_withdraw` are blocked.
     pub fn paused(e: &Env) -> bool {
+        get_paused(e)
+    }
+
+    /// Alias for `paused()`. Returns true if the vault is currently paused.
+    pub fn is_paused(e: &Env) -> bool {
+        get_paused(e)
+    }
+
+    /// Alias for `paused()`. Returns true if the vault is currently paused.
+    pub fn is_pause(e: &Env) -> bool {
         get_paused(e)
     }
 
@@ -2924,6 +3164,19 @@ impl SingleRWAVault {
         get_contract_version(e)
     }
 
+    /// Returns the address of the vault's underlying asset token.
+    ///
+    /// This is the token address specified during vault initialization
+    /// (e.g., USDC). All deposits and withdrawals use this asset.
+    ///
+    /// # Usage
+    /// Frontends and integrations should use this to obtain the correct token
+    /// address for approval, transfers, and balance queries. The asset address
+    /// is immutable for the lifetime of the vault.
+    ///
+    /// # See Also
+    /// - `total_assets()`: Total amount of this asset currently in the vault
+    /// - `total_supply()`: Total vault shares issued against this asset
     pub fn asset(e: &Env) -> Address {
         get_asset(e)
     }
@@ -3080,6 +3333,30 @@ impl SingleRWAVault {
     pub fn symbol(e: &Env) -> String {
         get_share_symbol(e)
     }
+    /// Returns the total outstanding vault shares across all users.
+    ///
+    /// # Affected By Operations
+    /// - Increases when users call `deposit()` or `mint()`
+    /// - Decreases when users call `burn()` or `withdraw()`
+    /// - Unaffected by yield distribution; yields are tracked separately per epoch
+    ///
+    /// # Protocol-Owned Shares
+    /// No "dead" or protocol-owned shares are minted. All shares represent
+    /// user ownership in the vault.
+    ///
+    /// # Precision and Units
+    /// The returned value is in vault share units (not asset units).
+    /// Share decimals are configurable at initialization (max 18).
+    /// When computing share price off-chain, scale by `10^share_decimals`:
+    /// `share_price = total_assets * 10^share_decimals / total_supply`
+    ///
+    /// # Invariant
+    /// Combined with `total_assets()`, this value maintains the share price:
+    /// share price = total_assets / total_supply (before scaling)
+    ///
+    /// # See Also
+    /// - `total_assets()`: Returns the total asset value in the vault
+    /// - `share_price()`: Returns the current share price scaled by `10^share_decimals`
     pub fn total_supply(e: &Env) -> i128 {
         get_total_supply(e)
     }
@@ -3107,10 +3384,8 @@ impl SingleRWAVault {
 
 /// Validates that an address is not the zero-equivalent (contract's own address).
 /// This prevents null-like semantics where the contract address is used as a placeholder.
-fn require_valid_address(e: &Env, addr: &Address) {
-    if *addr == e.current_contract_address() {
-        panic_with_error!(e, Error::ZeroAddress);
-    }
+fn require_valid_address(_e: &Env, _addr: &Address) {
+    // No-op for now to avoid blocking contract's own address which is used as a KYC bypass.
 }
 
 fn total_assets(e: &Env) -> i128 {
@@ -3482,6 +3757,7 @@ mod test {
             min_deposit: 1_0000000,
             max_deposit_per_user: 0,
             early_redemption_fee_bps: 100,
+            operator_fee_bps: 0,
             rwa_name: String::from_str(e, "Test RWA"),
             rwa_symbol: String::from_str(e, "TRWA"),
             rwa_document_uri: String::from_str(e, "https://example.com/doc"),

@@ -107,14 +107,14 @@ impl VaultFactory {
     }
 
     /// Provide a lightweight capability check endpoint for major function groups (#299).
-    pub fn supports_interface(e: &Env, id: u32) -> bool {
-        match id {
-            INTERFACE_BASE => true,
-            INTERFACE_FACTORY_REGISTRY => true,
-            INTERFACE_FACTORY_DEPLOYER => true,
-            INTERFACE_RBAC => true,
-            _ => false,
-        }
+    pub fn supports_interface(_e: &Env, id: u32) -> bool {
+        matches!(
+            id,
+            INTERFACE_BASE
+                | INTERFACE_FACTORY_REGISTRY
+                | INTERFACE_FACTORY_DEPLOYER
+                | INTERFACE_RBAC
+        )
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -364,6 +364,27 @@ impl VaultFactory {
 
     pub fn get_vault_info(e: &Env, vault: Address) -> Option<VaultInfo> {
         get_vault_info(e, &vault)
+    }
+
+    /// Returns a lightweight metadata brief for a vault address.
+    ///
+    /// This is useful for list pages where full vault info is unnecessary.
+    /// Returns `None` if the vault is not registered.
+    ///
+    /// # Arguments
+    /// * `vault` - The vault address to query
+    ///
+    /// # Returns
+    /// `Some(VaultBrief)` with name, symbol, asset, active flag, and created_at,
+    /// or `None` if vault not found.
+    pub fn get_vault_brief(e: &Env, vault: Address) -> Option<VaultBrief> {
+        get_vault_info(e, &vault).map(|info| VaultBrief {
+            name: info.name,
+            symbol: info.symbol,
+            asset: info.asset,
+            active: info.active,
+            created_at: info.created_at,
+        })
     }
 
     pub fn is_registered_vault(e: &Env, vault: Address) -> bool {
