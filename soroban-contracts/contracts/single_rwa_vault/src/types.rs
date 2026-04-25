@@ -131,6 +131,20 @@ pub struct RedemptionRequest {
     pub locked_asset_value: i128,
 }
 
+/// Statistics about the pending redemption queue.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RedemptionQueueSummary {
+    /// Number of requests currently awaiting processing.
+    pub pending_count: u32,
+    /// Unix timestamp of the oldest pending request (0 if queue empty).
+    pub oldest_request_timestamp: u64,
+    /// Redemption ID of the oldest pending request.
+    pub oldest_request_id: u32,
+    /// Total number of shares requested across all pending entries.
+    pub total_pending_shares: i128,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Epoch data structs (for historical yield queries)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -361,3 +375,16 @@ pub struct EmergencyProposal {
     pub proposed_at: u64,
     pub executed: bool,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Interface IDs for supports_interface (#299)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const INTERFACE_BASE: u32 = 1;
+pub const INTERFACE_VAULT_ERC4626: u32 = 2;
+pub const INTERFACE_YIELD_ACCOUNTING: u32 = 3;
+pub const INTERFACE_EARLY_REDEMPTION: u32 = 4;
+pub const INTERFACE_RBAC: u32 = 5;
+pub const INTERFACE_TIMELOCK: u32 = 6;
+pub const INTERFACE_EMERGENCY: u32 = 7;
+pub const INTERFACE_ACTIVITY_TRACKING: u32 = 8;

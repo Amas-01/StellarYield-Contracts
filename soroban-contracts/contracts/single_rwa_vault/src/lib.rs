@@ -631,6 +631,38 @@ impl SingleRWAVault {
         get_redemption_request(e, request_id)
     }
 
+    /// Expose queue stats: pending count, oldest request timestamp/id, total requested shares.
+    ///
+    /// Operators can monitor backlog health without scanning every request.
+    pub fn get_redemption_queue_summary(e: &Env) -> RedemptionQueueSummary {
+        let total_requests = get_redemption_counter(e);
+        let mut pending_count = 0u32;
+        let mut oldest_request_timestamp = 0u64;
+        let mut oldest_request_id = 0u32;
+        let mut total_pending_shares = 0i128;
+
+        // Redemption IDs are 1-based monotonically increasing.  We scan from 1 up
+        // to `total_requests`.  Requests that have been processed are skipped.
+        for i in 1..=total_requests {
+            let req = get_redemption_request(e, i); // This panics if ID invalid, but we stay in bounds.
+            if !req.processed {
+                if pending_count == 0 {
+                    oldest_request_timestamp = req.request_time;
+                    oldest_request_id = i;
+                }
+                pending_count += 1;
+                total_pending_shares += req.shares;
+            }
+        }
+
+        RedemptionQueueSummary {
+            pending_count,
+            oldest_request_timestamp,
+            oldest_request_id,
+            total_pending_shares,
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // ERC-4626 max helpers
     // ─────────────────────────────────────────────────────────────────
@@ -664,6 +696,23 @@ impl SingleRWAVault {
         }
 
         max_allowed
+    }
+
+    /// Returns the remaining deposit capacity for `user` based on current
+    /// cumulative deposits and max cap.
+    ///
+    /// This lets frontends enforce limits before sending transactions.
+    ///
+    /// # Returns
+    /// - `cap - already_deposited` if cap > 0.
+    /// - `i128::MAX` if cap is 0 (unlimited).
+    pub fn max_deposit_headroom(e: &Env, user: Address) -> i128 {
+        let cap = get_max_deposit_per_user(e);
+        if cap == 0 {
+            return i128::MAX;
+        }
+        let already = get_user_deposited(e, &user);
+        (cap - already).max(0)
     }
 
     /// Maximum shares `receiver` can obtain via `mint` right now.
@@ -777,6 +826,21 @@ impl SingleRWAVault {
 
     pub fn storage_schema_version(e: &Env) -> u32 {
         get_storage_schema_version(e)
+    }
+
+    /// Provide a lightweight capability check endpoint for major function groups (#299).
+    pub fn supports_interface(e: &Env, id: u32) -> bool {
+        match id {
+            INTERFACE_BASE => true,
+            INTERFACE_VAULT_ERC4626 => true,
+            INTERFACE_YIELD_ACCOUNTING => true,
+            INTERFACE_EARLY_REDEMPTION => true,
+            INTERFACE_RBAC => true,
+            INTERFACE_TIMELOCK => true,
+            INTERFACE_EMERGENCY => true,
+            INTERFACE_ACTIVITY_TRACKING => true,
+            _ => false,
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────

@@ -106,6 +106,17 @@ impl VaultFactory {
         get_contract_version(e)
     }
 
+    /// Provide a lightweight capability check endpoint for major function groups (#299).
+    pub fn supports_interface(e: &Env, id: u32) -> bool {
+        match id {
+            INTERFACE_BASE => true,
+            INTERFACE_FACTORY_REGISTRY => true,
+            INTERFACE_FACTORY_DEPLOYER => true,
+            INTERFACE_RBAC => true,
+            _ => false,
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Vault creation – simple (mirrors createSingleRWAVault)
     // ─────────────────────────────────────────────────────────────────
@@ -566,6 +577,21 @@ impl VaultFactory {
             }
         }
         result
+    }
+
+    /// Return admin/operator addresses and mutable default configuration in one view struct.
+    ///
+    /// This simplifies governance and monitoring dashboards.
+    pub fn get_factory_admin_overview(e: &Env) -> FactoryAdminOverview {
+        FactoryAdminOverview {
+            admin: get_admin(e),
+            default_asset: get_default_asset(e),
+            default_zkme_verifier: get_default_zkme_verifier(e),
+            default_cooperator: get_default_cooperator(e),
+            vault_wasm_hash: get_vault_wasm_hash(e),
+            default_fee_bps: get_default_fee_bps(e),
+            vault_count: get_vault_count(e),
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────

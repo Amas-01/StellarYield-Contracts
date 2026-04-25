@@ -136,3 +136,25 @@ pub enum Role {
     /// binary `Operator` flag — can create vaults and manage the factory.
     FullOperator,
 }
+
+/// Admin and configuration overview for the factory.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct FactoryAdminOverview {
+    pub admin: Address,
+    pub default_asset: Address,
+    pub default_zkme_verifier: Address,
+    pub default_cooperator: Address,
+    pub vault_wasm_hash: BytesN<32>,
+    pub default_fee_bps: u32,
+    pub vault_count: u32,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Interface IDs for supports_interface (#299)
+// ─────────────────────────────────────────────────────────────────────────────
+
+pub const INTERFACE_BASE: u32 = 1;
+pub const INTERFACE_FACTORY_REGISTRY: u32 = 100;
+pub const INTERFACE_FACTORY_DEPLOYER: u32 = 101;
+pub const INTERFACE_RBAC: u32 = 5;
