@@ -1407,6 +1407,10 @@ impl SingleRWAVault {
             panic_with_error!(e, Error::InsufficientBalance);
         }
 
+        // Lock the asset value at request time so that yield distributed
+        // (or removed) between now and processing cannot move the payout.
+        let locked_asset_value = preview_redeem(e, shares);
+
         // --- Effects (Escrow shares) ---
         put_share_balance(e, &caller, bal - shares);
         let escrowed = get_escrowed_shares(e, &caller) + shares;
@@ -1424,6 +1428,7 @@ impl SingleRWAVault {
                 shares,
                 request_time: e.ledger().timestamp(),
                 processed: false,
+                locked_asset_value,
             },
         );
 
@@ -1457,12 +1462,20 @@ impl SingleRWAVault {
             panic_with_error!(e, Error::InsufficientBalance);
         }
 
-        // Payout math before irreversible updates — `preview_redeem` may panic on dust
-        // (ERC-4626 zero-asset guard) and must not run after escrow/supply are changed.
-        let assets = preview_redeem(e, req.shares);
+        // Use the asset value snapshotted at request time, not the current
+        // share price. This protects the user from share-price moves between
+        // request and processing.
+        let assets = req.locked_asset_value;
         let fee_bps = get_early_redemption_fee_bps(e) as i128;
         let fee = math::mul_div(e, assets, fee_bps, 10000);
         let net_assets = assets - fee;
+
+        // Vault liquidity guard: refuse to process if the locked payout exceeds
+        // the vault's current asset balance. The operator can wait for more
+        // assets, or the user can cancel the request.
+        if asset_balance_of_vault(e) < net_assets {
+            panic_with_error!(e, Error::InsufficientBalance);
+        }
 
         // --- Effects ---
         req.processed = true;
