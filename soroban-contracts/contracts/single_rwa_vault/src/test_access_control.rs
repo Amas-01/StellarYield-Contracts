@@ -506,3 +506,112 @@ fn test_pause_does_not_add_share_transfer_state_guard_in_contract() {
         "share transfer must not gate on pause/freeze so holders can still move claims off-wallet"
     );
 }
+
+// ─── Test: operator cannot transfer admin ─────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // Error::NotAdmin = 4
+fn test_operator_cannot_transfer_admin() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (vault_id, _, _, admin) = make_vault(&e);
+    let vault = SingleRWAVaultClient::new(&e, &vault_id);
+
+    let operator  = Address::generate(&e);
+    let new_admin = Address::generate(&e);
+
+    // Grant full operator privileges to `operator`
+    vault.set_operator(&admin, &operator, &true);
+    assert!(vault.is_operator(&operator));
+
+    // Operator attempts an admin-only action: transfer_admin
+    // Must panic with NotAdmin (#4), not the timelock error (#38)
+    // that fires when a legitimate admin calls this.
+    vault.transfer_admin(&operator, &new_admin);
+}
+
+/// Companion positive test: after the attempted escalation fails, the admin
+/// address is unchanged and the operator retains only operator privileges.
+/// This confirms the failure is clean — no partial state mutation occurs.
+#[test]
+fn test_operator_escalation_attempt_leaves_state_intact() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (vault_id, _, _, admin) = make_vault(&e);
+    let vault = SingleRWAVaultClient::new(&e, &vault_id);
+
+    let operator  = Address::generate(&e);
+    let new_admin = Address::generate(&e);
+
+    vault.set_operator(&admin, &operator, &true);
+    assert!(vault.is_operator(&operator));
+
+    // Capture the result without panicking
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        vault.transfer_admin(&operator, &new_admin);
+    }));
+
+    // Call must have failed
+    assert!(result.is_err(), "operator transfer_admin must fail");
+
+    // Admin address must be unchanged
+    assert_eq!(
+        vault.admin(),
+        admin,
+        "admin address must not change after failed operator escalation"
+    );
+
+    // Operator must still be an operator (not silently revoked)
+    assert!(
+        vault.is_operator(&operator),
+        "operator status must be unchanged after failed escalation"
+    );
+
+    // new_admin must not have become admin
+    assert_ne!(
+        vault.admin(),
+        new_admin,
+        "new_admin must not have been installed"
+    );
+}
+
+/// Admin-only actions beyond transfer_admin: `set_operator` itself is also
+/// admin-only. An operator must not be able to grant operator status to others.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // Error::NotAdmin = 4
+fn test_operator_cannot_grant_operator_to_others() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (vault_id, _, _, admin) = make_vault(&e);
+    let vault = SingleRWAVaultClient::new(&e, &vault_id);
+
+    let operator  = Address::generate(&e);
+    let new_oper  = Address::generate(&e);
+
+    vault.set_operator(&admin, &operator, &true);
+
+    // Operator attempts to grant operator status to another address
+    // Must fail with NotAdmin — only admin can manage operator assignments
+    vault.set_operator(&operator, &new_oper, &true);
+}
+
+/// An operator also must not be able to revoke another operator.
+/// Operator management is exclusively an admin capability.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")] // Error::NotAdmin = 4
+fn test_operator_cannot_revoke_other_operator() {
+    let e = Env::default();
+    e.mock_all_auths();
+    let (vault_id, _, _, admin) = make_vault(&e);
+    let vault = SingleRWAVaultClient::new(&e, &vault_id);
+
+    let operator_a = Address::generate(&e);
+    let operator_b = Address::generate(&e);
+
+    // Admin grants both operators
+    vault.set_operator(&admin, &operator_a, &true);
+    vault.set_operator(&admin, &operator_b, &true);
+
+    // operator_a attempts to revoke operator_b — must fail
+    vault.set_operator(&operator_a, &operator_b, &false);
+}
