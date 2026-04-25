@@ -824,7 +824,8 @@ impl SingleRWAVault {
         const MAX_BATCH: u32 = 50;
         let mut results: Vec<DepositCheckResult> = Vec::new(e);
 
-        let actual_len = (users.len() as u32).min(amounts.len() as u32);
+        #[allow(clippy::unnecessary_cast)]
+        let actual_len = users.len().min(amounts.len()) as u32;
         if actual_len == 0 {
             return results;
         }
@@ -875,10 +876,12 @@ impl SingleRWAVault {
                 }
             }
 
-            if status_code == 0 && state == VaultState::Funding && target > 0 {
-                if current_total + assets > target {
-                    status_code = Error::FundingTargetExceeded as u32;
-                }
+            if status_code == 0
+                && state == VaultState::Funding
+                && target > 0
+                && current_total + assets > target
+            {
+                status_code = Error::FundingTargetExceeded as u32;
             }
 
             let expected_shares = if status_code == 0 {
@@ -905,6 +908,25 @@ impl SingleRWAVault {
         results
     }
 
+    /// Returns the total assets currently held or controlled by the vault.
+    ///
+    /// This is the sum of all user deposits net of withdrawals, before
+    /// distributions and early redemption escrows. It does **not** include
+    /// unclaimed epoch yields; those are computed separately via `claim_yield`.
+    ///
+    /// # Value Representation
+    /// The returned value is in the vault's underlying asset token units
+    /// (e.g., USDC). For decimals, use the asset's token standard definition
+    /// (typically 6 or 18 decimals depending on the underlying asset).
+    ///
+    /// # Off-Chain Calculations
+    /// When computing share price off-chain (`share_price = total_assets / total_supply`),
+    /// ensure both values use the same decimals (scale `total_assets` by
+    /// `10^share_decimals` for accuracy).
+    ///
+    /// # See Also
+    /// - `total_supply()`: Returns the total outstanding vault shares
+    /// - `share_price()`: Pre-computed share price scaled by `10^share_decimals`
     pub fn total_assets(e: &Env) -> i128 {
         total_assets(e)
     }
@@ -975,18 +997,18 @@ impl SingleRWAVault {
     }
 
     /// Provide a lightweight capability check endpoint for major function groups (#299).
-    pub fn supports_interface(e: &Env, id: u32) -> bool {
-        match id {
-            INTERFACE_BASE => true,
-            INTERFACE_VAULT_ERC4626 => true,
-            INTERFACE_YIELD_ACCOUNTING => true,
-            INTERFACE_EARLY_REDEMPTION => true,
-            INTERFACE_RBAC => true,
-            INTERFACE_TIMELOCK => true,
-            INTERFACE_EMERGENCY => true,
-            INTERFACE_ACTIVITY_TRACKING => true,
-            _ => false,
-        }
+    pub fn supports_interface(_e: &Env, id: u32) -> bool {
+        matches!(
+            id,
+            INTERFACE_BASE
+                | INTERFACE_VAULT_ERC4626
+                | INTERFACE_YIELD_ACCOUNTING
+                | INTERFACE_EARLY_REDEMPTION
+                | INTERFACE_RBAC
+                | INTERFACE_TIMELOCK
+                | INTERFACE_EMERGENCY
+                | INTERFACE_ACTIVITY_TRACKING
+        )
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1453,6 +1475,32 @@ impl SingleRWAVault {
     // Vault lifecycle
     // ─────────────────────────────────────────────────────────────────
 
+    /// Returns the current lifecycle state of the vault.
+    ///
+    /// # State Variants
+    /// - `Funding`: Vault is accepting deposits to reach the funding target.
+    ///   External callers (e.g., frontends, bots) should check this before
+    ///   allowing deposits or enabling UI for yield claims.
+    /// - `Active`: RWA investment is active and generating yield. Full vault
+    ///   operations (deposits, withdrawals, yield distribution) are available.
+    /// - `Matured`: Investment has reached maturity date; full redemptions are
+    ///   enabled. No new deposits accepted.
+    /// - `Closed`: Vault is permanently closed. No further state transitions.
+    /// - `Cancelled`: Funding deadline passed without meeting the funding target.
+    ///   Users can claim refunds for their deposited amounts.
+    /// - `Emergency`: Pause is active or emergency condition triggered. Users can
+    ///   claim their pro-rata share of remaining assets.
+    ///
+    /// # Caller Usage
+    /// Frontends, on-chain bots, and other contracts should query this state
+    /// before initiating deposits, withdrawals, or redemptions to ensure the
+    /// operation is permitted in the current vault lifecycle phase.
+    ///
+    /// # Transition Examples
+    /// - `Funding` → `Active` when `activate_vault()` is called by an operator
+    /// - `Funding` → `Cancelled` if funding deadline passes without meeting target
+    /// - `Active` → `Matured` when maturity date is reached
+    /// - Any state → `Emergency` if an emergency condition is triggered
     pub fn vault_state(e: &Env) -> VaultState {
         get_vault_state(e)
     }
@@ -2778,6 +2826,19 @@ impl SingleRWAVault {
         get_contract_version(e)
     }
 
+    /// Returns the address of the vault's underlying asset token.
+    ///
+    /// This is the token address specified during vault initialization
+    /// (e.g., USDC). All deposits and withdrawals use this asset.
+    ///
+    /// # Usage
+    /// Frontends and integrations should use this to obtain the correct token
+    /// address for approval, transfers, and balance queries. The asset address
+    /// is immutable for the lifetime of the vault.
+    ///
+    /// # See Also
+    /// - `total_assets()`: Total amount of this asset currently in the vault
+    /// - `total_supply()`: Total vault shares issued against this asset
     pub fn asset(e: &Env) -> Address {
         get_asset(e)
     }
@@ -2934,6 +2995,30 @@ impl SingleRWAVault {
     pub fn symbol(e: &Env) -> String {
         get_share_symbol(e)
     }
+    /// Returns the total outstanding vault shares across all users.
+    ///
+    /// # Affected By Operations
+    /// - Increases when users call `deposit()` or `mint()`
+    /// - Decreases when users call `burn()` or `withdraw()`
+    /// - Unaffected by yield distribution; yields are tracked separately per epoch
+    ///
+    /// # Protocol-Owned Shares
+    /// No "dead" or protocol-owned shares are minted. All shares represent
+    /// user ownership in the vault.
+    ///
+    /// # Precision and Units
+    /// The returned value is in vault share units (not asset units).
+    /// Share decimals are configurable at initialization (max 18).
+    /// When computing share price off-chain, scale by `10^share_decimals`:
+    /// `share_price = total_assets * 10^share_decimals / total_supply`
+    ///
+    /// # Invariant
+    /// Combined with `total_assets()`, this value maintains the share price:
+    /// share price = total_assets / total_supply (before scaling)
+    ///
+    /// # See Also
+    /// - `total_assets()`: Returns the total asset value in the vault
+    /// - `share_price()`: Returns the current share price scaled by `10^share_decimals`
     pub fn total_supply(e: &Env) -> i128 {
         get_total_supply(e)
     }
