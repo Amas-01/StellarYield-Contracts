@@ -21,6 +21,8 @@ mod test_burn_snapshot;
 #[cfg(test)]
 mod test_burn_yield_accounting;
 #[cfg(test)]
+mod test_can_redeem;
+#[cfg(test)]
 mod test_claim_cursor;
 #[cfg(test)]
 mod test_close_vault;
@@ -341,7 +343,9 @@ impl SingleRWAVault {
         require_valid_address(e, &new_cooperator);
         let old = get_cooperator(e);
         put_cooperator(e, new_cooperator.clone());
-        emit_cooperator_updated(e, old, new_cooperator);
+        emit_cooperator_updated(e, old.clone(), new_cooperator.clone());
+        // Emit additional event for cooperator fee tracking
+        emit_cooperator_fee_updated(e, old, new_cooperator);
         bump_instance(e);
     }
 
@@ -842,10 +846,10 @@ impl SingleRWAVault {
 
         // Validate inputs
         if users.len() != shares.len() {
-            panic_with_error!(e, Error::InvalidInput);
+            panic_with_error!(e, Error::InvalidInitParams);
         }
         if users.len() > MAX_BATCH_SIZE {
-            panic_with_error!(e, Error::InvalidInput);
+            panic_with_error!(e, Error::InvalidInitParams);
         }
 
         let mut results: Vec<RedemptionPreflight> = Vec::new(e);
@@ -853,7 +857,8 @@ impl SingleRWAVault {
         // Check vault state once
         let paused = get_paused(e);
         let state = get_vault_state(e);
-        let can_redeem_state = !paused && (state == VaultState::Active || state == VaultState::Matured);
+        let can_redeem_state =
+            !paused && (state == VaultState::Active || state == VaultState::Matured);
 
         for i in 0..users.len() {
             let user = users.get_unchecked(i);
@@ -898,6 +903,11 @@ impl SingleRWAVault {
                 can_redeem,
                 reason,
             });
+        }
+
+        results
+    }
+
     /// Batched deposit preflight check (bounded to avoid expensive calls).
     /// Returns per-user deposit validation results with status codes and expected shares.
     /// Max batch size: 50 entries per call.
@@ -2261,7 +2271,7 @@ impl SingleRWAVault {
     pub fn early_redemption_fee_bps(e: &Env) -> u32 {
         get_early_redemption_fee_bps(e)
     }
- 
+
     /// Returns the fee in basis points (0-10,000) that may be charged by the
     /// cooperator or platform for vault operations.
     ///
@@ -2591,6 +2601,67 @@ impl SingleRWAVault {
             out.push_back(all.get(i).unwrap());
         }
         out
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // View helpers for frontend and scripts
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Check if a user can redeem a specific amount of shares.
+    ///
+    /// Returns a `CanRedeemResult` struct with:
+    /// - `ok`: true if redemption is possible
+    /// - `reason`: optional error message if redemption is not possible
+    ///
+    /// This is a view function useful for frontend previews and preventing
+    /// failed transactions. It validates:
+    /// - Vault state constraints (Active or Matured)
+    /// - Pause status
+    /// - Blacklist status
+    /// - Share sufficiency (user has enough non-escrowed shares)
+    ///
+    /// Note: Escrowed shares (from early redemption requests) are not available
+    /// for redemption until the request is cancelled or rejected.
+    pub fn can_redeem(e: &Env, user: Address, shares: i128) -> CanRedeemResult {
+        // Check if vault is paused
+        if get_paused(e) {
+            return CanRedeemResult {
+                ok: false,
+                reason: Some(String::from_str(e, "Vault is paused")),
+            };
+        }
+
+        // Check vault state
+        let state = get_vault_state(e);
+        if state != VaultState::Active && state != VaultState::Matured {
+            return CanRedeemResult {
+                ok: false,
+                reason: Some(String::from_str(e, "Vault not active or matured")),
+            };
+        }
+
+        // Check if user is blacklisted
+        if get_blacklisted(e, &user) {
+            return CanRedeemResult {
+                ok: false,
+                reason: Some(String::from_str(e, "User is blacklisted")),
+            };
+        }
+
+        // Check share sufficiency (balance already excludes escrowed shares)
+        let balance = get_share_balance(e, &user);
+        if balance < shares {
+            return CanRedeemResult {
+                ok: false,
+                reason: Some(String::from_str(e, "Insufficient shares")),
+            };
+        }
+
+        // All checks passed
+        CanRedeemResult {
+            ok: true,
+            reason: None,
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────
