@@ -78,6 +78,8 @@ mod test_withdraw;
 mod test_yield_vesting;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod test_safe_preview;
 
 pub use crate::storage::Key;
 pub use crate::types::*;
@@ -665,6 +667,150 @@ impl SingleRWAVault {
             amount: assets,
             status_code: 0,
         }
+    }
+
+    /// Safe, non-panicking preview of shares minted for `assets` deposited.
+    ///
+    /// Validates all deposit constraints (minimum, per-user cap, funding target)
+    /// before computing the share amount. Returns a typed reason on failure so
+    /// that UI estimators can surface actionable messages without catching traps.
+    ///
+    /// # Returns
+    /// - `ok == true`, `shares == estimated`, `reason == SafePreviewDepositReason::None`.
+    /// - `ok == false`, `shares == 0`, `reason` identifies the violated constraint.
+    pub fn safe_preview_deposit(e: &Env, assets: i128) -> SafePreviewDepositResult {
+        macro_rules! fail_deposit {
+            ($r:expr) => {
+                return SafePreviewDepositResult {
+                    ok: false,
+                    shares: 0,
+                    reason: $r,
+                }
+            };
+        }
+
+        if assets <= 0 {
+            fail_deposit!(SafePreviewDepositReason::ZeroAmount);
+        }
+
+        let min_dep = get_min_deposit(e);
+        if min_dep > 0 && assets < min_dep {
+            fail_deposit!(SafePreviewDepositReason::BelowMinimumDeposit);
+        }
+
+        let max_dep = get_max_deposit_per_user(e);
+        if max_dep > 0 && assets > max_dep {
+            // Conservative: compare assets against the cap ceiling directly.
+            // For per-user deposit accumulation checks, use `can_deposit_many`.
+            fail_deposit!(SafePreviewDepositReason::ExceedsMaximumDeposit);
+        }
+
+        if get_vault_state(e) == VaultState::Funding {
+            let target = get_funding_target(e);
+            if target > 0 {
+                let current = total_assets(e);
+                if current + assets > target {
+                    fail_deposit!(SafePreviewDepositReason::FundingTargetExceeded);
+                }
+            }
+        }
+
+        // Compute shares using the same formula as preview_deposit / deposit.
+        let supply = get_total_supply(e);
+        let ta = total_assets(e);
+        let shares = if supply == 0 || ta == 0 {
+            assets
+        } else {
+            math::mul_div(e, assets, supply + VIRTUAL_OFFSET, ta + VIRTUAL_OFFSET)
+        };
+
+        if shares == 0 {
+            fail_deposit!(SafePreviewDepositReason::ZeroShares);
+        }
+
+        SafePreviewDepositResult {
+            ok: true,
+            shares,
+            reason: SafePreviewDepositReason::None,
+        }
+    }
+
+    /// Safe, non-panicking preview of the asset cost to mint exactly `shares`.
+    ///
+    /// Validates all deposit constraints after computing the asset cost so that
+    /// UI estimators receive a typed reason rather than a contract trap.
+    ///
+    /// # Returns
+    /// - `ok == true`, `assets == estimated`, `reason == SafePreviewMintReason::None`.
+    /// - `ok == false`, `assets == 0`, `reason` identifies the violated constraint.
+    pub fn safe_preview_mint(e: &Env, shares: i128) -> SafePreviewMintResult {
+        macro_rules! fail_mint {
+            ($r:expr) => {
+                return SafePreviewMintResult {
+                    ok: false,
+                    assets: 0,
+                    reason: $r,
+                }
+            };
+        }
+
+        if shares <= 0 {
+            fail_mint!(SafePreviewMintReason::ZeroAmount);
+        }
+
+        // Compute asset cost using the same formula as preview_mint / mint (ceiling division).
+        let supply = get_total_supply(e);
+        let ta = total_assets(e);
+        let assets = if supply == 0 || ta == 0 {
+            shares
+        } else {
+            math::mul_div_ceil(e, shares, ta + VIRTUAL_OFFSET, supply + VIRTUAL_OFFSET)
+        };
+
+        let min_dep = get_min_deposit(e);
+        if min_dep > 0 && assets < min_dep {
+            fail_mint!(SafePreviewMintReason::BelowMinimumDeposit);
+        }
+
+        let max_dep = get_max_deposit_per_user(e);
+        if max_dep > 0 && assets > max_dep {
+            fail_mint!(SafePreviewMintReason::ExceedsMaximumDeposit);
+        }
+
+        if get_vault_state(e) == VaultState::Funding {
+            let target = get_funding_target(e);
+            if target > 0 {
+                let current = total_assets(e);
+                if current + assets > target {
+                    fail_mint!(SafePreviewMintReason::FundingTargetExceeded);
+                }
+            }
+        }
+
+        SafePreviewMintResult {
+            ok: true,
+            assets,
+            reason: SafePreviewMintReason::None,
+        }
+    }
+
+    /// Raw underlying-token balance held by this vault contract, in base units.
+    ///
+    /// Unlike `total_assets()` — which returns the accounting value tracked in
+    /// `TotDep` — this method queries the token contract directly. Both values
+    /// should match during normal operation; any divergence indicates an
+    /// out-of-band transfer or fee-on-transfer token behaviour.
+    ///
+    /// Wallet scripts and operator monitoring tools can use this to perform a
+    /// quick solvency sanity check without computing it off-chain.
+    ///
+    /// # Returns
+    /// The actual token balance of the vault contract address, in the asset's
+    /// base units (e.g. micro-USDC for a 6-decimal USDC vault).
+    pub fn vault_asset_balance(e: &Env) -> i128 {
+        let asset = get_asset(e);
+        let client = token::Client::new(e, &asset);
+        client.balance(&e.current_contract_address())
     }
 
     // ERC-4626 pure conversion helpers (floor division)
