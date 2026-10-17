@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS vaults (
   description     TEXT,
   logo_uri        TEXT,
   created_at      TIMESTAMPTZ DEFAULT NOW(),
-  updated_at      TIMESTAMPTZ DEFAULT NOW()
+  updated_at      TIMESTAMPTZ DEFAULT NOW(),
+  tags            TEXT[] NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS query_benchmarks (
@@ -199,4 +200,16 @@ CREATE TABLE IF NOT EXISTS transfer_fees (
   created_at      TIMESTAMPTZ DEFAULT NOW(),
   collected_at    TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Vault admin notes (#1281)
+CREATE TABLE IF NOT EXISTS vault_admin_notes (
+  id          SERIAL PRIMARY KEY,
+  contract_id TEXT NOT NULL,
+  author      TEXT NOT NULL,
+  note        TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_admin_notes_contract_id_created_at
+  ON vault_admin_notes (contract_id, created_at DESC);
 
