@@ -231,6 +231,12 @@ export class Indexer {
   lastLedger: number;
   private running = false;
   private lastTickAt: Date | null = null;
+  /**
+   * The tick (or backfill) currently in flight, if any. Tracked so `drain()` can
+   * wait for it to finish before shutdown tears down the database pool it writes
+   * through (#1294).
+   */
+  private inFlightTick: Promise<void> | null = null;
   private readonly vaultFactoryContractId: string;
   private watchedContractIds: Set<string>;
   private vaultService: VaultService;
@@ -279,7 +285,7 @@ export class Indexer {
       if (!this.vaultFactoryContractId) {
         logger.info("Indexer started in state-only mode (no contract ID configured)");
         while (this.running) {
-          await this.tickStateOnly();
+          await this.track(() => this.tickStateOnly());
           await this.sleepWhileRunning(config.indexer.pollIntervalMs);
         }
         return;
@@ -290,11 +296,11 @@ export class Indexer {
       const gap = tipLedger - this.lastLedger;
 
       if (gap > config.indexer.batchSize) {
-        await this.backfill(tipLedger);
+        await this.track(() => this.backfill(tipLedger));
       }
 
       while (this.running) {
-        await this.tick();
+        await this.track(() => this.tick());
         await this.sleepWhileRunning(config.indexer.pollIntervalMs);
       }
     } catch (err) {
@@ -306,6 +312,37 @@ export class Indexer {
 
   stop(): void {
     this.running = false;
+  }
+
+  /**
+   * Stop polling and wait for the in-flight tick or backfill to settle (#1294).
+   *
+   * Shutdown drains the indexer before it closes the database pool and job
+   * queue, so a tick that is already mid-flight cannot write through a pool that
+   * has since been ended. Safe to call when nothing is running.
+   */
+  async drain(): Promise<void> {
+    this.stop();
+    const pending = this.inFlightTick;
+    if (pending) await pending;
+  }
+
+  /**
+   * Run a tick/backfill while exposing it through {@link inFlightTick} so
+   * {@link drain} can await it.
+   */
+  private async track<T>(work: () => Promise<T>): Promise<T> {
+    const inFlight = work();
+    const settled = inFlight.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.inFlightTick = settled;
+    try {
+      return await inFlight;
+    } finally {
+      if (this.inFlightTick === settled) this.inFlightTick = null;
+    }
   }
 
   private async tickStateOnly(): Promise<void> {
