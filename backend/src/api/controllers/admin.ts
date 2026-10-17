@@ -1504,6 +1504,109 @@ export async function exportAdminAuditLogCsv(req: Request, res: Response, next: 
   }
 }
 
+export async function getVaultNotes(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    const rows = await query<{
+      id: number;
+      contract_id: string;
+      author: string;
+      note: string;
+      created_at: Date;
+    }>(
+      `SELECT id, contract_id, author, note, created_at
+         FROM vault_admin_notes
+        WHERE contract_id = $1
+        ORDER BY created_at DESC, id DESC`,
+      [contractId],
+    );
+
+    res.json(
+      rows.map((r) => ({
+        id: r.id,
+        contractId: r.contract_id,
+        author: r.author,
+        note: r.note,
+        createdAt: r.created_at,
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function createVaultNote(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    const { note, author } = (req.body ?? {}) as { note?: unknown; author?: unknown };
+    if (typeof note !== "string" || note.trim().length === 0) {
+      res.status(400).json({ error: "BadRequest", message: "Note is required and cannot be empty" });
+      return;
+    }
+
+    const noteAuthor =
+      typeof author === "string" && author.trim().length > 0
+        ? author.trim()
+        : req.apiKey?.label ?? "admin";
+
+    const rows = await query<{
+      id: number;
+      contract_id: string;
+      author: string;
+      note: string;
+      created_at: Date;
+    }>(
+      `INSERT INTO vault_admin_notes (contract_id, author, note, created_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING id, contract_id, author, note, created_at`,
+      [contractId, noteAuthor, note.trim()],
+    );
+
+    await logAdminAudit(req, "create_vault_note", `/api/v1/admin/vaults/${contractId}/notes`);
+
+    const created = rows[0];
+    res.status(201).json({
+      id: created.id,
+      contractId: created.contract_id,
+      author: created.author,
+      note: created.note,
+      createdAt: created.created_at,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function getArchivedVaults(_req: Request, res: Response, next: NextFunction) {
   try {
     const { VaultService } = await import("../../services/vault.js");

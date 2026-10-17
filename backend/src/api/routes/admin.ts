@@ -58,6 +58,8 @@ import {
   getApiKeyUsageStats,
   exportVaultsCsv,
   exportAdminAuditLogCsv,
+  getVaultNotes,
+  createVaultNote,
 } from "../controllers/admin.js";
 import { getRequestArchive } from "../controllers/debugArchive.js";
 import { createAnnouncement, deleteAnnouncement } from "../controllers/announcements.js";
@@ -106,6 +108,9 @@ adminRouter.get("/vaults/:contractId/audit", getVaultAudit);
 // Epoch yield outliers detected by the daily scan (#1073). Read-only, so the
 // router-wide readonly requirement is enough.
 adminRouter.get("/vaults/:contractId/epoch-anomalies", getEpochAnomalies);
+// Internal admin notes (#1281)
+adminRouter.get("/vaults/:contractId/notes", getVaultNotes);
+adminRouter.post("/vaults/:contractId/notes", requireApiKey({ role: "admin" }), createVaultNote);
 adminRouter.get("/vaults/archived", getArchivedVaults);
 adminRouter.patch("/vaults/:contractId/archive-exclusion", requireApiKey({ role: "admin" }), toggleVaultArchiveExclusion);
 adminRouter.get("/archive/verify", verifyArchiveConsistency);
