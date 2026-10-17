@@ -39,6 +39,7 @@ import { cacheResponse } from "./api/middleware/responseCache.js";
 import { responseSla } from "./api/middleware/routeSla.js";
 import { requestArchive } from "./api/middleware/requestArchive.js";
 import { changelogRouter } from "./api/routes/changelog.js";
+import { announcementsRouter } from "./api/routes/announcements.js";
 
 // Cache static responses at startup
 function initStaticCache(): void {
@@ -134,6 +135,8 @@ export function createApp(): Express {
   // Versioned alias for SDK clients and integration tests (#874).
   app.use("/api/v1/health", publicLimiter, healthRouter);
   app.use("/api/changelog", publicLimiter, changelogRouter);
+  // Public active-announcements feed (#1288).
+  app.use("/api/v1/announcements", publicLimiter, announcementsRouter);
   app.use("/api/status", publicLimiter, statusRouter);
   // Fee endpoints (#1099, #1101, #1102, #1103). Their paths all have a second
   // segment, so they are mounted first and never shadow a /:contractId route.

@@ -59,6 +59,7 @@ import {
   exportVaultsCsv,
 } from "../controllers/admin.js";
 import { getRequestArchive } from "../controllers/debugArchive.js";
+import { createAnnouncement, deleteAnnouncement } from "../controllers/announcements.js";
 import { postArchiveRestore, getArchiveStatusHandler } from "../controllers/archiveAdmin.js";
 import { getHolderConcentrationReport } from "../controllers/regulatoryReports.js";
 import { requireApiKey } from "../middleware/auth.js";
@@ -178,5 +179,9 @@ adminRouter.use("/vaults", adminFeesRouter);
 // Issues #1077, #1078: Transfer alerts
 adminRouter.get("/transfer-alerts", getTransferAlerts);
 adminRouter.patch("/transfer-alerts/:id/acknowledge", acknowledgeTransferAlert);
+
+// Issue #1287: operator announcements (publish / remove)
+adminRouter.post("/announcements", requireApiKey({ role: "admin" }), createAnnouncement);
+adminRouter.delete("/announcements/:id", requireApiKey({ role: "admin" }), deleteAnnouncement);
 
 
