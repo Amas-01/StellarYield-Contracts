@@ -10,6 +10,7 @@ vi.mock("../cache/redis.js", () => ({
 import { YieldService } from "./yield.js";
 import * as db from "../db/index.js";
 import * as cache from "../cache/redis.js";
+import { buildEpoch } from "../../tests/builders/index.js";
 
 const CONTRACT_ID = "CDLZFC3SYJYHZDQA6M57EYUC2XBDA6LQF3M6KFRDZ7TXJYJL2K3B";
 
@@ -126,15 +127,13 @@ describe("YieldService.getVaultEpochs yield range (#858)", () => {
 
   it("returns only the rows the database matched", async () => {
     vi.mocked(db.query).mockResolvedValue([
-      {
+      buildEpoch({
         id: 2,
         vault_id: 10,
         epoch: 2,
         yield_amount: "300",
         total_shares: "1000",
-        distributed_at: new Date("2025-02-01"),
-        net_yield: null,
-      },
+      }),
     ]);
 
     const epochs = await service.getVaultEpochs(CONTRACT_ID, {
