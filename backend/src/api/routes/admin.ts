@@ -60,6 +60,8 @@ import {
   exportAdminAuditLogCsv,
   getVaultNotes,
   createVaultNote,
+  getVaultTags,
+  updateVaultTags,
 } from "../controllers/admin.js";
 import { getRequestArchive } from "../controllers/debugArchive.js";
 import { createAnnouncement, deleteAnnouncement } from "../controllers/announcements.js";
@@ -111,6 +113,9 @@ adminRouter.get("/vaults/:contractId/epoch-anomalies", getEpochAnomalies);
 // Internal admin notes (#1281)
 adminRouter.get("/vaults/:contractId/notes", getVaultNotes);
 adminRouter.post("/vaults/:contractId/notes", requireApiKey({ role: "admin" }), createVaultNote);
+// Internal admin tags (#1282)
+adminRouter.get("/vaults/:contractId/tags", getVaultTags);
+adminRouter.put("/vaults/:contractId/tags", requireApiKey({ role: "admin" }), updateVaultTags);
 adminRouter.get("/vaults/archived", getArchivedVaults);
 adminRouter.patch("/vaults/:contractId/archive-exclusion", requireApiKey({ role: "admin" }), toggleVaultArchiveExclusion);
 adminRouter.get("/archive/verify", verifyArchiveConsistency);

@@ -6,8 +6,6 @@ import { once } from "node:events";
 import type { Request, Response, NextFunction } from "express";
 import Cursor from "pg-cursor";
 import { stringify } from "csv-stringify";
-import Cursor from "pg-cursor";
-import { stringify } from "csv-stringify";
 import { z } from "zod";
 import { query, pool } from "../../db/index.js";
 import { config } from "../../config.js";
@@ -1601,6 +1599,114 @@ export async function createVaultNote(req: Request, res: Response, next: NextFun
       author: created.author,
       note: created.note,
       createdAt: created.created_at,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getVaultTags(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const rows = await query<{ tags: string[] | null }>(
+      "SELECT tags FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    res.json({
+      contractId,
+      tags: rows[0].tags ?? [],
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateVaultTags(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    const rawTags = Array.isArray(req.body)
+      ? req.body
+      : req.body?.tags;
+
+    if (!Array.isArray(rawTags)) {
+      res.status(422).json({
+        error: "UnprocessableEntity",
+        message: "tags must be an array of strings",
+      });
+      return;
+    }
+
+    if (rawTags.length > 10) {
+      res.status(422).json({
+        error: "UnprocessableEntity",
+        message: "A vault may have at most 10 tags",
+      });
+      return;
+    }
+
+    const normalizedTags: string[] = [];
+    for (const tag of rawTags) {
+      if (typeof tag !== "string") {
+        res.status(422).json({
+          error: "UnprocessableEntity",
+          message: "Each tag must be a string",
+        });
+        return;
+      }
+      const trimmed = tag.trim();
+      if (trimmed.length === 0 || trimmed.length > 32) {
+        res.status(422).json({
+          error: "UnprocessableEntity",
+          message: "Tag length must be between 1 and 32 characters",
+        });
+        return;
+      }
+      if (!/^[a-z0-9_-]+$/i.test(trimmed)) {
+        res.status(422).json({
+          error: "UnprocessableEntity",
+          message: `Invalid tag characters in "${trimmed}". Tags may only contain alphanumeric characters, hyphens, and underscores.`,
+        });
+        return;
+      }
+      normalizedTags.push(trimmed.toLowerCase());
+    }
+
+    const updateRows = await query<{ tags: string[] }>(
+      "UPDATE vaults SET tags = $1 WHERE contract_id = $2 RETURNING tags",
+      [normalizedTags, contractId],
+    );
+
+    await logAdminAudit(req, "update_vault_tags", `/api/v1/admin/vaults/${contractId}/tags`);
+
+    res.json({
+      contractId,
+      tags: updateRows[0]?.tags ?? normalizedTags,
     });
   } catch (err) {
     next(err);
