@@ -1,0 +1,8 @@
+{
+  "sequence": 1002,
+  "protocolVersion": 22,
+  "oldestLedger": 1,
+  "latestLedger": 1002,
+  "latestLedgerComputeTime": "2025-01-01T00:00:05Z",
+  "latestLedgerCloseTime": "2025-01-01T00:00:03Z"
+}

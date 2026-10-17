@@ -10,21 +10,21 @@ vi.mock("../cache/redis.js", () => ({
 import { YieldService, InvalidEpochCursorError } from "./yield.js";
 import * as db from "../db/index.js";
 import * as cache from "../cache/redis.js";
+import { buildEpoch } from "../../tests/builders/index.js";
 
 const CONTRACT_ID = "CDLZFC3SYJYHZDQA6M57EYUC2XBDA6LQF3M6KFRDZ7TXJYJL2K3B";
 const OTHER_CONTRACT_ID = "CBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 /** Build a page of epoch rows, ascending by epoch. */
 function epochRows(epochs: number[]) {
-  return epochs.map((epoch) => ({
-    id: epoch,
-    vault_id: 10,
-    epoch,
-    yield_amount: String(epoch * 100),
-    total_shares: "1000",
-    distributed_at: new Date("2025-02-01T00:00:00.000Z"),
-    net_yield: null,
-  }));
+  return epochs.map((epoch) =>
+    buildEpoch({
+      id: epoch,
+      vault_id: 10,
+      epoch,
+      yield_amount: String(epoch * 100),
+    }),
+  );
 }
 
 /** Decode an issued cursor to assert on its shape. */

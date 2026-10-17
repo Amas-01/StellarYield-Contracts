@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { UserService } from "./user.js";
 import * as db from "../db/index.js";
+import { buildUser, buildPosition, randomStellarAddress } from "../../tests/builders/index.js";
 
 // Mock the database module
 vi.mock("../db/index.js");
@@ -23,7 +24,7 @@ vi.mock("./yield.js", () => ({
   })),
 }));
 
-const TEST_ADDRESS = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXVXPXD5XNMJXVXV";
+const TEST_ADDRESS = randomStellarAddress();
 
 describe("UserService", () => {
   let userService: UserService;
@@ -39,13 +40,7 @@ describe("UserService", () => {
 
   describe("getUser", () => {
     it("should return a user with kycVerified status when user exists", async () => {
-      const mockUser = {
-        id: 1,
-        address: TEST_ADDRESS,
-        kyc_verified: true,
-        created_at: new Date("2024-01-01"),
-        updated_at: new Date("2024-01-02"),
-      };
+      const mockUser = buildUser({ address: TEST_ADDRESS, kyc_verified: true });
 
       vi.mocked(db.query).mockResolvedValueOnce([mockUser]);
 
@@ -93,7 +88,7 @@ describe("UserService", () => {
   describe("getUserPortfolio", () => {
     it("should return portfolio with positions and totalDeposited sum", async () => {
       const mockPositions = [
-        {
+        buildPosition({
           id: 1,
           user_address: TEST_ADDRESS,
           vault_id: 1,
@@ -102,9 +97,8 @@ describe("UserService", () => {
           shares: "1000",
           deposited: "5000",
           last_claimed_epoch: 0,
-          updated_at: new Date("2024-01-01"),
-        },
-        {
+        }),
+        buildPosition({
           id: 2,
           user_address: TEST_ADDRESS,
           vault_id: 2,
@@ -113,8 +107,7 @@ describe("UserService", () => {
           shares: "2000",
           deposited: "3000",
           last_claimed_epoch: 1,
-          updated_at: new Date("2024-01-02"),
-        },
+        }),
       ];
 
       vi.mocked(db.query).mockResolvedValueOnce(mockPositions);
@@ -166,22 +159,15 @@ describe("UserService", () => {
   });
 
   describe("getPortfoliosBatch", () => {
-    const ADDR_A = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXVXPXD5XNMJXVXA";
-    const ADDR_B = "GBRPYHIL2CI3WHZDTOOQFC6EB4KJJGUJJBBX7UYXVXPXD5XNMJXVXB";
+    const ADDR_A = randomStellarAddress();
+    const ADDR_B = randomStellarAddress();
 
     it("groups positions by address using a single ANY query", async () => {
       vi.mocked(db.query).mockResolvedValueOnce([
-        {
-          id: 1,
+        buildPosition({
           user_address: ADDR_A,
-          vault_id: 1,
           contract_id: "CCONTRACT11111111111111111111111111111111111111111111",
-          state: "Active",
-          shares: "1000",
-          deposited: "5000",
-          last_claimed_epoch: 0,
-          updated_at: new Date("2024-01-01"),
-        },
+        }),
       ]);
 
       const result = await userService.getPortfoliosBatch([ADDR_A, ADDR_B]);
