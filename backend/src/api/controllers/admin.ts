@@ -6,6 +6,8 @@ import { once } from "node:events";
 import type { Request, Response, NextFunction } from "express";
 import Cursor from "pg-cursor";
 import { stringify } from "csv-stringify";
+import Cursor from "pg-cursor";
+import { stringify } from "csv-stringify";
 import { z } from "zod";
 import { query, pool } from "../../db/index.js";
 import { config } from "../../config.js";
@@ -1399,6 +1401,106 @@ export async function getAdminAuditLog(req: Request, res: Response, next: NextFu
     });
   } catch (err) {
     next(err);
+  }
+}
+
+const AUDIT_LOG_EXPORT_COLUMNS = [
+  "timestamp",
+  "actor",
+  "action",
+  "target",
+  "details",
+] as const;
+
+export async function exportAdminAuditLogCsv(req: Request, res: Response, next: NextFunction) {
+  const action = typeof req.query["action"] === "string" ? req.query["action"] : undefined;
+  const actor = typeof req.query["actor"] === "string" ? req.query["actor"] : undefined;
+  const from = typeof req.query["from"] === "string" ? req.query["from"] : undefined;
+  const to = typeof req.query["to"] === "string" ? req.query["to"] : undefined;
+
+  const { conditions, params } = buildAuditLogFilters({ action, actor, from, to });
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  let client: any;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    next(err);
+    return;
+  }
+
+  const cursor = client.query(
+    new Cursor(
+      `SELECT created_at,
+              api_key_label AS actor,
+              action,
+              target,
+              details
+         FROM admin_audit_log
+        ${whereClause}
+        ORDER BY created_at DESC, id DESC`,
+      params,
+    ),
+  );
+
+  let released = false;
+  const cleanup = async (): Promise<void> => {
+    if (released) return;
+    released = true;
+    try {
+      await cursor.close();
+    } catch {
+      /* connection may already be gone */
+    }
+    client.release();
+  };
+
+  const stringifier = stringify({ header: true, columns: [...AUDIT_LOG_EXPORT_COLUMNS] });
+
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", 'attachment; filename="audit-log.csv"');
+  res.setHeader("Transfer-Encoding", "chunked");
+
+  stringifier.on("error", (err) => {
+    void cleanup();
+    res.destroy(err);
+  });
+  res.on("close", () => {
+    void cleanup();
+  });
+  stringifier.pipe(res);
+
+  try {
+    for (;;) {
+      const rows = await cursor.read(500);
+      if (!rows || rows.length === 0) break;
+      for (const row of rows) {
+        const timestamp = row.created_at instanceof Date
+          ? row.created_at.toISOString()
+          : row.created_at ? new Date(row.created_at).toISOString() : "";
+        const formattedRow = {
+          timestamp,
+          actor: row.actor ?? "",
+          action: row.action ?? "",
+          target: row.target ?? "",
+          details: row.details != null
+            ? (typeof row.details === "object" ? JSON.stringify(row.details) : String(row.details))
+            : "",
+        };
+        if (!stringifier.write(formattedRow)) {
+          await once(stringifier, "drain");
+        }
+      }
+    }
+    stringifier.end();
+    await cleanup();
+  } catch (err) {
+    await cleanup();
+    if (!res.headersSent) {
+      next(err);
+      return;
+    }
+    res.destroy(err as Error);
   }
 }
 

@@ -57,6 +57,7 @@ import {
   getApiDiff,
   getApiKeyUsageStats,
   exportVaultsCsv,
+  exportAdminAuditLogCsv,
 } from "../controllers/admin.js";
 import { getRequestArchive } from "../controllers/debugArchive.js";
 import { createAnnouncement, deleteAnnouncement } from "../controllers/announcements.js";
@@ -129,6 +130,7 @@ adminRouter.get("/db/slow-queries", getSlowQueries);
 adminRouter.get("/fees", getAdminFees);
 adminRouter.get("/fees/dashboard", requireApiKey({ role: "admin" }), getAdminFeesDashboard);
 adminRouter.delete("/users/:address", requireApiKey({ role: "admin" }), deleteUser);
+adminRouter.get("/audit-log/export.csv", requireApiKey({ role: "admin" }), exportAdminAuditLogCsv);
 adminRouter.get("/audit-log", requireApiKey({ role: "admin" }), getAdminAuditLog);
 
 adminRouter.post("/users/:address/aml-flag", flagUserAml);
