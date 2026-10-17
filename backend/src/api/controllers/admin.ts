@@ -1177,16 +1177,178 @@ export async function deleteUser(req: Request, res: Response, next: NextFunction
   }
 }
 
+interface AuditLogFilters {
+  action?: string;
+  actor?: string;
+  from?: string;
+  to?: string;
+}
+
+function buildAuditLogFilters(filters: AuditLogFilters, startIdx = 0): {
+  conditions: string[];
+  params: any[];
+  nextIdx: number;
+} {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  let idx = startIdx;
+
+  if (filters.action && filters.action.trim() !== "") {
+    idx++;
+    conditions.push(`action = $${idx}`);
+    params.push(filters.action.trim());
+  }
+
+  if (filters.actor && filters.actor.trim() !== "") {
+    idx++;
+    conditions.push(`api_key_label = $${idx}`);
+    params.push(filters.actor.trim());
+  }
+
+  if (filters.from && filters.from.trim() !== "") {
+    idx++;
+    conditions.push(`created_at >= $${idx}::timestamptz`);
+    params.push(filters.from.trim());
+  }
+
+  if (filters.to && filters.to.trim() !== "") {
+    idx++;
+    conditions.push(`created_at <= $${idx}::timestamptz`);
+    params.push(filters.to.trim());
+  }
+
+  return { conditions, params, nextIdx: idx };
+}
+
+function decodeAuditCursor(cursorStr: string): { cursorId: number | null; cursorCreatedAt: Date | null } {
+  try {
+    const raw = Buffer.from(cursorStr, "base64url").toString("utf8");
+    const parsed = JSON.parse(raw);
+    const cursorId = typeof parsed.id === "number" ? parsed.id : null;
+    const cursorCreatedAt = parsed.created_at ? new Date(parsed.created_at) : null;
+    if (cursorId !== null) {
+      return { cursorId, cursorCreatedAt };
+    }
+  } catch {
+    // not base64url JSON
+  }
+  const idNum = parseInt(cursorStr, 10);
+  if (!isNaN(idNum)) {
+    return { cursorId: idNum, cursorCreatedAt: null };
+  }
+  return { cursorId: null, cursorCreatedAt: null };
+}
+
+function encodeAuditCursor(id: number, createdAt: Date): string {
+  return Buffer.from(
+    JSON.stringify({
+      id,
+      created_at: createdAt instanceof Date ? createdAt.toISOString() : new Date(createdAt).toISOString(),
+    }),
+  ).toString("base64url");
+}
+
 export async function getAdminAuditLog(req: Request, res: Response, next: NextFunction) {
   try {
+    const action = typeof req.query["action"] === "string" ? req.query["action"] : undefined;
+    const actor = typeof req.query["actor"] === "string" ? req.query["actor"] : undefined;
+    const from = typeof req.query["from"] === "string" ? req.query["from"] : undefined;
+    const to = typeof req.query["to"] === "string" ? req.query["to"] : undefined;
+    const cursorParam = typeof req.query["cursor"] === "string" && req.query["cursor"].trim() !== ""
+      ? req.query["cursor"].trim()
+      : undefined;
+
+    const rawLimit = parseInt(String(req.query["limit"] ?? req.query["pageSize"] ?? "20"), 10);
+    const limit = Math.max(1, Math.min(100, isNaN(rawLimit) ? 20 : rawLimit));
+
+    const { conditions, params, nextIdx } = buildAuditLogFilters({ action, actor, from, to });
+    let paramIdx = nextIdx;
+
+    const countWhere = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const countRows = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM admin_audit_log ${countWhere}`,
+      params,
+    );
+    const total = parseInt(countRows[0]?.count ?? "0", 10);
+
+    const queryConditions = [...conditions];
+    const queryParams = [...params];
+
+    if (cursorParam) {
+      const { cursorId, cursorCreatedAt } = decodeAuditCursor(cursorParam);
+      if (cursorCreatedAt !== null && cursorId !== null) {
+        paramIdx++;
+        queryConditions.push(`(created_at, id) < ($${paramIdx}::timestamptz, $${paramIdx + 1})`);
+        queryParams.push(cursorCreatedAt.toISOString(), cursorId);
+        paramIdx++;
+      } else if (cursorId !== null) {
+        paramIdx++;
+        queryConditions.push(`id < $${paramIdx}`);
+        queryParams.push(cursorId);
+      }
+
+      const whereClause = queryConditions.length > 0 ? `WHERE ${queryConditions.join(" AND ")}` : "";
+      paramIdx++;
+      queryParams.push(limit + 1);
+
+      const rows = await query<{
+        id: number;
+        api_key_label: string | null;
+        action: string;
+        target: string;
+        ip_address: string | null;
+        request_body_hash: string;
+        details: any;
+        created_at: Date;
+      }>(
+        `SELECT id, api_key_label, action, target, ip_address, request_body_hash, details, created_at
+         FROM admin_audit_log
+         ${whereClause}
+         ORDER BY created_at DESC, id DESC
+         LIMIT $${paramIdx}`,
+        queryParams,
+      );
+
+      let nextCursor: string | null = null;
+      if (rows.length > limit) {
+        rows.pop();
+        const lastRow = rows[rows.length - 1];
+        nextCursor = encodeAuditCursor(lastRow.id, lastRow.created_at);
+      }
+
+      if (nextCursor) {
+        res.set("X-Next-Cursor", nextCursor);
+      }
+
+      res.json({
+        data: rows.map((row) => ({
+          id: row.id,
+          apiKeyLabel: row.api_key_label,
+          actor: row.api_key_label,
+          action: row.action,
+          target: row.target,
+          ipAddress: row.ip_address,
+          requestBodyHash: row.request_body_hash,
+          details: row.details ?? null,
+          createdAt: row.created_at,
+        })),
+        nextCursor,
+        total,
+        limit,
+        pageSize: limit,
+      });
+      return;
+    }
+
     const rawPage = parseInt(String(req.query["page"] ?? "1"), 10);
     const page = Math.max(1, isNaN(rawPage) ? 1 : rawPage);
-    const rawPageSize = parseInt(String(req.query["pageSize"] ?? "20"), 10);
-    const pageSize = Math.max(1, Math.min(100, isNaN(rawPageSize) ? 20 : rawPageSize));
-    const offset = (page - 1) * pageSize;
+    const offset = (page - 1) * limit;
 
-    const countRows = await query<{ count: string }>("SELECT COUNT(*)::text AS count FROM admin_audit_log");
-    const total = parseInt(countRows[0]?.count ?? "0", 10);
+    const whereClause = queryConditions.length > 0 ? `WHERE ${queryConditions.join(" AND ")}` : "";
+    queryParams.push(limit + 1);
+    const limitIdx = queryParams.length;
+    queryParams.push(offset);
+    const offsetIdx = queryParams.length;
 
     const rows = await query<{
       id: number;
@@ -1195,28 +1357,45 @@ export async function getAdminAuditLog(req: Request, res: Response, next: NextFu
       target: string;
       ip_address: string | null;
       request_body_hash: string;
+      details: any;
       created_at: Date;
     }>(
-      `SELECT id, api_key_label, action, target, ip_address, request_body_hash, created_at
+      `SELECT id, api_key_label, action, target, ip_address, request_body_hash, details, created_at
        FROM admin_audit_log
-       ORDER BY created_at DESC
-       LIMIT $1 OFFSET $2`,
-      [pageSize, offset],
+       ${whereClause}
+       ORDER BY created_at DESC, id DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      queryParams,
     );
+
+    let nextCursor: string | null = null;
+    if (rows.length > limit) {
+      rows.pop();
+      const lastRow = rows[rows.length - 1];
+      nextCursor = encodeAuditCursor(lastRow.id, lastRow.created_at);
+    }
+
+    if (nextCursor) {
+      res.set("X-Next-Cursor", nextCursor);
+    }
 
     res.json({
       data: rows.map((row) => ({
         id: row.id,
         apiKeyLabel: row.api_key_label,
+        actor: row.api_key_label,
         action: row.action,
         target: row.target,
         ipAddress: row.ip_address,
         requestBodyHash: row.request_body_hash,
+        details: row.details ?? null,
         createdAt: row.created_at,
       })),
+      nextCursor,
       total,
       page,
-      pageSize,
+      pageSize: limit,
+      limit,
     });
   } catch (err) {
     next(err);
