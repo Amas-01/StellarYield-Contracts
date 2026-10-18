@@ -101,3 +101,52 @@ describe("GraphQL API key auth - #772", () => {
     expect(result.errors?.[0]?.message).toBe("Forbidden");
   });
 });
+
+
+describe("vaultTvlUpdated subscription - #1115", () => {
+  it("emits real-time TVL updates through subscription", async () => {
+    const { subscribe, parse } = await import("graphql");
+    const { tvlPubSub } = await import("../services/tvlPubSub.js");
+
+    const document = parse(`
+      subscription {
+        vaultTvlUpdated(contractId: "CV123") {
+          contractId
+          tvlUsd
+          snapshotAt
+        }
+      }
+    `);
+
+    const subscriptionResult = await subscribe({
+      schema,
+      document,
+      rootValue: root,
+    });
+
+    expect(Symbol.asyncIterator in subscriptionResult).toBe(true);
+    const iterator = (subscriptionResult as AsyncIterable<any>)[Symbol.asyncIterator]();
+
+    const nextPromise = iterator.next();
+
+    // Trigger emission on pubsub
+    tvlPubSub.publish({
+      contractId: "CV123",
+      tvlUsd: "5000000",
+      snapshotAt: "2026-09-27T10:00:00.000Z",
+    });
+
+    const result = await nextPromise;
+    expect(result.value).toEqual({
+      data: {
+        vaultTvlUpdated: {
+          contractId: "CV123",
+          tvlUsd: "5000000",
+          snapshotAt: "2026-09-27T10:00:00.000Z",
+        },
+      },
+    });
+
+    await iterator.return?.();
+  });
+});

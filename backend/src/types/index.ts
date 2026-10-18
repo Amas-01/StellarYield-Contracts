@@ -5,14 +5,6 @@ export type VaultState =
   | "Closed"
   | "Cancelled";
 
-declare global {
-  namespace Express {
-    interface Request {
-      queryTimeoutMs?: number;
-    }
-  }
-}
-
 export interface Vault {
   id: number;
   contractId: string;
@@ -36,6 +28,8 @@ export interface Vault {
   rwaSymbol: string | null;
   rwaDocumentUri: string | null;
   rwaCategory: string | null;
+  description: string | null;
+  logoUri: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -208,4 +202,47 @@ export interface PortfolioDiversification {
   vaultCount: number;
   categoryCount: number;
   herfindahlIndex: number;
+}
+
+export interface PortfolioValuePosition {
+  contractId: string;
+  shares: string;
+  valueUsd: string;
+  shareOfVault: number;
+}
+
+export interface PortfolioValueResponse {
+  address: string;
+  totalValueUsd: string;
+  positions: PortfolioValuePosition[];
+}
+
+export interface PortfolioHistoryEntry {
+  date: string;
+  totalValueUsd: string;
+}
+
+export interface FirstDepositResponse {
+  address: string;
+  firstDepositAt: Date;
+  contractId: string;
+}
+
+export interface RealizedYieldEntry {
+  contractId: string;
+  epochId: number;
+  yieldClaimed: string;
+  claimedAt: Date;
+}
+
+/** Trailing window for the per-vault transfer volume endpoint (#1074). */
+export type TransferVolumePeriod = "1d" | "7d" | "30d";
+
+export interface TransferVolume {
+  period: TransferVolumePeriod;
+  transferCount: number;
+  /** Base units as a string; exceeds Number.MAX_SAFE_INTEGER. */
+  totalVolume: string;
+  uniqueSenders: number;
+  uniqueRecipients: number;
 }

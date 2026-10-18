@@ -1,5 +1,6 @@
-import type { ErrorRequestHandler } from "express";
+import type { ErrorRequestHandler, Request } from "express";
 import { logger } from "../../logger.js";
+import { recordHttpError } from "../../services/metrics.js";
 
 export enum ErrorCode {
   VAULT_NOT_FOUND = "VAULT_NOT_FOUND",
@@ -25,8 +26,17 @@ export class AppError extends Error {
   }
 }
 
+function routeLabel(req: Request): string {
+  return req.route?.path ?? req.path;
+}
+
 export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
   (req.log ?? logger).error(err, "Unhandled error");
+
+  const statusCode = err instanceof AppError ? err.statusCode : (err.statusCode ?? 500);
+
+  // Error-rate metric (#831) — 4xx and 5xx only, tagged with the route pattern.
+  recordHttpError(routeLabel(req), statusCode);
 
   if (err instanceof AppError) {
     res.status(err.statusCode).json({
@@ -44,3 +54,13 @@ export const errorHandler: ErrorRequestHandler = (err, req, res, _next) => {
     statusCode: err.statusCode ?? 500,
   });
 };
+
+/**
+ * Terminal 404 handler (#831). Without this Express answers unmatched paths
+ * with its own plain-text 404 that never reaches the error handler, so those
+ * responses would be missing from http_errors_total.
+ */
+export const notFoundHandler: import("express").RequestHandler = (req, _res, next) => {
+  next(new AppError(ErrorCode.NOT_FOUND, `Route ${req.method} ${req.path} not found`, 404));
+};
+

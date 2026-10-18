@@ -81,6 +81,8 @@ pub struct SingleRwaVaultInitParams {
     pub timelock_delay: u64,
     /// Period over which claimed yield vests (0 = immediately claimable).
     pub yield_vesting_period: u64,
+    /// Maximum number of unique investors allowed (0 = unlimited).
+    pub max_investors: u32,
 }
 
 /// Parameters for batch vault creation (mirrors BatchVaultParams in Solidity).
@@ -101,6 +103,16 @@ pub struct BatchVaultParams {
     pub min_deposit: i128,
     pub max_deposit_per_user: i128,
     pub early_redemption_fee_bps: u32,
+    /// Optional: Share token decimals (defaults to factory default if not specified).
+    pub share_decimals: Option<u32>,
+    /// Optional: Vault admin override (defaults to factory admin if not specified).
+    pub vault_admin: Option<Address>,
+    /// Optional: KYC verifier override (defaults to factory default if not specified).
+    pub zkme_verifier: Option<Address>,
+    /// Optional: Cooperator override (defaults to factory default if not specified).
+    pub cooperator: Option<Address>,
+    /// Optional: Maximum number of investors (0 = unlimited, defaults to unlimited if not specified).
+    pub max_investors: Option<u32>,
 }
 
 /// Parameters for `create_single_rwa_vault_full`.

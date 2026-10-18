@@ -14,7 +14,7 @@ vi.mock("./user.js", () => ({
 vi.mock("./notifications.js", () => ({ NotificationService: vi.fn().mockImplementation(() => ({})) }));
 
 import { rpc, xdr, nativeToScVal } from "@stellar/stellar-sdk";
-import { Indexer, parseDepositEvent, parseYieldDistributedEvent, parseCancelFundingEvent, parseEarlyRedemptionProcessedEvent, parseEarlyRedemptionCancelledEvent } from "./indexer.js";
+import { Indexer, parseDepositEvent, parseYieldDistributedEvent, parseEpochFinalizedEvent, parseCancelFundingEvent, parseEarlyRedemptionProcessedEvent, parseEarlyRedemptionCancelledEvent, parseVaultNameUpdatedEvent } from "./indexer.js";
 import { getSorobanRpc } from "./stellar.js";
 
 const VAULT_CONTRACT = "CDLZFC3SYJYHZDQA6M57EYUC2XBDA6LQF3M6KFRDZ7TXJYJL2K3B";
@@ -248,6 +248,40 @@ describe("Indexer Event Parsers", () => {
     expect(parseYieldDistributedEvent(null)).toBeNull();
     expect(parseYieldDistributedEvent({})).toBeNull();
   });
+
+  it("parses epoch finalized event", () => {
+    const topics = [nativeToScVal("epoch_finalized"), nativeToScVal(5)];
+    const data = nativeToScVal([5000n, 123456789n]);
+
+    const result = parseEpochFinalizedEvent({ topics, data });
+    expect(result).toEqual({ epochId: 5, totalYield: 5000n, timestamp: 123456789n });
+  });
+});
+
+describe("Indexer epoch.finalized webhook", () => {
+  it("notifies after indexing an epoch finalization", async () => {
+    const notify = vi.fn().mockResolvedValue(undefined);
+    const indexer = new Indexer({ notify } as any);
+    const event = {
+      id: "evt-epoch-finalized",
+      contractId: VAULT_CONTRACT,
+      type: "contract",
+      ledger: 2000,
+      txHash: "epoch-finalized-tx",
+      ledgerClosedAt: "2025-06-01T00:00:00.000Z",
+      topic: [nativeToScVal("epoch_finalized"), nativeToScVal(7)],
+      value: nativeToScVal([9000n, 123456789n]),
+    };
+
+    await indexer.processEvent(event);
+
+    expect(notify).toHaveBeenCalledWith("epoch.finalized", {
+      contractId: VAULT_CONTRACT,
+      epochId: 7,
+      totalYield: "9000",
+      timestamp: "2025-06-01T00:00:00.000Z",
+    });
+  });
 });
 
 // ── Indexer tick tests ─────────────────────────────────────────────────────────
@@ -307,6 +341,36 @@ describe("Indexer tick", () => {
 
     const calls: string[] = (query as any).mock.calls.map((c: any[]) => c[0] as string);
     expect(calls.some((sql) => sql.includes("user_vault_positions"))).toBe(true);
+  });
+
+  it("stamps first_entry_at and clears last_exit_at on a deposit (#1083)", async () => {
+    const { getSorobanRpc } = await import("./stellar.js");
+    const { Indexer } = await import("./indexer.js");
+    const { query } = await import("../db/index.js");
+
+    const depositEvent = {
+      id: "0000000002",
+      contractId: "CCONTRACT123",
+      type: "contract",
+      ledger: 101,
+      txHash: "def456",
+      topic: [nativeToScVal("deposit"), nativeToScVal(account), nativeToScVal(account)],
+      value: nativeToScVal([500n, 500n]),
+    };
+
+    (getSorobanRpc as any).mockReturnValue({
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 101 }),
+      getEvents: vi.fn().mockResolvedValue({ events: [depositEvent], latestLedger: 101 }),
+    });
+    (query as any).mockResolvedValue([]);
+
+    await new Indexer().tick();
+
+    const upsert = (query as any).mock.calls
+      .map((c: any[]) => c[0] as string)
+      .find((sql: string) => sql.includes("INSERT INTO user_vault_positions"));
+    expect(upsert).toContain("first_entry_at = COALESCE(user_vault_positions.first_entry_at, NOW())");
+    expect(upsert).toContain("last_exit_at = NULL");
   });
 
   it("logs a warning and does not crash when RPC throws", async () => {
@@ -617,5 +681,44 @@ describe("parseKycVerifiedEvent", () => {
     expect(parseKycVerifiedEvent(null)).toBeNull();
     expect(parseKycVerifiedEvent({})).toBeNull();
     expect(parseKycVerifiedEvent({ topics: [], data: null })).toBeNull();
+  });
+});
+
+// ── Issue #968: parseVaultNameUpdatedEvent ────────────────────────────────────
+
+describe("parseVaultNameUpdatedEvent", () => {
+  it("parses a vault_name_updated event with full topic name", () => {
+    const caller = ACCOUNT;
+    const oldName = "Alpha Vault";
+    const newName = "Alpha Vault v2";
+    const topics = [nativeToScVal("vault_name_updated"), nativeToScVal(caller)];
+    const data = nativeToScVal([oldName, newName]);
+    const result = parseVaultNameUpdatedEvent({ topics, data });
+    expect(result).not.toBeNull();
+    expect(result?.caller).toBe(caller);
+    expect(result?.oldName).toBe(oldName);
+    expect(result?.newName).toBe(newName);
+  });
+
+  it("parses a v_name_upd event with short topic name", () => {
+    const caller = ACCOUNT;
+    const topics = [nativeToScVal("v_name_upd"), nativeToScVal(caller)];
+    const data = nativeToScVal(["Old Name", "New Name"]);
+    const result = parseVaultNameUpdatedEvent({ topics, data });
+    expect(result).not.toBeNull();
+    expect(result?.oldName).toBe("Old Name");
+    expect(result?.newName).toBe("New Name");
+  });
+
+  it("returns null for an unrecognised topic", () => {
+    const topics = [nativeToScVal("deposit"), nativeToScVal(ACCOUNT)];
+    const data = nativeToScVal(["A", "B"]);
+    expect(parseVaultNameUpdatedEvent({ topics, data })).toBeNull();
+  });
+
+  it("returns null for malformed events", () => {
+    expect(parseVaultNameUpdatedEvent(null)).toBeNull();
+    expect(parseVaultNameUpdatedEvent({})).toBeNull();
+    expect(parseVaultNameUpdatedEvent({ topics: [], data: null })).toBeNull();
   });
 });

@@ -70,6 +70,25 @@ describe("Apollo GraphQL server - #765", () => {
   });
 });
 
+describe("API metadata endpoints - #911/#912", () => {
+  it("returns the static changelog with the initial release", async () => {
+    const { default: supertest } = await import("supertest");
+    const res = await supertest(app).get("/api/changelog");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(expect.arrayContaining([
+      expect.objectContaining({ version: "1.0.0", breaking: false, changes: expect.any(Array) }),
+    ]));
+  });
+
+  it("sets the configured SLA header for vault requests", async () => {
+    const { default: supertest } = await import("supertest");
+    const res = await supertest(app).get("/api/v1/vaults");
+
+    expect(res.headers["x-sla-ms"]).toBe("200");
+  });
+});
+
 describe("Sandbox mode and security audit - #938/#936", () => {
   it("returns the sandbox header and a mocked success response for mutating endpoints", async () => {
     process.env.SANDBOX_MODE = "true";
@@ -105,3 +124,25 @@ describe("Sandbox mode and security audit - #938/#936", () => {
     ]));
   });
 });
+
+describe("HTTP request duration histogram metric per route", () => {
+  it("GET /metrics exposes http_request_duration_seconds_bucket with method and route labels", async () => {
+    const { default: supertest } = await import("supertest");
+    // Make a request to generate duration metrics
+    await supertest(app).get("/health");
+
+    const res = await supertest(app).get("/metrics");
+    expect(res.status).toBe(200);
+    expect(res.text).toContain("http_request_duration_seconds_bucket");
+    expect(res.text).toMatch(/http_request_duration_seconds_bucket\{le="0\.05",method="GET",route="\/health"\}/);
+    expect(res.text).toMatch(/http_request_duration_seconds_bucket\{le="0\.1",method="GET",route="\/health"\}/);
+    expect(res.text).toMatch(/http_request_duration_seconds_bucket\{le="0\.25",method="GET",route="\/health"\}/);
+    expect(res.text).toMatch(/http_request_duration_seconds_bucket\{le="0\.5",method="GET",route="\/health"\}/);
+    expect(res.text).toMatch(/http_request_duration_seconds_bucket\{le="1",method="GET",route="\/health"\}/);
+    expect(res.text).toMatch(/http_request_duration_seconds_bucket\{le="2",method="GET",route="\/health"\}/);
+    expect(res.text).toMatch(/http_request_duration_seconds_bucket\{le="5",method="GET",route="\/health"\}/);
+    expect(res.text).toMatch(/http_request_duration_seconds_bucket\{le="\+Inf",method="GET",route="\/health"\}/);
+    expect(res.text).toMatch(/http_request_duration_seconds_count\{method="GET",route="\/health"\}/);
+  });
+});
+

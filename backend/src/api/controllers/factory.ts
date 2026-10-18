@@ -1,6 +1,10 @@
 import type { Request, Response, NextFunction } from "express";
 import { query } from "../../db/index.js";
 import { config } from "../../config.js";
+import { getCurrentFactoryWasmHash } from "../../services/factory.js";
+
+const VAULT_COUNT_STATES = ["Funding", "Active", "Matured", "Cancelled"] as const;
+type VaultCountState = (typeof VAULT_COUNT_STATES)[number];
 
 // GET /api/v1/factory/admin-history — audit log of factory admin transfers (#839)
 export async function getFactoryAdminHistory(_req: Request, res: Response, next: NextFunction) {
@@ -118,3 +122,36 @@ export async function getFactoryEvents(req: Request, res: Response, next: NextFu
     next(err);
   }
 }
+
+// GET /api/v1/factory/operators — active factory-level role holders
+export async function getFactoryOperators(_req: Request, res: Response, next: NextFunction) {
+  try {
+    const factoryContractId = config.stellar.vaultFactoryContractId;
+
+    const rows = await query<{
+      address?: string;
+      user_address?: string;
+      role: string;
+      assigned_at?: Date | string;
+      assignedAt?: Date | string;
+      granted_at?: Date | string;
+    }>(
+      `SELECT address, role, assigned_at
+       FROM vault_roles
+       WHERE vault_id = $1 AND active = TRUE
+       ORDER BY assigned_at DESC`,
+      [factoryContractId],
+    );
+
+    res.json(
+      rows.map((r) => ({
+        address: r.address ?? r.user_address,
+        role: r.role,
+        assignedAt: r.assigned_at ?? r.assignedAt ?? r.granted_at,
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
+}
+

@@ -1,21 +1,35 @@
 import { vi, describe, it, expect, beforeEach } from "vitest";
 
 vi.mock("../../db/index.js", () => ({ query: vi.fn() }));
-vi.mock("../../config.js", () => ({
-  config: { stellar: { vaultFactoryContractId: "CFACTORY000000000000000000000000000000000000000000000" } },
+vi.mock("../../logger.js", () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
+vi.mock("../../config.js", () => ({
+  config: {
+    logLevel: "info",
+    nodeEnv: "test",
+    adminJwtSecret: "test-secret-at-least-32-chars-long-12345",
+    adminSessionExpiryMinutes: 60,
+    stellar: { vaultFactoryContractId: "CFACTORY000000000000000000000000000000000000000000000" },
+  },
+}));
+
 
 import {
   getFactoryAdminHistory,
   getVaultCreationRate,
   getFactoryDefaults,
   getFactoryEvents,
+  getFactoryOperators,
 } from "./factory.js";
+import { config } from "../../config.js";
+
 
 function makeRes() {
   return {
     json: vi.fn().mockReturnThis(),
     status: vi.fn().mockReturnThis(),
+    setHeader: vi.fn().mockReturnThis(),
   };
 }
 
@@ -142,3 +156,106 @@ describe("getFactoryEvents (#842)", () => {
     });
   });
 });
+
+describe("getFactoryOperators", () => {
+  const next = vi.fn();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns active factory-level role holders", async () => {
+    const { query } = await import("../../db/index.js");
+    const mockQuery = query as ReturnType<typeof vi.fn>;
+    mockQuery.mockResolvedValueOnce([
+      { address: "GOPERATOR1", role: "admin", assigned_at: new Date("2026-01-02") },
+      { address: "GOPERATOR2", role: "operator", assigned_at: new Date("2026-01-01") },
+    ]);
+
+    const res = makeRes();
+    await getFactoryOperators({} as any, res as any, next);
+
+    expect(mockQuery).toHaveBeenCalledWith(
+      expect.stringMatching(/FROM\s+vault_roles/i),
+      ["CFACTORY000000000000000000000000000000000000000000000"],
+    );
+    expect(res.json).toHaveBeenCalledWith([
+      { address: "GOPERATOR1", role: "admin", assignedAt: new Date("2026-01-02") },
+      { address: "GOPERATOR2", role: "operator", assignedAt: new Date("2026-01-01") },
+    ]);
+  });
+
+  it("returns [] if no role events for the factory have been indexed", async () => {
+    const { query } = await import("../../db/index.js");
+    const mockQuery = query as ReturnType<typeof vi.fn>;
+    mockQuery.mockResolvedValueOnce([]);
+
+    const res = makeRes();
+    await getFactoryOperators({} as any, res as any, next);
+
+    expect(res.json).toHaveBeenCalledWith([]);
+  });
+
+  it("forwards database errors to next", async () => {
+    const { query } = await import("../../db/index.js");
+    const mockQuery = query as ReturnType<typeof vi.fn>;
+    const dbError = new Error("DB error");
+    mockQuery.mockRejectedValueOnce(dbError);
+
+    const res = makeRes();
+    await getFactoryOperators({} as any, res as any, next);
+
+    expect(next).toHaveBeenCalledWith(dbError);
+  });
+});
+
+describe("GET /api/v1/factory/operators route protection", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("rejects unauthenticated requests with 401", async () => {
+    const express = (await import("express")).default;
+    const supertest = (await import("supertest")).default;
+    const { factoryRouter } = await import("../routes/factory.js");
+
+    const app = express();
+    app.use("/api/v1/factory", factoryRouter);
+
+    const res = await supertest(app).get("/api/v1/factory/operators");
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: "Unauthorized", message: "Missing API key" });
+  });
+
+  it("accepts requests with valid API key and returns factory operators", async () => {
+    const express = (await import("express")).default;
+    const supertest = (await import("supertest")).default;
+    const { factoryRouter } = await import("../routes/factory.js");
+    const { query } = await import("../../db/index.js");
+    const mockQuery = query as ReturnType<typeof vi.fn>;
+
+    // auth middleware looks up key in api_keys:
+    mockQuery.mockResolvedValueOnce([
+      { id: 1, role: "admin", label: "test-key", active: true, allowedMethods: null },
+    ]);
+    // touchLastUsed:
+    mockQuery.mockResolvedValueOnce([]);
+    // getFactoryOperators query for vault_roles:
+    mockQuery.mockResolvedValueOnce([
+      { address: "GOPERATOR1", role: "operator", assigned_at: new Date("2026-01-01T00:00:00Z") },
+    ]);
+
+    const app = express();
+    app.use("/api/v1/factory", factoryRouter);
+
+    const res = await supertest(app)
+      .get("/api/v1/factory/operators")
+      .set("Authorization", "Bearer valid-test-key");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([
+      { address: "GOPERATOR1", role: "operator", assignedAt: "2026-01-01T00:00:00.000Z" },
+    ]);
+  });
+});
+

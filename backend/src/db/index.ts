@@ -33,6 +33,26 @@ export const readPool: pg.Pool = config.db.readUrl
     })
   : pool;
 
+function setupPoolMetrics(p: pg.Pool, isRead: boolean): void {
+  import("../services/metrics.js")
+    .then(({ updatePgPoolMetrics }) => {
+      const update = () => updatePgPoolMetrics(p, isRead);
+      p.on("connect", update);
+      p.on("acquire", update);
+      p.on("release", update);
+      p.on("remove", update);
+      update();
+    })
+    .catch(() => {
+      // Ignore in environments without metrics
+    });
+}
+
+setupPoolMetrics(pool, false);
+if (config.db.readUrl && readPool !== pool) {
+  setupPoolMetrics(readPool, true);
+}
+
 const READ_ONLY_STATEMENT = /^\s*(?:select|show|explain)\b/i;
 
 /**

@@ -349,6 +349,32 @@ fn test_deposit_exceeds_funding_target_panics() {
 }
 
 #[test]
+fn test_small_over_target_deposit_is_rejected_without_mutating_state() {
+    let ctx = setup_with_kyc_bypass();
+    let user_a = Address::generate(&ctx.env);
+    let user_b = Address::generate(&ctx.env);
+
+    mint_usdc(&ctx.env, &ctx.asset_id, &user_a, 50_000_000);
+    ctx.vault().deposit(&user_a, &50_000_000i128, &user_a);
+
+    assert_eq!(ctx.vault().vault_state(), crate::VaultState::Funding);
+    assert_eq!(ctx.vault().total_assets(), 50_000_000i128);
+    assert_eq!(ctx.vault().balance(&user_a), 50_000_000i128);
+
+    mint_usdc(&ctx.env, &ctx.asset_id, &user_b, 50_000_001);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.vault().deposit(&user_b, &50_000_001i128, &user_b);
+    }));
+
+    assert!(result.is_err(), "overshooting the funding target should fail");
+    assert_eq!(ctx.vault().vault_state(), crate::VaultState::Funding);
+    assert_eq!(ctx.vault().total_assets(), 50_000_000i128);
+    assert_eq!(ctx.vault().balance(&user_a), 50_000_000i128);
+    assert_eq!(ctx.vault().balance(&user_b), 0i128);
+    assert_eq!(ctx.vault().user_deposited(&user_b), 0i128);
+}
+
+#[test]
 fn test_deposit_cap_not_applied_in_active_state() {
     let ctx = setup_with_kyc_bypass();
     mint_usdc(&ctx.env, &ctx.asset_id, &ctx.user, 150_000_000);

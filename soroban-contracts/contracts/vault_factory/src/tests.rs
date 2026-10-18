@@ -344,6 +344,44 @@ fn test_vault_count_matches_list_length() {
     });
 }
 
+/// Removing multiple vaults should update both the live count and all reported
+/// query results to match the remaining registry contents.
+#[test]
+fn test_vault_count_and_queries_reflect_multiples_removed() {
+    let e = Env::default();
+    e.mock_all_auths();
+
+    let (factory_id, admin) = setup_factory(&e);
+    let client = VaultFactoryClient::new(&e, &factory_id);
+
+    let keep_a = inject_vault(&e, &factory_id, false);
+    let remove_a = inject_vault(&e, &factory_id, false);
+    let keep_b = inject_vault(&e, &factory_id, false);
+    let remove_b = inject_vault(&e, &factory_id, false);
+
+    assert_eq!(client.get_vault_count(), 4);
+    assert_eq!(client.get_all_vaults().len(), 4);
+    assert_eq!(client.get_single_rwa_vaults().len(), 4);
+
+    client.remove_vault(&admin, &remove_a);
+    client.remove_vault(&admin, &remove_b);
+
+    assert_eq!(client.get_vault_count(), 2);
+    assert_eq!(client.get_all_vaults().len(), 2);
+    assert_eq!(client.get_single_rwa_vaults().len(), 2);
+
+    let all = client.get_all_vaults();
+    assert!(all.contains(keep_a.clone()));
+    assert!(all.contains(keep_b.clone()));
+    assert!(!all.contains(remove_a.clone()));
+    assert!(!all.contains(remove_b.clone()));
+
+    let single = client.get_single_rwa_vaults();
+    assert_eq!(single.len(), 2);
+    assert!(single.contains(keep_a));
+    assert!(single.contains(keep_b));
+}
+
 /// vault_count() alias returns the same value as get_vault_count().
 #[test]
 fn test_vault_count_alias_matches_get_vault_count() {

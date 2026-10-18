@@ -5,6 +5,7 @@ import { VaultService, validateFilterTree, VAULT_FIELD_ALLOWLIST, pickVaultField
 import { readTotalAssets, readVaultState, readPaused, readCooperator, readCooperatorFeeBps } from "../../services/stellar.js";
 import { query } from "../../db/index.js";
 import { AppError, ErrorCode } from "../middleware/errors.js";
+import type { TransferVolumePeriod } from "../../types/index.js";
 import { sseManager } from "../../services/sseManager.js";
 
 const vaultService = new VaultService();
@@ -1098,8 +1099,13 @@ export async function getCompoundProjection(req: Request, res: Response, next: N
  * Query params:
  *   - from: ISO datetime (optional)
  *   - to: ISO datetime (optional)
+ *   - bucket: "hour" | "day" | "week" (optional, #864). When present,
+ *     snapshots are aggregated per bucket with `date_trunc` and the response
+ *     is [{ bucket, avgTotalAssets, maxTotalAssets, minTotalAssets }].
+ *     `avgTotalAssets` is the mean of all snapshot values in the bucket.
  *
- * Response is capped at 500 data points and bucketed by hour if range > 48 hours.
+ * Without `bucket`, response is capped at 500 data points and bucketed by
+ * hour if range > 48 hours (legacy auto-bucketing).
  */
 export async function getVaultTvlHistory(req: Request, res: Response, next: NextFunction) {
   try {
@@ -1113,6 +1119,18 @@ export async function getVaultTvlHistory(req: Request, res: Response, next: Next
     // Parse query parameters
     const fromParam = req.query.from as string | undefined;
     const toParam = req.query.to as string | undefined;
+    const bucketParam = req.query.bucket as string | undefined;
+
+    // Explicit bucket strategy (#864)
+    if (bucketParam !== undefined) {
+      if (bucketParam !== "hour" && bucketParam !== "day" && bucketParam !== "week") {
+        res.status(400).json({
+          error: "BadRequest",
+          message: "Invalid bucket parameter. Supported values: hour, day, week",
+        });
+        return;
+      }
+    }
 
     let fromDate: Date | null = null;
     let toDate: Date | null = null;
@@ -1158,6 +1176,42 @@ export async function getVaultTvlHistory(req: Request, res: Response, next: Next
     }
 
     const whereClause = whereConditions.join(" AND ");
+
+    // Explicit configurable bucketing (#864): aggregate with date_trunc.
+    if (bucketParam === "hour" || bucketParam === "day" || bucketParam === "week") {
+      const bucketRows = await query<{
+        bucket: Date;
+        avg_total_assets: string;
+        max_total_assets: string;
+        min_total_assets: string;
+      }>(
+        `SELECT
+           date_trunc('${bucketParam}', recorded_at) AS bucket,
+           AVG(total_assets::numeric)::text AS avg_total_assets,
+           MAX(total_assets::numeric)::text AS max_total_assets,
+           MIN(total_assets::numeric)::text AS min_total_assets
+         FROM vault_tvl_snapshots
+         WHERE ${whereClause}
+         GROUP BY 1
+         ORDER BY 1 ASC
+         LIMIT 500`,
+        params,
+      );
+
+      const data = bucketRows.map((row) => ({
+        bucket:
+          row.bucket instanceof Date
+            ? row.bucket.toISOString()
+            : new Date(row.bucket).toISOString(),
+        avgTotalAssets: row.avg_total_assets,
+        maxTotalAssets: row.max_total_assets,
+        minTotalAssets: row.min_total_assets,
+      }));
+
+      setCacheHeaders(res);
+      res.json(data);
+      return;
+    }
 
     // Determine if we need to bucket by hour
     let needsBucketing = false;
@@ -1283,6 +1337,118 @@ export async function getFeeHistory(req: Request, res: Response, next: NextFunct
         recordedAt: r.recorded_at.toISOString(),
       })),
     );
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/v1/vaults/:contractId/whitelist-history
+ *
+ * Returns every on-chain whitelist change the indexer recorded for a vault,
+ * newest first, for audit purposes. Each entry is one `whitelist_updated` event,
+ * so a vault that was never touched returns an empty list. (#1094)
+ */
+export async function getWhitelistHistory(req: Request, res: Response, next: NextFunction) {
+  try {
+    const contractId = String(req.params["contractId"]);
+    const parsed = contractAddressSchema.safeParse(contractId);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+
+    const page = Math.max(1, parseInt(String(req.query["page"] ?? "1"), 10) || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(String(req.query["pageSize"] ?? "20"), 10) || 20));
+    const offset = (page - 1) * pageSize;
+
+    const rows = await query<{
+      address: string;
+      action: string;
+      tx_hash: string;
+      ledger: number;
+      created_at: Date;
+    }>(
+      `SELECT address, action, tx_hash, ledger, created_at
+       FROM whitelist_events
+       WHERE contract_id = $1
+       ORDER BY created_at DESC, id DESC
+       LIMIT $2 OFFSET $3`,
+      [parsed.data, pageSize, offset],
+    );
+
+    const countRows = await query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM whitelist_events WHERE contract_id = $1",
+      [parsed.data],
+    );
+    const total = parseInt(countRows[0]?.count ?? "0", 10);
+
+    const data = rows.map((r) => ({
+      address: r.address,
+      action: r.action,
+      txHash: r.tx_hash,
+      ledger: r.ledger,
+      createdAt: r.created_at.toISOString(),
+    }));
+
+    setCacheHeaders(res);
+    res.json({ data, total, page, pageSize });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/v1/vaults/:contractId/status-history
+ *
+ * Returns the full audit trail of a vault's on-chain status transitions
+ * (#1065) and manager changes (#1068), newest first. Each entry is one
+ * indexed event, distinguished by `eventType`.
+ */
+export async function getVaultStatusHistory(req: Request, res: Response, next: NextFunction) {
+  try {
+    const contractId = String(req.params["contractId"]);
+    const parsed = contractAddressSchema.safeParse(contractId);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+
+    const rows = await query<{
+      id: number;
+      contract_id: string;
+      event_type: string;
+      previous_status: string | null;
+      new_status: string | null;
+      previous_manager: string | null;
+      new_manager: string | null;
+      changed_at: Date;
+      tx_hash: string;
+      ledger: number;
+    }>(
+      `SELECT id, contract_id, event_type, previous_status, new_status,
+              previous_manager, new_manager, changed_at, tx_hash, ledger
+       FROM vault_status_history
+       WHERE contract_id = $1
+       ORDER BY changed_at DESC, id DESC`,
+      [parsed.data],
+    );
+
+    const data = rows.map((r) => ({
+      id: r.id,
+      contractId: r.contract_id,
+      eventType: r.event_type,
+      previousStatus: r.previous_status,
+      newStatus: r.new_status,
+      previousManager: r.previous_manager,
+      newManager: r.new_manager,
+      changedAt: r.changed_at.toISOString(),
+      txHash: r.tx_hash,
+      ledger: r.ledger,
+    }));
+
+    setCacheHeaders(res);
+    res.json({ data, total: data.length });
   } catch (err) {
     next(err);
   }
@@ -1537,4 +1703,193 @@ export function streamVaultEvents(req: Request, res: Response): void {
   }
 
   sseManager.addVaultClient(req, res, contractIds);
+}
+
+/**
+ * Issue #1076: GET /api/v1/vaults/:contractId/transfer-fees?from=&to=
+ * Returns total transfer fees collected for the vault within a date range.
+ */
+export async function getVaultTransferFees(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    const { from, to } = req.query as { from?: string; to?: string };
+    let fromIso: string | null = null;
+    let toIso: string | null = null;
+
+    if (from !== undefined && from !== "") {
+      const fromDate = new Date(from);
+      if (Number.isNaN(fromDate.getTime())) {
+        res.status(400).json({ error: "BadRequest", message: "Invalid from date" });
+        return;
+      }
+      fromIso = fromDate.toISOString();
+    }
+
+    if (to !== undefined && to !== "") {
+      const toDate = new Date(to);
+      if (Number.isNaN(toDate.getTime())) {
+        res.status(400).json({ error: "BadRequest", message: "Invalid to date" });
+        return;
+      }
+      toIso = toDate.toISOString();
+    }
+
+    if (fromIso && toIso && new Date(fromIso) > new Date(toIso)) {
+      res.status(400).json({ error: "BadRequest", message: "from must not be after to" });
+      return;
+    }
+
+    const rows = await query<{ total_fees: string }>(
+      `SELECT COALESCE(SUM(fee_amount), 0)::text AS total_fees
+       FROM transfer_fees
+       WHERE contract_id = $1
+         AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
+         AND ($3::timestamptz IS NULL OR created_at <= $3::timestamptz)`,
+      [contractId, fromIso, toIso],
+    );
+
+    const totalFees = rows[0]?.total_fees ?? "0";
+
+    res.json({
+      contractId,
+      totalFees,
+      from: from ?? null,
+      to: to ?? null,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/v1/vaults/:contractId/transfer-volume?period=1d|7d|30d (#1074)
+ *
+ * Share trading activity for a vault token, used by the platform analytics
+ * widgets. The period is validated by the route schema against a fixed set, so
+ * an unrecognised value is a 400 rather than a silently widened window that
+ * would report a number the caller did not ask for.
+ */
+export async function getTransferVolume(req: Request, res: Response, next: NextFunction) {
+  try {
+    const contractId = String(req.params["contractId"]);
+    const period = req.query["period"] as TransferVolumePeriod;
+
+    res.json(await vaultService.getTransferVolume(contractId, period));
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * Issue #1075: GET /api/v1/vaults/:contractId/transfer-leaderboard?limit=10
+ * Returns top addresses sorted by total transfer activity (sentCount + receivedCount) descending.
+ */
+export async function getVaultTransferLeaderboard(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    let limit = 10;
+    if (req.query.limit !== undefined && req.query.limit !== "") {
+      const parsedLimit = parseInt(String(req.query.limit), 10);
+      if (Number.isNaN(parsedLimit) || parsedLimit <= 0) {
+        res.status(400).json({ error: "BadRequest", message: "Invalid limit parameter" });
+        return;
+      }
+      limit = Math.min(parsedLimit, 100);
+    }
+
+    const rows = await query<{
+      address: string;
+      sentCount: string | number;
+      receivedCount: string | number;
+      netVolume: string | number;
+    }>(
+      `WITH vault_transfers AS (
+         SELECT t.from_address, t.to_address, t.amount
+         FROM transfers t
+         JOIN vaults v ON v.id = t.vault_id
+         WHERE v.contract_id = $1
+       ),
+       sent AS (
+         SELECT from_address AS address,
+                COUNT(*)::bigint AS sent_count,
+                COALESCE(SUM(amount), 0)::numeric AS sent_volume
+         FROM vault_transfers
+         GROUP BY from_address
+       ),
+       received AS (
+         SELECT to_address AS address,
+                COUNT(*)::bigint AS received_count,
+                COALESCE(SUM(amount), 0)::numeric AS received_volume
+         FROM vault_transfers
+         GROUP BY to_address
+       ),
+       combined AS (
+         SELECT
+           COALESCE(s.address, r.address) AS address,
+           COALESCE(s.sent_count, 0)::bigint AS sent_count,
+           COALESCE(r.received_count, 0)::bigint AS received_count,
+           (COALESCE(r.received_volume, 0) - COALESCE(s.sent_volume, 0))::numeric AS net_volume
+         FROM sent s
+         FULL OUTER JOIN received r ON s.address = r.address
+       )
+       SELECT
+         address,
+         sent_count AS "sentCount",
+         received_count AS "receivedCount",
+         net_volume::text AS "netVolume"
+       FROM combined
+       ORDER BY (sent_count + received_count) DESC, address ASC
+       LIMIT $2`,
+      [contractId, limit],
+    );
+
+    res.json(
+      rows.map((row) => ({
+        address: row.address,
+        sentCount: parseInt(String(row.sentCount), 10),
+        receivedCount: parseInt(String(row.receivedCount), 10),
+        netVolume: String(row.netVolume ?? "0"),
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
 }

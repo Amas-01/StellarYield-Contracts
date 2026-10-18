@@ -9,6 +9,16 @@ export function getSorobanRpc(): rpc.Server {
 }
 
 /**
+ * Query the latest ledger sequence from the Soroban RPC server.
+ * Lightweight call used by the indexer and /health latency check.
+ */
+export async function getLatestLedger(): Promise<rpc.Api.GetLatestLedgerResponse> {
+  const server = getSorobanRpc();
+  return server.getLatestLedger();
+}
+
+
+/**
  * Simulate a read-only contract call and return the decoded native value.
  * Uses a zero-sequence throwaway account — no signing required for simulations.
  * Automatically retries on fallback RPC endpoints (#746) with configurable timeout (#747).

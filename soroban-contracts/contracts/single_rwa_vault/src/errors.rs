@@ -91,4 +91,8 @@ pub enum Error {
     YieldShortfallNotFound = 51,
     /// The resolution amount is greater than the recorded shortfall.
     InsufficientShortfall = 52,
+    /// Maximum number of investors reached.
+    MaxInvestorsReached = 53,
+    /// Vault balance is insufficient for the requested transfer.
+    InsufficientVaultBalance = 54,
 }

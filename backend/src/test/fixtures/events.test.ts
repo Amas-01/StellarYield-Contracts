@@ -19,6 +19,7 @@ import {
   parseZkmeVerifierUpdatedEvent,
   parseAdminTransferredEvent,
   parseDefaultsUpdatedEvent,
+  parseWasmHashUpdatedEvent,
   parseKycSetEvent,
   parsePausedEvent,
   parseUnpausedEvent,
@@ -46,6 +47,7 @@ import {
   makeZkmeVerifierUpdatedEvent,
   makeAdminTransferredEvent,
   makeDefaultsUpdatedEvent,
+  makeWasmHashUpdatedEvent,
   makeKycSetEvent,
   makePausedEvent,
   makeUnpausedEvent,
@@ -155,6 +157,15 @@ describe("event fixture factory (#697)", () => {
       makeDefaultsUpdatedEvent({ asset: "XLM", zkmeVerifier: USER_ADDRESS, cooperator: OTHER_ADDRESS }),
     );
     expect(parsed).toEqual({ asset: "XLM", zkmeVerifier: USER_ADDRESS, cooperator: OTHER_ADDRESS });
+  });
+
+  it("makeWasmHashUpdatedEvent parses to the expected fields (#837)", () => {
+    const oldHash = "a".repeat(64);
+    const newHash = "b".repeat(64);
+    const parsed = parseWasmHashUpdatedEvent(
+      makeWasmHashUpdatedEvent({ oldHash, newHash, updatedBy: OTHER_ADDRESS }),
+    );
+    expect(parsed).toEqual({ oldHash, newHash, updatedBy: OTHER_ADDRESS });
   });
 
   it("makeKycSetEvent parses to the expected fields", () => {

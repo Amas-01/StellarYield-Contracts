@@ -2,6 +2,7 @@ import type { Epoch } from "../types/index.js";
 import { query } from "../db/index.js";
 import { cacheGet, cacheSet, cacheDel } from "../cache/redis.js";
 import { config } from "../config.js";
+import { FIXED_POINT_DECIMALS, formatYieldPerShare, parseFixedPoint } from "../utils/fixedPoint.js";
 
 const EPOCHS_CACHE_TTL = 30;
 const PENDING_YIELD_CACHE_TTL = 10;
@@ -14,18 +15,96 @@ export interface EpochFilterOptions {
   maxYield?: string;
 }
 
+/**
+ * Inclusive epoch-number window plus keyset pagination for the multi-epoch
+ * batch endpoint (#1072).
+ */
+export interface EpochRangeOptions {
+  /** Inclusive lower bound on `epoch`; open-ended when omitted. */
+  from?: number;
+  /** Inclusive upper bound on `epoch`; open-ended when omitted. */
+  to?: number;
+  /** Page size, already bounded by the route schema. */
+  limit: number;
+  /** Inclusive lower bound on `yield_amount`; open-ended when omitted. */
+  minYield?: string;
+  /** Inclusive upper bound on `yield_amount`; open-ended when omitted. */
+  maxYield?: string;
+  /** Opaque base64url cursor from a previous page's `nextCursor`. */
+  cursor?: string;
+}
+
+/** One page of epoch summaries, ascending by epoch. */
+export interface EpochRangePage {
+  epochs: Epoch[];
+  /** Cursor for the following page, or null when this is the last page. */
+  nextCursor: string | null;
+}
+
+/**
+ * Cursor payload for the epoch batch endpoint (#1072). The epoch number is the
+ * ordering key and is unique per vault (`UNIQUE (vault_id, epoch)`), so no
+ * tiebreaker column is needed — a seek on `epoch > cursor` can neither skip nor
+ * duplicate a row even when several epochs are recorded in the same ledger.
+ */
+interface EpochCursorPayload {
+  /** Schema version, so a future cursor shape can be rejected cleanly. */
+  v: 1;
+  /** Vault the cursor was issued for; a cursor from another vault is rejected. */
+  c: string;
+  /** Last epoch returned on the previous page. */
+  e: number;
+}
+
+/** Raised when a supplied cursor cannot be used to continue a listing. */
+export class InvalidEpochCursorError extends Error {
+  constructor(message = "Invalid cursor") {
+    super(message);
+    this.name = "InvalidEpochCursorError";
+  }
+}
+
+function encodeEpochCursor(payload: EpochCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+/**
+ * Decode a cursor, rejecting anything that is not a well-formed token for the
+ * requested vault.
+ *
+ * A malformed or foreign cursor is an error rather than something to silently
+ * ignore: silently falling back to the first page would hand the client a
+ * duplicate page and hide the bug in the client.
+ */
+function decodeEpochCursor(cursor: string, contractId: string): number {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+  } catch {
+    throw new InvalidEpochCursorError("Cursor is not a valid base64url token");
+  }
+
+  if (typeof decoded !== "object" || decoded === null) {
+    throw new InvalidEpochCursorError("Cursor payload must be an object");
+  }
+
+  const payload = decoded as Partial<EpochCursorPayload>;
+  if (payload.v !== 1) {
+    throw new InvalidEpochCursorError("Unsupported cursor version");
+  }
+  if (payload.c !== contractId) {
+    throw new InvalidEpochCursorError("Cursor was issued for a different vault");
+  }
+  if (!Number.isInteger(payload.e) || (payload.e as number) < 0) {
+    throw new InvalidEpochCursorError("Cursor epoch must be a non-negative integer");
+  }
+
+  return payload.e as number;
+}
+
 export class YieldService {
   private formatYieldPerShare(yieldAmount: string, totalShares: string): string {
-    const yieldBig = BigInt(yieldAmount);
-    const sharesBig = BigInt(totalShares);
-    if (sharesBig === BigInt(0)) return "0";
-    const DECIMALS = BigInt(10) ** BigInt(18);
-    const result = (yieldBig * DECIMALS) / sharesBig;
-    const resultStr = result.toString();
-    const padded = resultStr.padStart(19, "0");
-    const integer = padded.slice(0, -18);
-    const fraction = padded.slice(-18);
-    return `${integer}.${fraction}`;
+    return formatYieldPerShare(yieldAmount, totalShares);
   }
 
   /**
@@ -95,6 +174,148 @@ export class YieldService {
 
     await cacheSet(cacheKey, epochs, EPOCHS_CACHE_TTL);
     return epochs;
+  }
+
+  /**
+   * Fetch one page of epoch summaries for an inclusive epoch window, ascending
+   * by epoch (#1072).
+   *
+   * Backs the yield-history chart, where a single request replaces N round
+   * trips. Pagination is keyset-based on `epoch`: the cursor carries the last
+   * epoch of the previous page and the next query seeks `epoch > cursor`, so
+   * pages stay stable and cheap no matter how deep the history runs, and no
+   * `COUNT(*)` is needed to know whether another page exists — the query
+   * over-fetches by one row and the extra row is trimmed.
+   *
+   * Unlike {@link getVaultEpochs}, this result is not cached: the window and
+   * cursor make the key space unbounded, and a stale page would be handed out
+   * with a cursor that no longer matches the rows behind it.
+   */
+  async getEpochsInRange(
+    contractId: string,
+    options: EpochRangeOptions,
+  ): Promise<EpochRangePage> {
+    const { from, to, limit, minYield, maxYield } = options;
+
+    const params: unknown[] = [contractId];
+    const conditions = ["v.contract_id = $1"];
+
+    if (from !== undefined) {
+      params.push(from);
+      conditions.push(`e.epoch >= $${params.length}`);
+    }
+    if (to !== undefined) {
+      params.push(to);
+      conditions.push(`e.epoch <= $${params.length}`);
+    }
+    // Yield bounds compose with the window and the cursor rather than replacing
+    // them, so `?minYield=...&limit=50` still means "the cheapest-above-X epochs
+    // from here, 50 at a time". Same column and comparison as getVaultEpochs, so
+    // a filtered page returns the same rows the unbounded route would.
+    if (minYield !== undefined) {
+      params.push(minYield);
+      conditions.push(`e.yield_amount >= $${params.length}::numeric`);
+    }
+    if (maxYield !== undefined) {
+      params.push(maxYield);
+      conditions.push(`e.yield_amount <= $${params.length}::numeric`);
+    }
+    if (options.cursor !== undefined) {
+      const afterEpoch = decodeEpochCursor(options.cursor, contractId);
+      params.push(afterEpoch);
+      conditions.push(`e.epoch > $${params.length}`);
+    }
+
+    // Over-fetch by one so a full page plus one row means "there is more".
+    params.push(limit + 1);
+
+    const rows = await query<{
+      id: number;
+      vault_id: number;
+      epoch: number;
+      yield_amount: string;
+      total_shares: string;
+      distributed_at: Date | null;
+      net_yield: string | null;
+    }>(
+      `SELECT e.id, e.vault_id, e.epoch, e.yield_amount, e.total_shares, e.distributed_at,
+              (ie.payload->>'netYield') AS net_yield
+       FROM epochs e
+       JOIN vaults v ON e.vault_id = v.id
+       LEFT JOIN LATERAL (
+         SELECT payload FROM indexed_events
+         WHERE contract_id = v.contract_id
+           AND event_type = 'yield_distributed'
+           AND (payload->>'epoch')::int = e.epoch
+         ORDER BY created_at DESC
+         LIMIT 1
+       ) ie ON TRUE
+       WHERE ${conditions.join(" AND ")}
+       ORDER BY e.epoch ASC
+       LIMIT $${params.length}`,
+      params,
+    );
+
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+
+    const epochs = page.map((row) => ({
+      id: row.id,
+      vaultId: row.vault_id,
+      epoch: row.epoch,
+      yieldAmount: row.yield_amount,
+      totalShares: row.total_shares,
+      distributedAt: row.distributed_at,
+      netYield: row.net_yield ?? row.yield_amount,
+    }));
+
+    const last = epochs[epochs.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeEpochCursor({ v: 1, c: contractId, e: last.epoch })
+        : null;
+
+    return { epochs, nextCursor };
+  }
+
+  /**
+   * Yield-per-share for a single finalized epoch (#1071).
+   *
+   * The ratio is `totalYield / totalShares` captured at epoch close, so it is
+   * only reported once the epoch is final. `epochs.closed_at` is the same
+   * marker the epoch-closed webhook uses (set exactly once, when the yield has
+   * been fully claimed), so an epoch still accumulating claims returns null and
+   * the controller answers 404 rather than publishing a number that can still
+   * move.
+   *
+   * Returns null when the vault has no such epoch, or when the epoch exists but
+   * is not yet finalized.
+   */
+  async getEpochYieldPerShare(
+    contractId: string,
+    epoch: number,
+  ): Promise<{ epochId: number; yieldPerShare: string; decimals: number } | null> {
+    const rows = await query<{
+      epoch: number;
+      yield_amount: string;
+      total_shares: string;
+      closed_at: Date | null;
+    }>(
+      `SELECT e.epoch, e.yield_amount, e.total_shares, e.closed_at
+       FROM epochs e
+       JOIN vaults v ON e.vault_id = v.id
+       WHERE v.contract_id = $1 AND e.epoch = $2`,
+      [contractId, epoch],
+    );
+
+    const row = rows[0];
+    if (!row || !row.closed_at) return null;
+
+    return {
+      epochId: row.epoch,
+      yieldPerShare: this.formatYieldPerShare(row.yield_amount, row.total_shares),
+      decimals: FIXED_POINT_DECIMALS,
+    };
   }
 
   /**
@@ -220,6 +441,61 @@ export class YieldService {
     );
 
     return parseInt(fallbackRows[0]?.holder_count ?? "0", 10);
+  }
+
+  /**
+   * Return the finalized yield and allocation for every holder at an epoch's
+   * close-time share snapshot.
+   */
+  async getEpochSummary(
+    contractId: string,
+    epoch: number,
+  ): Promise<{
+    epochId: number;
+    totalYield: string;
+    holderCount: number;
+    distributions: Array<{ address: string; amount: string }>;
+  } | null> {
+    const epochRows = await query<{
+      vault_id: number;
+      epoch: number;
+      yield_amount: string;
+      total_shares: string;
+    }>(
+      `SELECT e.vault_id, e.epoch, e.yield_amount, e.total_shares
+       FROM epochs e
+       JOIN vaults v ON e.vault_id = v.id
+       WHERE v.contract_id = $1 AND e.epoch = $2`,
+      [contractId, epoch],
+    );
+
+    const epochRow = epochRows[0];
+    if (!epochRow) return null;
+
+    const holderRows = await query<{ address: string; shares: string }>(
+      `SELECT user_address AS address, SUM(shares)::text AS shares
+       FROM share_balance_snapshots
+       WHERE vault_id = $1 AND epoch = $2 AND shares::numeric > 0
+       GROUP BY user_address
+       ORDER BY user_address`,
+      [epochRow.vault_id, epoch],
+    );
+
+    const totalYield = BigInt(epochRow.yield_amount);
+    const totalShares = BigInt(epochRow.total_shares);
+    const distributions = holderRows.map((holder) => ({
+      address: holder.address,
+      amount: totalShares > 0n
+        ? (totalYield * BigInt(holder.shares) / totalShares).toString()
+        : "0",
+    }));
+
+    return {
+      epochId: epochRow.epoch,
+      totalYield: epochRow.yield_amount,
+      holderCount: distributions.length,
+      distributions,
+    };
   }
 
   /**
@@ -606,9 +882,7 @@ export class YieldService {
 
   /** Parse a "X.Y" yield-per-share string back to a BigInt of scaled units. */
   private parseYieldPerShare(yps: string): bigint {
-    const [intPart, fracPart = ""] = yps.split(".");
-    const frac = fracPart.padEnd(18, "0").slice(0, 18);
-    return BigInt(intPart + frac);
+    return parseFixedPoint(yps);
   }
 
   // ── Next epoch projection (#821) ────────────────────────────────────────────
@@ -1408,4 +1682,3 @@ export class YieldService {
     }));
   }
 }
-

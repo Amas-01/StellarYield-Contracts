@@ -1,35 +1,77 @@
 import type { Request, Response, NextFunction } from "express";
-import { YieldService } from "../../services/yield.js";
+import { YieldService, InvalidEpochCursorError } from "../../services/yield.js";
 import { NotificationService } from "../../services/notifications.js";
+import { formatYieldPerShare } from "../../utils/fixedPoint.js";
+import type { Epoch } from "../../types/index.js";
+
+/** Default page size for the multi-epoch batch window (#1072). */
+const DEFAULT_EPOCH_PAGE_SIZE = 100;
+
+/** Response header carrying the continuation cursor for the next page (#1072). */
+const NEXT_CURSOR_HEADER = "X-Next-Cursor";
 
 const yieldService = new YieldService();
 const notificationService = new NotificationService();
 
-function formatYieldPerShare(yieldAmount: string, totalShares: string): string {
-  const yieldBig = BigInt(yieldAmount);
-  const sharesBig = BigInt(totalShares);
-  if (sharesBig === BigInt(0)) return "0";
-  const DECIMALS = BigInt(10) ** BigInt(18);
-  const result = (yieldBig * DECIMALS) / sharesBig;
-  const resultStr = result.toString();
-  const padded = resultStr.padStart(19, "0");
-  const integer = padded.slice(0, -18);
-  const fraction = padded.slice(-18);
-  return `${integer}.${fraction}`;
+/**
+ * Shape one epoch for the list/batch responses. `status` and
+ * `participationRate` come from the vault-wide claim/holder rollups, which are
+ * fetched in one query each so the cost does not grow with the page size
+ * (#816, #817).
+ */
+function toEpochSummary(
+  epoch: Epoch,
+  claimStats: Map<number, { claimedAmount: string; uniqueClaimants: number }>,
+  holderCounts: Map<number, number>,
+) {
+  const stats = claimStats.get(epoch.epoch) ?? { claimedAmount: "0", uniqueClaimants: 0 };
+  const totalHolders = holderCounts.get(epoch.epoch) ?? 0;
+  return {
+    ...epoch,
+    netYield: epoch.netYield,
+    yieldPerShare: formatYieldPerShare(epoch.yieldAmount, epoch.totalShares),
+    distributedAt: epoch.distributedAt ? epoch.distributedAt.toISOString() : null,
+    status: yieldService.deriveEpochStatus(epoch.yieldAmount, stats.claimedAmount),
+    participationRate: yieldService.calculateParticipationRate(stats.uniqueClaimants, totalHolders),
+  };
 }
 
 export async function getVaultEpochs(req: Request, res: Response, next: NextFunction) {
   try {
     const contractId = String(req.params["contractId"]);
-    // Yield range filters, already validated by the route schema (#858).
-    const { minYield, maxYield } = (req.query ?? {}) as unknown as {
+    // Validated by the route schema: yield range (#858), epoch window and
+    // keyset pagination (#1072).
+    const { minYield, maxYield, from, to, limit, cursor } = (req.query ?? {}) as unknown as {
       minYield?: string;
       maxYield?: string;
+      from?: number;
+      to?: number;
+      limit?: number;
+      cursor?: string;
     };
-    const epochs = await yieldService.getVaultEpochs(contractId, {
-      minYield,
-      maxYield,
-    });
+
+    // Paging is opt-in: a request that names no window and no page stays on the
+    // original unbounded listing, so existing clients are unaffected.
+    const paged =
+      from !== undefined || to !== undefined || limit !== undefined || cursor !== undefined;
+
+    let epochs: Epoch[];
+    let nextCursor: string | null = null;
+
+    if (paged) {
+      const page = await yieldService.getEpochsInRange(contractId, {
+        from,
+        to,
+        limit: limit ?? DEFAULT_EPOCH_PAGE_SIZE,
+        cursor,
+        minYield,
+        maxYield,
+      });
+      epochs = page.epochs;
+      nextCursor = page.nextCursor;
+    } else {
+      epochs = await yieldService.getVaultEpochs(contractId, { minYield, maxYield });
+    }
 
     // Batched per-vault lookups so status/participationRate don't cost an
     // extra pair of queries per epoch (#816, #817).
@@ -38,23 +80,47 @@ export async function getVaultEpochs(req: Request, res: Response, next: NextFunc
       yieldService.getHolderCountsForVault(contractId),
     ]);
 
-    res.json(
-      epochs.map((e) => {
-        const stats = claimStats.get(e.epoch) ?? { claimedAmount: "0", uniqueClaimants: 0 };
-        const totalHolders = holderCounts.get(e.epoch) ?? 0;
-        return {
-          ...e,
-          netYield: e.netYield,
-          yieldPerShare: formatYieldPerShare(e.yieldAmount, e.totalShares),
-          distributedAt: e.distributedAt ? e.distributedAt.toISOString() : null,
-          status: yieldService.deriveEpochStatus(e.yieldAmount, stats.claimedAmount),
-          participationRate: yieldService.calculateParticipationRate(
-            stats.uniqueClaimants,
-            totalHolders,
-          ),
-        };
-      }),
-    );
+    // The body stays a plain array of epoch summaries, so the continuation
+    // token rides in a header rather than wrapping the payload in an envelope.
+    if (nextCursor) {
+      res.set(NEXT_CURSOR_HEADER, nextCursor);
+    }
+
+    res.json(epochs.map((e) => toEpochSummary(e, claimStats, holderCounts)));
+  } catch (err) {
+    if (err instanceof InvalidEpochCursorError) {
+      res.status(400).json({ error: "BadRequest", message: err.message });
+      return;
+    }
+    next(err);
+  }
+}
+
+/**
+ * GET /api/v1/yields/:contractId/epochs/:epochId/yield-per-share (#1071).
+ *
+ * A consumer computing a holder's yield needs the per-share ratio for one
+ * epoch. The ratio is only meaningful once the epoch is final, so an epoch that
+ * is missing or still open answers 404 — the same response a client would get
+ * for an unknown epoch, since neither can be turned into a correct number yet.
+ */
+export async function getEpochYieldPerShare(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const contractId = String(req.params["contractId"]);
+    // Validated as a positive integer by the route schema (#1071).
+    const epochId = Number(req.params["epochId"]);
+
+    const result = await yieldService.getEpochYieldPerShare(contractId, epochId);
+    if (!result) {
+      res.status(404).json({ error: "NotFound", message: "Epoch not found or not yet finalized" });
+      return;
+    }
+
+    res.json(result);
   } catch (err) {
     next(err);
   }
@@ -83,6 +149,23 @@ export async function getEpochDetail(req: Request, res: Response, next: NextFunc
         totalHolders,
       ),
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getEpochSummary(req: Request, res: Response, next: NextFunction) {
+  try {
+    const summary = await yieldService.getEpochSummary(
+      String(req.params["contractId"]),
+      Number(req.params["epoch"]),
+    );
+    if (!summary) {
+      res.status(404).json({ error: "NotFound", message: "Epoch not found" });
+      return;
+    }
+
+    res.json(summary);
   } catch (err) {
     next(err);
   }
@@ -393,4 +476,3 @@ export async function getYieldVolatility(
     next(err);
   }
 }
-

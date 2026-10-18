@@ -44,6 +44,8 @@ pub struct InitParams {
     /// Lock-up period in seconds after deposit during which shares cannot be transferred or redeemed.
     /// 0 means no lock-up.
     pub lock_up_period: u64,
+    /// Maximum number of unique investors allowed (0 = unlimited).
+    pub max_investors: u32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -3,16 +3,6 @@ import { ROUTE_CACHE_CONTROL } from "../../config.js";
 
 const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
-function getCacheControlHeader(path: string): string {
-  // Check exact path match or prefix match in ROUTE_CACHE_CONTROL map
-  for (const [pattern, maxAge] of Object.entries(ROUTE_CACHE_CONTROL)) {
-    if (path === pattern || path.startsWith(`${pattern}/`)) {
-      return maxAge > 0 ? `public, max-age=${maxAge}` : "no-store";
-    }
-  }
-  return "no-store";
-}
-
 export function cacheControl(
   configMap: Record<string, number> = ROUTE_CACHE_CONTROL,
 ) {

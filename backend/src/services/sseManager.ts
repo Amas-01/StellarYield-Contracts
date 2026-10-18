@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 import { config } from "../config.js";
 import { cacheGet, cacheSet } from "../cache/redis.js";
+import { decrementSseConnections, incrementSseConnections, resetSseConnections } from "./metrics.js";
 
 export interface VaultSseEvent {
   contractId: string;
@@ -72,6 +73,8 @@ export class SseManager {
 
     // Increment server-side SSE connection counter (#760)
     this.activeConnections++;
+    // Prometheus gauge for capacity planning (#1092)
+    incrementSseConnections();
 
     // Setup heartbeat interval (#759)
     const heartbeatTimer = setInterval(() => {
@@ -97,6 +100,7 @@ export class SseManager {
         clearInterval(heartbeatTimer);
         this.vaultClients.delete(clientId);
         this.activeConnections = Math.max(0, this.activeConnections - 1);
+        decrementSseConnections();
       }
     };
 
@@ -154,6 +158,8 @@ export class SseManager {
 
     // Increment server-side SSE connection counter (#760)
     this.activeConnections++;
+    // Prometheus gauge for capacity planning (#1092)
+    incrementSseConnections();
 
     // Setup heartbeat interval (#759)
     const heartbeatTimer = setInterval(() => {
@@ -174,6 +180,7 @@ export class SseManager {
         clearInterval(heartbeatTimer);
         this.indexerClients.delete(clientId);
         this.activeConnections = Math.max(0, this.activeConnections - 1);
+        decrementSseConnections();
       }
     };
 
@@ -256,6 +263,7 @@ export class SseManager {
     this.vaultClients.clear();
     this.indexerClients.clear();
     this.activeConnections = 0;
+    resetSseConnections();
     this.vaultEventCounters.clear();
     this.vaultEventBuffers.clear();
     this.warmedContractIds.clear();

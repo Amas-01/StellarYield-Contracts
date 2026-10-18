@@ -12,6 +12,10 @@ import type {
   PortfolioAllocation,
   PortfolioAllocationResponse,
   PortfolioDiversification,
+  PortfolioValueResponse,
+  PortfolioHistoryEntry,
+  FirstDepositResponse,
+  RealizedYieldEntry,
 } from "../types/index.js";
 import { EventEmitter } from "node:events";
 import { query } from "../db/index.js";
@@ -708,5 +712,180 @@ export class UserService {
     }
 
     return { months: monthsResult };
+  }
+
+  /**
+   * Get user portfolio value with USD calculations based on latest TVL per share.
+   * #1079
+   */
+  async getUserPortfolioValue(address: string): Promise<PortfolioValueResponse> {
+    const positions = await query<{
+      contract_id: string;
+      shares: string;
+      total_assets: string;
+      total_supply: string;
+    }>(
+      `SELECT v.contract_id, uvp.shares, v.total_assets, v.total_supply
+       FROM user_vault_positions uvp
+       JOIN vaults v ON uvp.vault_id = v.id
+       WHERE uvp.user_address = $1 AND uvp.shares > 0`,
+      [address],
+    );
+
+    const transformedPositions = positions.map((row) => {
+      const shares = BigInt(row.shares || "0");
+      const totalAssets = BigInt(Math.round(parseFloat(row.total_assets || "0")));
+      const totalSupply = BigInt(Math.round(parseFloat(row.total_supply || "0")));
+
+      const tvlPerShare = totalSupply > 0n ? totalAssets / totalSupply : 0n;
+      const valueUsd = shares * tvlPerShare;
+      const shareOfVault = totalSupply > 0n ? Number(shares) / Number(totalSupply) : 0;
+
+      return {
+        contractId: row.contract_id,
+        shares: row.shares,
+        valueUsd: valueUsd.toString(),
+        shareOfVault,
+      };
+    });
+
+    const totalValueUsd = transformedPositions.reduce(
+      (sum, pos) => sum + BigInt(pos.valueUsd),
+      BigInt(0),
+    ).toString();
+
+    return {
+      address,
+      totalValueUsd,
+      positions: transformedPositions,
+    };
+  }
+
+  /**
+   * Get user portfolio history time-series.
+   * #1080
+   */
+  async getUserPortfolioHistory(
+    address: string,
+    from: Date,
+    to: Date,
+    interval: "1d" | "7d",
+  ): Promise<PortfolioHistoryEntry[]> {
+    const intervalDays = interval === "1d" ? 1 : 7;
+    const points: PortfolioHistoryEntry[] = [];
+
+    const startDate = new Date(from);
+    startDate.setHours(0, 0, 0, 0);
+    const endDate = new Date(to);
+    endDate.setHours(23, 59, 59, 999);
+
+    for (let current = new Date(startDate); current <= endDate; current.setDate(current.getDate() + intervalDays)) {
+      const dateStr = current.toISOString().split("T")[0];
+
+      const snapshots = await query<{
+        shares: string;
+        total_assets: string;
+        total_supply: string;
+      }>(
+        `SELECT sbs.shares, tvl.total_assets, tvl.total_supply
+         FROM share_balance_snapshots sbs
+         JOIN vault_tvl_snapshots tvl ON sbs.vault_id = tvl.vault_id
+         WHERE sbs.user_address = $1
+           AND sbs.recorded_at <= $2
+           AND tvl.recorded_at <= $2
+         ORDER BY sbs.recorded_at DESC, tvl.recorded_at DESC
+         LIMIT 1`,
+        [address, current],
+      );
+
+      if (snapshots.length === 0) {
+        points.push({ date: dateStr, totalValueUsd: "0" });
+        continue;
+      }
+
+      const snapshot = snapshots[0];
+      const shares = BigInt(snapshot.shares || "0");
+      const totalAssets = BigInt(Math.round(parseFloat(snapshot.total_assets || "0")));
+      const totalSupply = BigInt(Math.round(parseFloat(snapshot.total_supply || "0")));
+
+      const tvlPerShare = totalSupply > 0n ? totalAssets / totalSupply : 0n;
+      const valueUsd = shares * tvlPerShare;
+
+      points.push({ date: dateStr, totalValueUsd: valueUsd.toString() });
+    }
+
+    return points;
+  }
+
+  /**
+   * Get user first deposit date and vault.
+   * #1081
+   */
+  async getUserFirstDeposit(address: string): Promise<FirstDepositResponse | null> {
+    const result = await query<{
+      contract_id: string;
+      created_at: Date;
+    }>(
+      `SELECT ie.contract_id, ie.created_at
+       FROM indexed_events ie
+       WHERE ie.event_type = 'deposit'
+         AND (ie.payload->>'caller' = $1 OR ie.payload->>'receiver' = $1)
+       ORDER BY ie.created_at ASC
+       LIMIT 1`,
+      [address],
+    );
+
+    if (result.length === 0) {
+      return null;
+    }
+
+    return {
+      address,
+      firstDepositAt: result[0].created_at,
+      contractId: result[0].contract_id,
+    };
+  }
+
+  /**
+   * Get user realized yield history.
+   * #1082
+   */
+  async getUserRealizedYield(
+    address: string,
+    from?: Date,
+    to?: Date,
+  ): Promise<RealizedYieldEntry[]> {
+    let queryStr = `
+      SELECT contract_id, payload, created_at
+      FROM indexed_events
+      WHERE event_type IN ('yield_claimed', 'yield_claimed_partial')
+        AND (payload->>'user' = $1 OR payload->>'address' = $1)
+    `;
+    const params: (string | Date)[] = [address];
+
+    if (from) {
+      queryStr += ` AND created_at >= $${params.length + 1}`;
+      params.push(from);
+    }
+
+    if (to) {
+      queryStr += ` AND created_at <= $${params.length + 1}`;
+      params.push(to);
+    }
+
+    queryStr += ` ORDER BY created_at DESC`;
+
+    const rows = await query<{
+      contract_id: string;
+      payload: Record<string, unknown>;
+      created_at: Date;
+    }>(queryStr, params);
+
+    return rows.map((row) => ({
+      contractId: row.contract_id,
+      epochId: Number(row.payload["epoch"] ?? 0),
+      yieldClaimed: String(row.payload["amount"] ?? "0"),
+      claimedAt: row.created_at,
+    }));
   }
 }

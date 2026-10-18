@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // `src/drift.types.ts` compares these schemas against the backend's own
+    // interfaces in `backend/src/types`, which lives outside this package. The
+    // default config pins `rootDir` to `src` so the published `dist/` layout
+    // stays flat; widening it here is safe because this config only ever runs
+    // with `noEmit`.
+    "rootDir": "../../..",
+    "noEmit": true
+  },
+  "include": ["src"]
+}

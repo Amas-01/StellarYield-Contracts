@@ -1,0 +1,11 @@
+[
+  {
+    "version": "1.0.0",
+    "date": "2026-01-01",
+    "breaking": false,
+    "summary": "Initial public API release.",
+    "changes": [
+      "Introduced the StellarYield REST API."
+    ]
+  }
+]

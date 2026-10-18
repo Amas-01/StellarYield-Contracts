@@ -226,6 +226,66 @@ skipped (a warning is logged; the skip is **not** counted as a delivery failure)
 counter resets automatically at the top of the next hour. If Redis is unavailable the
 throttle fails open and all events are delivered.
 
+## Circuit Breaker (#1061)
+
+After **5 consecutive failed deliveries** the endpoint's circuit opens
+(`webhooks.circuit_open = TRUE`). While the circuit is open the backend makes **no
+further delivery attempts** for that endpoint — queued jobs are dropped without an HTTP
+request and scheduled retries are skipped — so a dead endpoint stops consuming retry
+budget and job-queue capacity.
+
+Skipped deliveries are not counted as failures, and opening the circuit does **not**
+deactivate the webhook. Reset it to resume deliveries on the next triggered event:
+
+```bash
+POST /api/v1/admin/webhooks/42/circuit-reset
+→ 200 { "id": 42, "circuitOpen": false, "consecutiveFailures": 0 }
+```
+
+The reset also clears `consecutive_failures`, otherwise the next failure would
+immediately re-trip the breaker. Requires an `admin` API key.
+
+## Secret Rotation (#1062)
+
+`POST /api/v1/admin/webhooks/:id/rotate-secret` issues a fresh HMAC secret. The previous
+secret is retained for a transition window (`SECRET_ROTATION_WINDOW_HOURS`, default 24)
+and then purged, so receivers can roll over without downtime.
+
+```bash
+POST /api/v1/admin/webhooks/42/rotate-secret
+→ 200 {
+    "id": 42,
+    "secret": "<new secret — returned once, never readable again>",
+    "rotationWindowHours": 24,
+    "previousSecretRetained": true,
+    "rotatesAt": "2026-09-30T05:00:00.000Z"
+  }
+```
+
+During the window each delivery carries **two** signature headers:
+
+| Header | Secret |
+| --- | --- |
+| `X-StellarYield-Signature` | current secret |
+| `X-StellarYield-Signature-Previous` | previous secret (window only) |
+
+After the window elapses only `X-StellarYield-Signature` is sent and the old secret is
+deleted. Accept either header while the receiver migrates, then drop the fallback.
+
+## Delivery Replay (#1063)
+
+`POST /api/v1/admin/webhooks/deliveries/:deliveryId/replay` re-enqueues a past delivery
+verbatim from the log, without re-indexing the underlying event. The clone is a new
+`webhook_deliveries` row pointing back at its source:
+
+```bash
+POST /api/v1/admin/webhooks/deliveries/118/replay
+→ 201 { "deliveryId": 205, "replayedFrom": 118, "webhookId": 42, "status": "queued" }
+```
+
+Replays inherit the same circuit breaker: a `409` is returned while the endpoint's
+circuit is open. Requires an `admin` API key.
+
 ## Failure Escalation
 
 A webhook may reference another webhook row via `fallback_channel`. After the primary

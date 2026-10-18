@@ -7,6 +7,7 @@ export const KNOWN_EVENTS = [
   "deposit",
   "withdraw",
   "yield_distributed",
+  "epoch.finalized",
   "yield_claimed",
   "vault_state_changed",
   "vault_created",
@@ -18,6 +19,7 @@ export const KNOWN_EVENTS = [
   "vault.cancelled",
   "vault.matured",
   "vault.funded",
+  "vault.manager_changed",
 ] as const;
 
 export type KnownEvent = (typeof KNOWN_EVENTS)[number];

@@ -1,33 +1,47 @@
-import { createHmac } from "crypto";
 import type { PgBoss } from "pg-boss";
 import { query } from "../db/index.js";
 import { logger } from "../logger.js";
 import { sseService } from "./sse.js";
-import { validateWebhookUrl } from "./notifications.js";
+import { validateWebhookUrl, CIRCUIT_BREAKER_THRESHOLD } from "./notifications.js";
 import { isWebhookThrottled } from "./webhookThrottle.js";
+import { buildSignatureHeaders } from "./webhookSignature.js";
 
-const MAX_CONSECUTIVE_FAILURES = 10;
+export { CIRCUIT_BREAKER_THRESHOLD };
 
-interface WebhookRow {
+export interface WebhookRow {
   id: number;
   url: string;
   events: string[];
   secret: string | null;
   consecutive_failures: number;
   max_per_hour: number | null;
+  circuit_open?: boolean;
+  previous_secret?: string | null;
+  secret_rotated_at?: Date | string | null;
 }
 
 export async function processWebhookDelivery(
   boss: PgBoss,
   webhookId: number,
   payload: string,
+  deliveryId?: number,
 ): Promise<void> {
   const webhookRows = await query<WebhookRow>(
-    "SELECT id, url, events, secret, consecutive_failures, max_per_hour FROM webhooks WHERE id = $1",
+    "SELECT id, url, events, secret, consecutive_failures, max_per_hour, circuit_open, previous_secret, secret_rotated_at FROM webhooks WHERE id = $1",
     [webhookId],
   );
   if (webhookRows.length === 0) return;
   const webhook = webhookRows[0];
+
+  // Circuit breaker (#1061): a persistently failing endpoint must stop
+  // burning retry budget and queue capacity. Skipping here is not a failure.
+  if (webhook.circuit_open) {
+    logger.warn(
+      { webhookId: webhook.id },
+      "Skipping webhook delivery: circuit is open for this endpoint",
+    );
+    return;
+  }
 
   // Per-event throttle (#1022): once a webhook has received max_per_hour
   // deliveries within the current clock hour, drop further events until the
@@ -43,15 +57,12 @@ export async function processWebhookDelivery(
       { webhookId: webhook.id, url: webhook.url, err },
       "Webhook URL failed SSRF check; skipping",
     );
-    await recordFailure(webhook, payload, boss, "SSRF check failed");
+    await recordFailure(webhook, payload, boss, "SSRF check failed", deliveryId);
     return;
   }
 
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (webhook.secret) {
-    const signature = createHmac("sha256", webhook.secret).update(payload).digest("hex");
-    headers["X-StellarYield-Signature"] = `sha256=${signature}`;
-  }
+  Object.assign(headers, buildSignatureHeaders(webhook, payload));
 
   const start = Date.now();
   try {
@@ -76,10 +87,16 @@ export async function processWebhookDelivery(
       if ((webhook.consecutive_failures ?? 0) > 0) {
         await query("UPDATE webhooks SET consecutive_failures = 0 WHERE id = $1", [webhook.id]);
       }
+      if (deliveryId != null) {
+        await query(
+          "UPDATE webhook_deliveries SET delivered_at = NOW(), status = 'delivered', last_error = NULL WHERE id = $1",
+          [deliveryId],
+        );
+      }
       return;
     }
 
-    await recordFailure(webhook, payload, boss, `non-2xx response: ${response.status}`);
+    await recordFailure(webhook, payload, boss, `non-2xx response: ${response.status}`, deliveryId);
   } catch (err) {
     const durationMs = Date.now() - start;
     sseService.broadcastWebhookDelivery(webhook.id, {
@@ -89,7 +106,7 @@ export async function processWebhookDelivery(
       durationMs,
       success: false,
     });
-    await recordFailure(webhook, payload, boss, String(err));
+    await recordFailure(webhook, payload, boss, String(err), deliveryId);
     throw err;
   }
 }
@@ -99,17 +116,20 @@ async function recordFailure(
   payload: string,
   boss: PgBoss,
   errorMessage: string,
+  deliveryId?: number,
 ): Promise<void> {
   const newFailures = (webhook.consecutive_failures ?? 0) + 1;
 
-  if (newFailures >= MAX_CONSECUTIVE_FAILURES) {
+  if (newFailures >= CIRCUIT_BREAKER_THRESHOLD) {
+    // Circuit breaker (#1061): suspend the endpoint. `active` is left alone so
+    // a reset resumes deliveries without the operator re-enabling the webhook.
     await query(
-      "UPDATE webhooks SET consecutive_failures = $1, active = FALSE WHERE id = $2",
+      "UPDATE webhooks SET consecutive_failures = $1, circuit_open = TRUE, circuit_opened_at = COALESCE(circuit_opened_at, NOW()) WHERE id = $2",
       [newFailures, webhook.id],
     );
     logger.warn(
-      { webhookId: webhook.id, consecutiveFailures: newFailures },
-      "Webhook auto-deactivated after reaching consecutive failure threshold",
+      { webhookId: webhook.id, consecutiveFailures: newFailures, threshold: CIRCUIT_BREAKER_THRESHOLD },
+      "Webhook circuit opened after reaching consecutive failure threshold",
     );
   } else {
     await query(
@@ -118,11 +138,27 @@ async function recordFailure(
     );
   }
 
-  await query(
-    `INSERT INTO webhook_deliveries (webhook_id, payload, attempt, next_retry_at, last_error)
-     VALUES ($1, $2, 1, NOW() + INTERVAL '5 seconds', $3)`,
-    [webhook.id, payload, errorMessage],
-  );
+  const permanent = newFailures >= CIRCUIT_BREAKER_THRESHOLD;
+
+  if (deliveryId != null) {
+    // Replayed/queued delivery already owns a log row: schedule its retry in
+    // place instead of appending a duplicate entry (#1063).
+    await query(
+      `UPDATE webhook_deliveries
+          SET attempt = attempt + 1,
+              next_retry_at = NOW() + INTERVAL '5 seconds',
+              last_error = $1,
+              status = $2
+        WHERE id = $3`,
+      [errorMessage, permanent ? "failed_permanent" : "failed", deliveryId],
+    );
+  } else {
+    await query(
+      `INSERT INTO webhook_deliveries (webhook_id, payload, attempt, next_retry_at, last_error, status)
+       VALUES ($1, $2, 1, NOW() + INTERVAL '5 seconds', $3, $4)`,
+      [webhook.id, payload, errorMessage, permanent ? "failed_permanent" : "failed"],
+    );
+  }
 
   sseService.broadcastWebhookDelivery(webhook.id, {
     type: "delivery",

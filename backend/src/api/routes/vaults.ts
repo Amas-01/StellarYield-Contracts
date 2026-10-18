@@ -11,6 +11,9 @@ import {
   getRedemptionQueue,
   getVaultSnapshot,
   getVaultMetadataHistory,
+  getWhitelistHistory,
+  getVaultStatusHistory,
+  getTransferVolume,
   getVaultTopHolders,
   getVaultHolders,
   getVaultHolderCount,
@@ -33,6 +36,8 @@ import {
   getSimilarVaults,
   getFeeHistory,
   getVaultFees,
+  getVaultTransferFees,
+  getVaultTransferLeaderboard,
   getCooperatorFees,
   streamVaultEvents,
   getVaultsBulkStatus,
@@ -89,7 +94,7 @@ const nonNegativeAmountSchema = z
   .string()
   .regex(/^\d+$/, "must be a non-negative integer");
 
-const listVaultsQuerySchema = z
+export const listVaultsQuerySchema = z
   .object({
     page: z.coerce.number().int().min(1).default(1),
     pageSize: z.coerce.number().int().min(1).default(20).transform((value) => Math.min(value, 100)),
@@ -143,7 +148,7 @@ const listVaultsQuerySchema = z
     }
   });
 
-const vaultParamsSchema = z.object({
+export const vaultParamsSchema = z.object({
   contractId: contractAddressSchema,
 });
 
@@ -177,12 +182,33 @@ const maturingSoonQuerySchema = z.object({
 });
 
 // Detail endpoint query params: allow `fields` (comma-separated) and `embed` (comma-separated)
-const vaultDetailQuerySchema = z.object({ fields: z.string().optional(), embed: z.string().optional() });
+export const vaultDetailQuerySchema = z.object({ fields: z.string().optional(), embed: z.string().optional() });
 
 // Metadata history endpoint (#973): page + pageSize (capped at 100)
 const metadataHistoryQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).default(20).transform((value) => Math.min(value, 100)),
+});
+
+// Whitelist history endpoint (#1094): same pagination shape as the other
+// history endpoints.
+const whitelistHistoryQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).default(20).transform((value) => Math.min(value, 100)),
+});
+
+// Share transfer volume (#1074). A closed set of periods rather than a free-form
+// day count: the analytics widgets only ever ask for these three, and an
+// arbitrary window would make the reported number hard to compare across calls.
+const transferVolumeQuerySchema = z.object({
+  period: z.enum(["1d", "7d", "30d"]).default("7d"),
+});
+
+// TVL history endpoint (#864): from/to range plus explicit bucket strategy.
+const tvlHistoryQuerySchema = z.object({
+  from: z.string().optional(),
+  to: z.string().optional(),
+  bucket: z.enum(["hour", "day", "week"]).optional(),
 });
 
 export const vaultsRouter = Router();
@@ -268,8 +294,30 @@ vaultsRouter.get(
   validateQuery(metadataHistoryQuerySchema),
   getVaultMetadataHistory,
 );
+// Whitelist change history: GET /api/v1/vaults/:contractId/whitelist-history (#1094)
+vaultsRouter.get(
+  "/:contractId/whitelist-history",
+  validateParams(vaultParamsSchema),
+  validateQuery(whitelistHistoryQuerySchema),
+  getWhitelistHistory,
+);
+// Status / manager change history: GET /api/v1/vaults/:contractId/status-history (#1065, #1068)
+vaultsRouter.get("/:contractId/status-history", validateParams(vaultParamsSchema), getVaultStatusHistory);
+// Share transfer volume for a vault token (#1074):
+// GET /api/v1/vaults/:contractId/transfer-volume?period=1d|7d|30d
+vaultsRouter.get(
+  "/:contractId/transfer-volume",
+  validateParams(vaultParamsSchema),
+  validateQuery(transferVolumeQuerySchema),
+  getTransferVolume,
+);
 // Get vault TVL history: GET /api/v1/vaults/:contractId/tvl-history
-vaultsRouter.get("/:contractId/tvl-history", validateParams(vaultParamsSchema), getVaultTvlHistory);
+vaultsRouter.get(
+  "/:contractId/tvl-history",
+  validateParams(vaultParamsSchema),
+  validateQuery(tvlHistoryQuerySchema),
+  getVaultTvlHistory,
+);
 // Get compound projection: GET /api/v1/vaults/:contractId/compound-projection?shares=<amount>&epochs=<n>
 vaultsRouter.get("/:contractId/compound-projection", validateParams(vaultParamsSchema), getCompoundProjection);
 // Early redemption fee preview: GET /api/v1/vaults/:contractId/early-redemption-fee?shares=
@@ -298,3 +346,8 @@ vaultsRouter.get("/:contractId/report", validateParams(vaultParamsSchema), getVa
 vaultsRouter.get("/:contractId/epochs/:epoch/breakdown", validateParams(vaultParamsSchema), getEpochBreakdown);
 // Similar vaults by category and TVL proximity: GET /api/v1/vaults/:contractId/similar
 vaultsRouter.get("/:contractId/similar", validateParams(vaultParamsSchema), getSimilarVaults);
+// Transfer fees query: GET /api/v1/vaults/:contractId/transfer-fees?from=&to= (#1076)
+vaultsRouter.get("/:contractId/transfer-fees", validateParams(vaultParamsSchema), getVaultTransferFees);
+// Transfer leaderboard: GET /api/v1/vaults/:contractId/transfer-leaderboard?limit=10 (#1075)
+vaultsRouter.get("/:contractId/transfer-leaderboard", validateParams(vaultParamsSchema), getVaultTransferLeaderboard);
+

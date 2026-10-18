@@ -189,3 +189,95 @@ export async function getApyRanking(
   }
 }
 
+// ── Vault group-by analytics (#863) ──────────────────────────────────────────
+// GET /api/v1/analytics/vaults/group-by?by=rwa_category|state|maturityMonth
+// Returns [{ group; vaultCount; totalValueLocked; averageApy }] grouped by the
+// requested dimension. `totalValueLocked` is the sum of `total_assets` within
+// each group; `averageApy` is the mean of `expected_apy` (null when no vault
+// in the group reports an APY).
+export const VAULT_GROUP_BY_DIMENSIONS = [
+  "rwa_category",
+  "state",
+  "maturityMonth",
+] as const;
+
+export type VaultGroupByDimension = (typeof VAULT_GROUP_BY_DIMENSIONS)[number];
+
+export async function getVaultsGroupBy(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const by = String(req.query["by"] ?? "");
+
+    if (
+      by !== "rwa_category" &&
+      by !== "state" &&
+      by !== "maturityMonth"
+    ) {
+      res.status(400).json({
+        error: "BadRequest",
+        message:
+          "Invalid 'by' parameter. Supported values: rwa_category, state, maturityMonth",
+      });
+      return;
+    }
+
+    let sql: string;
+    if (by === "rwa_category") {
+      sql = `SELECT
+          COALESCE(NULLIF(rwa_category, ''), 'Uncategorized') AS grp,
+          COUNT(*)::text AS vault_count,
+          COALESCE(SUM(total_assets::numeric), 0)::text AS total_value_locked,
+          AVG(expected_apy)::text AS average_apy
+        FROM vaults
+        WHERE archived = FALSE
+        GROUP BY 1
+        ORDER BY 1 ASC`;
+    } else if (by === "state") {
+      sql = `SELECT
+          state AS grp,
+          COUNT(*)::text AS vault_count,
+          COALESCE(SUM(total_assets::numeric), 0)::text AS total_value_locked,
+          AVG(expected_apy)::text AS average_apy
+        FROM vaults
+        WHERE archived = FALSE
+        GROUP BY 1
+        HAVING COUNT(*) > 0
+        ORDER BY 1 ASC`;
+    } else {
+      sql = `SELECT
+          TO_CHAR(maturity_date, 'YYYY-MM') AS grp,
+          COUNT(*)::text AS vault_count,
+          COALESCE(SUM(total_assets::numeric), 0)::text AS total_value_locked,
+          AVG(expected_apy)::text AS average_apy
+        FROM vaults
+        WHERE archived = FALSE AND maturity_date IS NOT NULL
+        GROUP BY 1
+        ORDER BY 1 ASC`;
+    }
+
+    const rows = await query<{
+      grp: string;
+      vault_count: string;
+      total_value_locked: string;
+      average_apy: string | null;
+    }>(sql);
+
+    const data = rows.map((row) => ({
+      group: row.grp,
+      vaultCount: parseInt(row.vault_count, 10),
+      totalValueLocked: row.total_value_locked ?? "0",
+      averageApy:
+        row.average_apy === null || row.average_apy === undefined
+          ? null
+          : Number.parseFloat(row.average_apy),
+    }));
+
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+}
+

@@ -56,6 +56,15 @@ export const envSchema = z.object({
     .default("5000")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(100)),
+  SANCTIONS_LIST_URL: z.string().optional(),
+  TRANSFER_VELOCITY_THRESHOLD: z
+    .string()
+    .default("500")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(1)),
+  LARGE_TRANSFER_THRESHOLD: z
+    .string()
+    .default("1000000"),
   INDEXER_BATCH_SIZE: z
     .string()
     .default("200")
@@ -69,6 +78,13 @@ export const envSchema = z.object({
   WEBHOOK_SECRET: z
     .string()
     .default(""),
+  // Issue #1062: hours a rotated-out webhook secret stays valid alongside the
+  // new one, so receivers can roll over without downtime.
+  SECRET_ROTATION_WINDOW_HOURS: z
+    .string()
+    .default("24")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(0)),
   LOG_LEVEL: z
     .string()
     .default("info"),
@@ -137,18 +153,35 @@ export const envSchema = z.object({
     .default("90")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1)),
+  SNAPSHOT_RETENTION_DAYS: z
+    .string()
+    .optional()
+    .transform((v) => (v ? parseInt(v, 10) : null))
+    .pipe(z.number().int().min(1).nullable().default(null)),
+  TVL_SNAPSHOT_RETENTION_DAYS: z
+    .string()
+    .optional()
+    .transform((v) => (v ? parseInt(v, 10) : null))
+    .pipe(z.number().int().min(1).nullable().default(null)),
   ARCHIVE_CRON: z
     .string()
     .default("0 2 * * *")
     .refine((v) => cron.validate(v), {
       message: "ARCHIVE_CRON must be a valid cron expression",
     }),
+  DRY_RUN: z
+    .string()
+    .default("false")
+    .transform((v) => ["true", "1", "yes"].includes(v.toLowerCase())),
   ADMIN_IP_ALLOWLIST: z
     .string()
     .default(""),
   REQUEST_BODY_LIMIT: z
     .string()
     .default("100kb"),
+  DEBUG_ARCHIVE_ROUTES: z
+    .string()
+    .default(""),
   INTERNAL_SECRET: z
     .string()
     .default(""),
@@ -213,6 +246,27 @@ export const envSchema = z.object({
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
   SMTP_FROM: z.string().optional(),
+  DEPLOY_ID: z.string().optional(),
+  // Outbound HTTP client (services/apiClient.ts). Base URL defaults to this
+  // server's own origin; the key is the bearer token it sends on every call.
+  API_CLIENT_BASE_URL: z
+    .string()
+    .optional()
+    .transform((v) => v ?? "")
+    .refine((v) => v === "" || /^https?:\/\/.+/.test(v), {
+      message: "API_CLIENT_BASE_URL must be an absolute http(s) URL",
+    }),
+  API_CLIENT_API_KEY: z.string().default(""),
+  API_CLIENT_TIMEOUT_MS: z
+    .string()
+    .default("10000")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(0)),
+  API_CLIENT_MAX_RETRIES: z
+    .string()
+    .default("3")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(0)),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -247,6 +301,15 @@ export const config = {
   get adminSessionExpiryMinutes() {
     return Number(process.env.ADMIN_SESSION_EXPIRY_MINUTES ?? parsed.data.ADMIN_SESSION_EXPIRY_MINUTES);
   },
+  get sanctionsListUrl(): string | undefined {
+    return process.env.SANCTIONS_LIST_URL ?? parsed.data.SANCTIONS_LIST_URL;
+  },
+  get transferVelocityThreshold(): number {
+    return Number(process.env.TRANSFER_VELOCITY_THRESHOLD ?? parsed.data.TRANSFER_VELOCITY_THRESHOLD);
+  },
+  get largeTransferThreshold(): string {
+    return process.env.LARGE_TRANSFER_THRESHOLD ?? parsed.data.LARGE_TRANSFER_THRESHOLD;
+  },
   get sandboxMode() {
     return (process.env.SANDBOX_MODE ?? String(parsed.data.SANDBOX_MODE)).toLowerCase() === "true" || process.env.SANDBOX_MODE === "1";
   },
@@ -255,6 +318,9 @@ export const config = {
   },
   get archiveCron(): string {
     return process.env.ARCHIVE_CRON ?? parsed.data.ARCHIVE_CRON;
+  },
+  get dryRun(): boolean {
+    return ["true", "1", "yes"].includes((process.env.DRY_RUN ?? String(parsed.data.DRY_RUN)).toLowerCase());
   },
 
   stellar: {
@@ -296,6 +362,7 @@ export const config = {
   })(),
 
   webhookSecret: parsed.data.WEBHOOK_SECRET,
+  secretRotationWindowHours: parsed.data.SECRET_ROTATION_WINDOW_HOURS,
   logLevel: parsed.data.LOG_LEVEL,
 
   rateLimit: {
@@ -305,12 +372,18 @@ export const config = {
   },
 
   eventsRetentionDays: parsed.data.EVENTS_RETENTION_DAYS,
+  snapshotRetentionDays: parsed.data.SNAPSHOT_RETENTION_DAYS,
+  tvlSnapshotRetentionDays: parsed.data.TVL_SNAPSHOT_RETENTION_DAYS,
 
   adminIpAllowlist: parsed.data.ADMIN_IP_ALLOWLIST
     ? parsed.data.ADMIN_IP_ALLOWLIST.split(",").map((s) => s.trim()).filter(Boolean)
     : [],
 
   requestBodyLimit: parsed.data.REQUEST_BODY_LIMIT,
+  debugArchiveRoutes: parsed.data.DEBUG_ARCHIVE_ROUTES
+    .split(",")
+    .map((route) => route.trim())
+    .filter(Boolean),
   internalSecret: parsed.data.INTERNAL_SECRET,
 
   cors: {
@@ -333,6 +406,13 @@ export const config = {
     pass: parsed.data.SMTP_PASS,
     from: parsed.data.SMTP_FROM,
   },
+  apiClient: {
+    baseUrl: parsed.data.API_CLIENT_BASE_URL || `http://localhost:${parsed.data.PORT}`,
+    apiKey: parsed.data.API_CLIENT_API_KEY,
+    timeoutMs: parsed.data.API_CLIENT_TIMEOUT_MS,
+    maxRetries: parsed.data.API_CLIENT_MAX_RETRIES,
+  },
+  deployId: parsed.data.DEPLOY_ID ?? null,
 } as const;
 
 export const ROUTE_CACHE_CONTROL: Record<string, number> = {
@@ -341,4 +421,10 @@ export const ROUTE_CACHE_CONTROL: Record<string, number> = {
   "/api/v1/analytics": 300,
   "/health": 0,
 };
+
+export const ROUTE_SLA_MS: Record<string, number> = {
+  "/api/v1/vaults": 200,
+  "/api/v1/yields/:contractId/epochs": 500,
+};
+
 

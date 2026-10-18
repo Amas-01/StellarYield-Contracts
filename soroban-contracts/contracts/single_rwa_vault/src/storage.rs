@@ -153,6 +153,12 @@ pub enum Key {
     LockUpPeriod,
     /// Per-user timestamp of last deposit (used to enforce lock-up).
     DepositTimestamp(Address),
+
+    // --- Investor count ---
+    /// Current count of unique investors (users with non-zero balance).
+    InvestorCount,
+    /// Maximum allowed number of investors (0 = unlimited).
+    MaxInvestors,
 }
 
 // Manual serialization for `Key`: unit variants use a bare `u32` tag; any key that
@@ -249,6 +255,8 @@ impl soroban_sdk::IntoVal<Env, soroban_sdk::Val> for Key {
             Key::TlkCount => 51u32.into_val(env),
             Key::OpFee => 54u32.into_val(env),
             Key::LockUpPeriod => 55u32.into_val(env),
+            Key::InvestorCount => 56u32.into_val(env),
+            Key::MaxInvestors => 57u32.into_val(env),
         }
     }
 }
@@ -1433,4 +1441,47 @@ pub fn put_deposit_timestamp(e: &Env, addr: &Address, timestamp: u64) {
     e.storage()
         .persistent()
         .extend_ttl(&key, BALANCE_LIFETIME_THRESHOLD, BALANCE_BUMP_AMOUNT);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Investor count storage helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns the current count of unique investors (users with non-zero balance).
+pub fn get_investor_count(e: &Env) -> u32 {
+    e.storage().instance().get(&Key::InvestorCount).unwrap_or(0)
+}
+
+/// Sets the investor count.
+pub fn put_investor_count(e: &Env, count: u32) {
+    e.storage().instance().set(&Key::InvestorCount, &count);
+}
+
+/// Increments the investor count by 1 and returns the new count.
+pub fn increment_investor_count(e: &Env) -> u32 {
+    let count = get_investor_count(e) + 1;
+    put_investor_count(e, count);
+    count
+}
+
+/// Decrements the investor count by 1 and returns the new count.
+pub fn decrement_investor_count(e: &Env) -> u32 {
+    let count = get_investor_count(e);
+    if count > 0 {
+        let new_count = count - 1;
+        put_investor_count(e, new_count);
+        new_count
+    } else {
+        0
+    }
+}
+
+/// Returns the maximum allowed number of investors (0 = unlimited).
+pub fn get_max_investors(e: &Env) -> u32 {
+    e.storage().instance().get(&Key::MaxInvestors).unwrap_or(0)
+}
+
+/// Sets the maximum allowed number of investors.
+pub fn put_max_investors(e: &Env, max: u32) {
+    e.storage().instance().set(&Key::MaxInvestors, &max);
 }

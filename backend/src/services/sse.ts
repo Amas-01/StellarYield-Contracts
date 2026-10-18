@@ -1,5 +1,6 @@
 import type { Response } from "express";
 import { logger } from "../logger.js";
+import { decrementSseConnections, incrementSseConnections } from "./metrics.js";
 
 export interface SseClient {
   id: string;
@@ -43,6 +44,8 @@ class SseService {
       createdAt: new Date(),
     };
     this.clients.set(clientId, client);
+    // Prometheus gauge for capacity planning (#1092)
+    incrementSseConnections();
     logger.info({ clientId, ip, isAuthenticated }, "SSE client registered");
     return clientId;
   }
@@ -52,6 +55,7 @@ class SseService {
     if (!client) return;
 
     this.clients.delete(clientId);
+    decrementSseConnections();
 
     for (const subscribers of this.epochSubscribers.values()) {
       subscribers.delete(clientId);

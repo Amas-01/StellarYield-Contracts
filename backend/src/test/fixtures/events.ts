@@ -369,6 +369,23 @@ export function makeDefaultsUpdatedEvent(
   };
 }
 
+export function makeWasmHashUpdatedEvent(
+  overrides: Partial<BaseOverrides & {
+    oldHash: string;
+    newHash: string;
+    updatedBy: string;
+  }> = {},
+) {
+  const oldHash = overrides.oldHash ?? "a".repeat(64);
+  const newHash = overrides.newHash ?? "b".repeat(64);
+  const updatedBy = overrides.updatedBy ?? USER_ADDRESS;
+  return {
+    ...baseEvent(overrides),
+    topic: [nativeToScVal("wasm_upd"), nativeToScVal(updatedBy)],
+    value: nativeToScVal([Buffer.from(oldHash, "hex"), Buffer.from(newHash, "hex")]),
+  };
+}
+
 export function makeKycSetEvent(
   overrides: Partial<BaseOverrides & {
     user: string;
@@ -399,5 +416,52 @@ export function makeUnpausedEvent(overrides: Partial<BaseOverrides> = {}) {
     ...baseEvent(overrides),
     topic: [nativeToScVal("unpaused")],
     value: xdr.ScVal.scvVoid(),
+  };
+}
+
+export function makeVaultDocumentUriUpdatedEvent(
+  overrides: Partial<BaseOverrides & {
+    caller: string;
+    oldUri: string;
+    newUri: string;
+  }> = {},
+) {
+  const caller = overrides.caller ?? USER_ADDRESS;
+  const oldUri = overrides.oldUri ?? "https://example.com/old";
+  const newUri = overrides.newUri ?? "https://example.com/new";
+  return {
+    ...baseEvent(overrides),
+    topic: [nativeToScVal("vault_document_uri_updated"), nativeToScVal(caller)],
+    value: nativeToScVal([oldUri, newUri]),
+  };
+}
+
+export function makeVaultDescriptionUpdatedEvent(
+  overrides: Partial<BaseOverrides & {
+    caller: string;
+    description: string;
+  }> = {},
+) {
+  const caller = overrides.caller ?? USER_ADDRESS;
+  const description = overrides.description ?? "A regulated treasury vault";
+  return {
+    ...baseEvent(overrides),
+    topic: [nativeToScVal("vault_description_updated"), nativeToScVal(caller)],
+    value: nativeToScVal([description]),
+  };
+}
+
+export function makeVaultLogoUriUpdatedEvent(
+  overrides: Partial<BaseOverrides & {
+    caller: string;
+    logoUri: string;
+  }> = {},
+) {
+  const caller = overrides.caller ?? USER_ADDRESS;
+  const logoUri = overrides.logoUri ?? "https://example.com/logo.png";
+  return {
+    ...baseEvent(overrides),
+    topic: [nativeToScVal("vault_logo_uri_updated"), nativeToScVal(caller)],
+    value: nativeToScVal([logoUri]),
   };
 }

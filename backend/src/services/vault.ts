@@ -1,4 +1,4 @@
-import type { Vault, VaultOperator, UserVaultPosition, PaginatedResponse, VaultHolder, VaultHolderSort, OperatorLogEntry } from "../types/index.js";
+import type { Vault, VaultOperator, UserVaultPosition, PaginatedResponse, VaultHolder, VaultHolderSort, OperatorLogEntry, TransferVolume, TransferVolumePeriod } from "../types/index.js";
 import { query } from "../db/index.js";
 import * as db from "../db/index.js";
 import { logger } from "../logger.js";
@@ -199,6 +199,8 @@ export const VAULT_FIELD_MAP: Record<string, string> = {
   rwaSymbol: "v.rwa_symbol",
   rwaDocumentUri: "v.rwa_document_uri",
   rwaCategory: "v.rwa_category",
+  description: "v.description",
+  logoUri: "v.logo_uri",
   createdAt: "v.created_at",
   updatedAt: "v.updated_at",
   expectedApy: "v.expected_apy",
@@ -462,6 +464,8 @@ interface VaultRow {
   rwa_symbol: string | null;
   rwa_document_uri: string | null;
   rwa_category: string | null;
+  description: string | null;
+  logo_uri: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -510,10 +514,24 @@ function mapVaultRow(row: VaultRow): Vault {
     rwaSymbol: row.rwa_symbol,
     rwaDocumentUri: row.rwa_document_uri,
     rwaCategory: row.rwa_category,
+    description: row.description ?? null,
+    logoUri: row.logo_uri ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
+
+/**
+ * Number of UTC calendar days each transfer-volume period covers (#1074).
+ *
+ * A calendar day is counted inclusively: `1d` is today alone, `7d` is today plus
+ * the six preceding days.
+ */
+export const TRANSFER_VOLUME_PERIOD_DAYS: Record<TransferVolumePeriod, number> = {
+  "1d": 1,
+  "7d": 7,
+  "30d": 30,
+};
 
 export class VaultService {
   /**
@@ -627,6 +645,7 @@ export class VaultService {
                v.created_at, v.updated_at,
                v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
+               v.description, v.logo_uri,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -644,6 +663,7 @@ export class VaultService {
                v.created_at, v.updated_at,
                v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
+               v.description, v.logo_uri,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -796,6 +816,7 @@ export class VaultService {
               v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
               v.zkme_verifier_address,
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
+              v.description, v.logo_uri,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp
@@ -1013,6 +1034,8 @@ export class VaultService {
       rwaSymbol = null,
       rwaDocumentUri = null,
       rwaCategory = null,
+      description = null,
+      logoUri = null,
     } = vault;
 
     logger.info(
@@ -1026,9 +1049,10 @@ export class VaultService {
          total_assets, total_supply,
          funding_target, funding_deadline, min_deposit, max_deposit_per_user,
          rwa_name, rwa_symbol, rwa_document_uri, rwa_category,
+         description, logo_uri,
          created_at, updated_at
        )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW(), NOW())
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, NOW(), NOW())
        ON CONFLICT (contract_id)
        DO UPDATE SET
          state = EXCLUDED.state,
@@ -1042,10 +1066,12 @@ export class VaultService {
          rwa_symbol = COALESCE(EXCLUDED.rwa_symbol, vaults.rwa_symbol),
          rwa_document_uri = COALESCE(EXCLUDED.rwa_document_uri, vaults.rwa_document_uri),
          rwa_category = COALESCE(EXCLUDED.rwa_category, vaults.rwa_category),
+         description = COALESCE(EXCLUDED.description, vaults.description),
+         logo_uri = COALESCE(EXCLUDED.logo_uri, vaults.logo_uri),
          updated_at = NOW()`,
       [contractId, factoryId, asset, name, symbol, state, totalAssets, totalSupply,
        fundingTarget, fundingDeadline, minDeposit, maxDepositPerUser,
-       rwaName, rwaSymbol, rwaDocumentUri, rwaCategory],
+       rwaName, rwaSymbol, rwaDocumentUri, rwaCategory, description, logoUri],
     );
 
     logger.info({ contractId }, "Vault upserted successfully");
@@ -1746,6 +1772,50 @@ export class VaultService {
       projectedValue: projectedFormatted,
       compoundedYield: yieldFormatted,
       epochsProjected: epochs,
+    };
+  }
+
+  /**
+   * Share transfer volume for a vault token over a trailing window (#1074).
+   *
+   * Powers the daily/weekly activity figures shown per vault. The window is
+   * measured in UTC calendar days, so `7d` covers today plus the six days before
+   * it — seven distinct dates, matching what a calendar widget would show,
+   * rather than a rolling 168 hours that straddles eight dates.
+   *
+   * `totalVolume` is returned as a string: share amounts are base units that
+   * exceed `Number.MAX_SAFE_INTEGER`, and a JSON number would silently round
+   * them. Counts are returned as numbers since they are bounded by the size of
+   * the window.
+   */
+  async getTransferVolume(contractId: string, period: TransferVolumePeriod): Promise<TransferVolume> {
+    const days = TRANSFER_VOLUME_PERIOD_DAYS[period];
+
+    const rows = await query<{
+      transfer_count: string;
+      total_volume: string | null;
+      unique_senders: string;
+      unique_recipients: string;
+    }>(
+      `SELECT COUNT(*)::text AS transfer_count,
+              COALESCE(SUM(t.amount), 0)::text AS total_volume,
+              COUNT(DISTINCT t.from_address)::text AS unique_senders,
+              COUNT(DISTINCT t.to_address)::text AS unique_recipients
+       FROM transfers t
+       JOIN vaults v ON v.id = t.vault_id
+       WHERE v.contract_id = $1
+         AND t.created_at >= (date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+                            - make_interval(days => $2::int - 1)`,
+      [contractId, days],
+    );
+
+    const row = rows[0];
+    return {
+      period,
+      transferCount: parseInt(row?.transfer_count ?? "0", 10),
+      totalVolume: row?.total_volume ?? "0",
+      uniqueSenders: parseInt(row?.unique_senders ?? "0", 10),
+      uniqueRecipients: parseInt(row?.unique_recipients ?? "0", 10),
     };
   }
 }

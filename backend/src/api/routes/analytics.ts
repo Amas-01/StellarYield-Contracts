@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   getAnalyticsSummary,
   getTvlAggregate,
+  getVaultsGroupBy,
   getYieldCorrelation,
   getTopPerformingVaults,
   getUnderperformingVaults,
@@ -30,10 +31,20 @@ const rankingQuerySchema = z.object({
   state: z.string().optional(),
 });
 
+const groupByQuerySchema = z.object({
+  by: z.enum(["rwa_category", "state", "maturityMonth"]),
+});
+
 export const analyticsRouter = Router();
 
 analyticsRouter.get("/summary", getAnalyticsSummary);
 analyticsRouter.get("/tvl", getTvlAggregate);
+// ── Vault group-by analytics (#863) ──────────────────────────────────────────
+analyticsRouter.get(
+  "/vaults/group-by",
+  validateQuery(groupByQuerySchema),
+  getVaultsGroupBy,
+);
 analyticsRouter.get(
   "/yield-correlation",
   validateQuery(yieldCorrelationQuerySchema),

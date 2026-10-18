@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -10,41 +13,101 @@ import { query, pool } from "../../db/index.js";
 import { config } from "../../config.js";
 import { seed } from "../../db/seed.js";
 import { indexer } from "../../services/indexerSingleton.js";
+import { KNOWN_EVENT_TYPES } from "../../services/indexerEventTypes.js";
+import { EpochAnomalyService } from "../../services/epochAnomaly.js";
 import { jobQueue } from "../../services/jobQueue.js";
 import { sseManager } from "../../services/sseManager.js";
 import { logger } from "../../logger.js";
 import { createAdminSessionToken, refreshAdminSessionToken } from "../middleware/auth.js";
+import { getApiKeyUsage } from "../../cache/redis.js";
+import { logAdminAudit } from "../../services/adminAuditLog.js";
+import { generateWebhookSecret, secretRotationWindowHours } from "../../services/webhookSignature.js";
+
+const OPENAPI_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../../openapi");
+
+export async function getApiDiff(req: Request, res: Response, next: NextFunction) {
+  try {
+    const from = String(req.query["from"] ?? "");
+    const to = String(req.query["to"] ?? "");
+    if (!from || !to) {
+      res.status(400).json({
+        error: "BadRequest",
+        message: "Both 'from' and 'to' query parameters are required",
+      });
+      return;
+    }
+    if (!(["v1", "v2"] as const).includes(from as "v1" | "v2") || !(["v1", "v2"] as const).includes(to as "v1" | "v2")) {
+      res.status(400).json({
+        error: "BadRequest",
+        message: "Invalid version. Only 'v1' and 'v2' are supported",
+      });
+      return;
+    }
+
+    const fromSpec = JSON.parse(readFileSync(resolve(OPENAPI_DIR, `${from}.json`), "utf8")) as { paths: Record<string, unknown> };
+    const toSpec = JSON.parse(readFileSync(resolve(OPENAPI_DIR, `${to}.json`), "utf8")) as { paths: Record<string, unknown> };
+    const fromPaths = fromSpec.paths ?? {};
+    const toPaths = toSpec.paths ?? {};
+    const added = Object.keys(toPaths).filter((path) => !(path in fromPaths));
+    const removed = Object.keys(fromPaths).filter((path) => !(path in toPaths));
+    const modified = Object.keys(fromPaths).filter(
+      (path) => path in toPaths && JSON.stringify(fromPaths[path]) !== JSON.stringify(toPaths[path]),
+    );
+
+    res.json({ from, to, added, removed, modified });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getApiKeyUsageStats(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const id = Number(req.params["id"]);
+    if (!Number.isInteger(id) || id < 1) {
+      res.status(400).json({ error: "BadRequest", message: "API key id must be a positive integer" });
+      return;
+    }
+    res.json(await getApiKeyUsage(id));
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getSecurityEvents(_req: Request, res: Response, next: NextFunction) {
+  try {
+    const rows = await query<{
+      id: number;
+      event_type: string;
+      ip_address: string | null;
+      api_key_label: string | null;
+      path: string | null;
+      details: Record<string, unknown> | null;
+      created_at: Date;
+    }>(
+      `SELECT id, event_type, ip_address, api_key_label, path, details, created_at
+       FROM security_events
+       ORDER BY created_at DESC
+       LIMIT 200`,
+    );
+
+    res.json(
+      rows.map((row) => ({
+        id: row.id,
+        eventType: row.event_type,
+        ipAddress: row.ip_address,
+        apiKeyLabel: row.api_key_label,
+        path: row.path,
+        details: row.details,
+        createdAt: row.created_at,
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
+}
 
 const stellarAddressSchema = z.string().length(56).regex(/^G[A-Z2-7]{55}$/);
 const contractAddressSchema = z.string().length(56).regex(/^C[A-Z2-7]{55}$/);
-
-function getClientIp(req: Request): string | null {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string") {
-    return forwarded.split(",")[0]?.trim() || null;
-  }
-  if (Array.isArray(forwarded)) {
-    return forwarded[0] ?? null;
-  }
-  return req.ip ?? null;
-}
-
-function getRequestBodyHash(body: unknown): string {
-  const normalized = typeof body === "string"
-    ? body
-    : body == null
-      ? ""
-      : JSON.stringify(body);
-  return createHash("sha256").update(normalized).digest("hex");
-}
-
-async function logAdminAudit(req: Request, action: string, target: string): Promise<void> {
-  await query(
-    `INSERT INTO admin_audit_log (api_key_label, action, target, ip_address, request_body_hash, created_at)
-     VALUES ($1, $2, $3, $4, $5, NOW())`,
-    [req.apiKey?.label ?? null, action, target, getClientIp(req), getRequestBodyHash(req.body)],
-  );
-}
 
 interface ApiKeyRecord {
   id: number;
@@ -127,7 +190,7 @@ export async function createAdminSession(req: Request, res: Response, next: Next
   }
 }
 
-export async function refreshAdminSession(req: Request, res: Response, next: NextFunction) {
+export async function refreshAdminSession(req: Request, res: Response, _next: NextFunction) {
   try {
     const authHeader = req.headers.authorization ?? "";
     if (!authHeader.startsWith("Bearer ")) {
@@ -195,14 +258,20 @@ export async function getAdminStats(_req: Request, res: Response, next: NextFunc
     const archiveSizeRows = await query<{ total: string }>(
       "SELECT COALESCE(SUM(pg_total_relation_size(relid)), 0)::text AS total FROM pg_stat_user_tables WHERE relname LIKE '%_archive'",
     );
+    // Factory WASM hash from the most recent indexed update event (#837).
+    const wasmRows = await query<{ new_hash: string }>(
+      "SELECT new_hash FROM factory_wasm_history ORDER BY recorded_at DESC, id DESC LIMIT 1",
+    );
 
     const vaultCount = parseInt(vaultCountRows[0]?.count ?? "0", 10);
     const userCount = parseInt(userCountRows[0]?.count ?? "0", 10);
     const totalValueLocked = totalAssetsRows[0]?.total ?? "0";
     const epochCount = parseInt(epochCountRows[0]?.count ?? "0", 10);
     const archiveSizeBytes = parseInt(archiveSizeRows[0]?.total ?? "0", 10);
+    // Null until the first wasm_upd event has been indexed.
+    const wasmHash = wasmRows[0]?.new_hash ?? null;
 
-    res.json({ vaultCount, userCount, totalValueLocked, epochCount, archiveSizeBytes });
+    res.json({ vaultCount, userCount, totalValueLocked, epochCount, archiveSizeBytes, wasmHash });
   } catch (err) {
     next(err);
   }
@@ -260,6 +329,233 @@ export async function backfillIndexer(req: Request, res: Response, next: NextFun
   }
 }
 
+// ── Per-contract indexer controls (#1106, #1107) ──────────────────────────────
+
+const indexerContractIdSchema = z.string().regex(/^C[A-Z2-7]{55}$/);
+
+export const eventFilterBodySchema = z.object({
+  allowedTypes: z
+    .array(z.string().trim().min(1))
+    .max(64)
+    .refine((types) => types.every((t) => KNOWN_EVENT_TYPES.has(t)), {
+      message: "allowedTypes contains an unknown event type",
+    }),
+});
+
+interface IndexerContractStateRow {
+  contract_id: string;
+  indexing_paused: boolean;
+  allowed_event_types: string[] | null;
+  updated_at: Date | string;
+}
+
+function formatIndexerContractState(row: IndexerContractStateRow) {
+  return {
+    contractId: row.contract_id,
+    indexingPaused: row.indexing_paused,
+    allowedTypes: row.allowed_event_types ?? [],
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+/**
+ * Resolves `:contractId` to a contract the indexer knows about (a vault or the
+ * factory). Sends the 400/404 response itself and returns null on failure.
+ */
+async function resolveIndexedContract(req: Request, res: Response): Promise<string | null> {
+  const parsed = indexerContractIdSchema.safeParse(req.params["contractId"]);
+  if (!parsed.success) {
+    res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+    return null;
+  }
+  const contractId = parsed.data;
+  if (contractId === config.stellar.vaultFactoryContractId) return contractId;
+
+  const rows = await query<{ id: number }>("SELECT id FROM vaults WHERE contract_id = $1", [contractId]);
+  if (rows.length === 0) {
+    res.status(404).json({ error: "NotFound", message: `Contract ${contractId} is not indexed` });
+    return null;
+  }
+  return contractId;
+}
+
+/**
+ * POST /api/v1/admin/indexer/:contractId/pause (#1107)
+ *
+ * Skips the contract in every polling cycle. Records the global indexer ledger
+ * at pause time so a later resume can replay the events missed while paused.
+ * Pausing an already-paused contract keeps the original ledger.
+ */
+export async function pauseContractIndexing(req: Request, res: Response, next: NextFunction) {
+  try {
+    const contractId = await resolveIndexedContract(req, res);
+    if (!contractId) return;
+
+    const rows = await query<IndexerContractStateRow>(
+      `INSERT INTO indexer_contract_state (contract_id, indexing_paused, paused_at_ledger)
+       VALUES ($1, TRUE, (SELECT last_ledger FROM indexer_state ORDER BY id LIMIT 1))
+       ON CONFLICT (contract_id) DO UPDATE
+         SET indexing_paused = TRUE,
+             paused_at_ledger = COALESCE(indexer_contract_state.paused_at_ledger, EXCLUDED.paused_at_ledger),
+             updated_at = NOW()
+       RETURNING contract_id, indexing_paused, allowed_event_types, updated_at`,
+      [contractId],
+    );
+    await logAdminAudit(req, "pause_contract_indexing", `/api/v1/admin/indexer/${contractId}/pause`);
+
+    res.json(formatIndexerContractState(rows[0]));
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── Issue #1105: indexer start-block configuration ────────────────────────────
+
+/**
+ * GET /api/v1/admin/indexer/start-block
+ *
+ * The block a fresh indexing run starts from, plus the current cursor. The
+ * start block is stored in `indexer_state.start_ledger`; when that column is
+ * NULL the `INDEXER_START_LEDGER` env var is the fallback (`source:
+ * "environment"`). `active` is false once the cursor has advanced, because the
+ * start block is only consulted while no progress has been recorded.
+ */
+export async function getIndexerStartBlock(_req: Request, res: Response, next: NextFunction) {
+  try {
+    const [{ startBlock, source }, lastLedger] = await Promise.all([
+      indexer.getStartLedgerConfig(),
+      indexer.getLastIndexedLedger(),
+    ]);
+
+    res.json({
+      startBlock,
+      source,
+      envStartLedger: config.indexer.startLedger,
+      lastLedger,
+      running: indexer.isRunning(),
+      active: lastLedger === 0,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /api/v1/admin/indexer/:contractId/resume (#1107)
+ *
+ * Re-enables indexing. `paused_at_ledger` is left in place: the indexer's next
+ * cycle replays the contract from that ledger up to the current cursor and
+ * then clears it, so indexing continues from the last known ledger.
+ */
+export async function resumeContractIndexing(req: Request, res: Response, next: NextFunction) {
+  try {
+    const contractId = await resolveIndexedContract(req, res);
+    if (!contractId) return;
+
+    const rows = await query<IndexerContractStateRow>(
+      `INSERT INTO indexer_contract_state (contract_id, indexing_paused)
+       VALUES ($1, FALSE)
+       ON CONFLICT (contract_id) DO UPDATE
+         SET indexing_paused = FALSE, updated_at = NOW()
+       RETURNING contract_id, indexing_paused, allowed_event_types, updated_at`,
+      [contractId],
+    );
+    await logAdminAudit(req, "resume_contract_indexing", `/api/v1/admin/indexer/${contractId}/resume`);
+
+    res.json(formatIndexerContractState(rows[0]));
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * PATCH /api/v1/admin/indexer/:contractId/event-filter (#1106)
+ *
+ * Body: { allowedTypes: string[] }. Only the listed event types are indexed for
+ * the contract from the next index run; `[]` removes the filter. Types may be
+ * stored event types (`deposit`, `yield_distributed`) or topic symbols.
+ */
+export async function setContractEventFilter(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = eventFilterBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "BadRequest",
+        message: parsed.error.issues[0]?.message ?? "Invalid request body",
+      });
+      return;
+    }
+    const contractId = await resolveIndexedContract(req, res);
+    if (!contractId) return;
+
+    const allowedTypes = Array.from(new Set(parsed.data.allowedTypes));
+    const rows = await query<IndexerContractStateRow>(
+      `INSERT INTO indexer_contract_state (contract_id, allowed_event_types)
+       VALUES ($1, $2::text[])
+       ON CONFLICT (contract_id) DO UPDATE
+         SET allowed_event_types = EXCLUDED.allowed_event_types, updated_at = NOW()
+       RETURNING contract_id, indexing_paused, allowed_event_types, updated_at`,
+      [contractId, allowedTypes],
+    );
+    await logAdminAudit(req, "set_contract_event_filter", `/api/v1/admin/indexer/${contractId}/event-filter`);
+
+    res.json(formatIndexerContractState(rows[0]));
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * PUT /api/v1/admin/indexer/start-block
+ *
+ * Body: `{ "startBlock": <ledger> }`. Persists the origin of a fresh indexing
+ * run. A start block ahead of the current cursor is rejected: it would skip
+ * every ledger between the two. The value takes effect on the next indexer
+ * start, never mid-run, so the cursor is left untouched.
+ */
+export async function updateIndexerStartBlock(req: Request, res: Response, next: NextFunction) {
+  try {
+    const startBlockSchema = z.object({
+      startBlock: z.number().int().min(0),
+    }).strict();
+
+    const parsed = startBlockSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: "BadRequest",
+        message: "startBlock must be a non-negative integer",
+        details: parsed.error.issues,
+      });
+      return;
+    }
+
+    const { startBlock } = parsed.data;
+    const lastLedger = await indexer.getLastIndexedLedger();
+
+    if (startBlock > lastLedger) {
+      res.status(400).json({
+        error: "BadRequest",
+        message: `startBlock must not be ahead of the current indexer cursor (${lastLedger})`,
+      });
+      return;
+    }
+
+    await indexer.saveStartLedgerConfig(startBlock);
+    await logAdminAudit(req, "update_indexer_start_block", "/api/v1/admin/indexer/start-block");
+
+    res.json({
+      startBlock,
+      source: "database",
+      envStartLedger: config.indexer.startLedger,
+      lastLedger,
+      running: indexer.isRunning(),
+      active: lastLedger === 0,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function deleteApiKey(req: Request, res: Response, next: NextFunction) {
   try {
     const keyId = String(req.params["id"]);
@@ -298,9 +594,11 @@ export async function getApiKeys(_req: Request, res: Response, next: NextFunctio
       active: boolean;
       deactivated_at: Date | null;
       allowed_methods: string[] | null;
+      allowed_cidrs: string[] | null;
+            description: string | null;
     }>(
-      `SELECT id, label, role, created_at, expires_at, last_used_at, active, deactivated_at,
-              allowed_methods
+            `SELECT id, label, role, description, created_at, expires_at, last_used_at, active, deactivated_at,
+              allowed_methods, allowed_cidrs
        FROM api_keys ORDER BY created_at DESC`,
     );
 
@@ -309,15 +607,18 @@ export async function getApiKeys(_req: Request, res: Response, next: NextFunctio
         id: row.id,
         label: row.label,
         role: row.role,
+        description: row.description ?? null,
         createdAt: row.created_at,
         expiresAt: row.expires_at,
         // null until the key authenticates a request for the first time (#933)
-        lastUsedAt: row.last_used_at ?? null,
+        ...(row.last_used_at !== undefined ? { lastUsedAt: row.last_used_at ?? null } : {}),
         // false once the inactivity sweep has retired the key (#934)
-        active: row.active,
-        deactivatedAt: row.deactivated_at ?? null,
+        ...(row.active !== undefined ? { active: row.active } : {}),
+        ...(row.deactivated_at !== undefined ? { deactivatedAt: row.deactivated_at ?? null } : {}),
         // null means the key may use any HTTP method (#935)
-        allowedMethods: row.allowed_methods ?? null,
+        ...(row.allowed_methods !== undefined ? { allowedMethods: row.allowed_methods ?? null } : {}),
+        // null means the key may be used from any IP (#928)
+        ...(row.allowed_cidrs !== undefined ? { allowedCidrs: row.allowed_cidrs ?? null } : {}),
       })),
     );
   } catch (err) {
@@ -417,12 +718,14 @@ export async function getWebhookDeliveries(req: Request, res: Response, next: Ne
     const rows = await query<{
       id: number;
       attempt: number;
+      status: string;
       delivered_at: Date | null;
       last_error: string | null;
       next_retry_at: Date | null;
+      replayed_from: number | null;
       created_at: Date;
     }>(
-      `SELECT id, attempt, delivered_at, last_error, next_retry_at, created_at
+      `SELECT id, attempt, status, delivered_at, last_error, next_retry_at, replayed_from, created_at
        FROM webhook_deliveries
        WHERE webhook_id = $1
        ORDER BY created_at DESC
@@ -434,9 +737,11 @@ export async function getWebhookDeliveries(req: Request, res: Response, next: Ne
       data: rows.map((r) => ({
         id: r.id,
         attempt: r.attempt,
+        status: r.status,
         deliveredAt: r.delivered_at,
         lastError: r.last_error,
         nextRetryAt: r.next_retry_at,
+        replayedFrom: r.replayed_from,
         createdAt: r.created_at,
       })),
       total,
@@ -484,6 +789,162 @@ export async function bulkToggleWebhooks(req: Request, res: Response, next: Next
   }
 }
 
+/**
+ * POST /admin/webhooks/:id/circuit-reset (#1061)
+ *
+ * Closes an open circuit so deliveries resume on the next triggered event.
+ * Also clears the failure counter that opened it, otherwise the very next
+ * failure would immediately re-trip the breaker.
+ */
+export async function resetWebhookCircuit(req: Request, res: Response, next: NextFunction) {
+  try {
+    const webhookId = parseInt(req.params["id"] as string, 10);
+    if (isNaN(webhookId) || webhookId <= 0) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid webhook ID" });
+      return;
+    }
+
+    const rows = await query<{ id: number; circuit_open: boolean }>(
+      `UPDATE webhooks
+          SET circuit_open = FALSE, circuit_opened_at = NULL, consecutive_failures = 0
+        WHERE id = $1
+        RETURNING id, circuit_open`,
+      [webhookId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Webhook not found" });
+      return;
+    }
+
+    await logAdminAudit(req, "webhook_circuit_reset", `/api/v1/admin/webhooks/${webhookId}/circuit-reset`);
+
+    res.json({ id: webhookId, circuitOpen: false, consecutiveFailures: 0 });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /admin/webhooks/:id/rotate-secret (#1062)
+ *
+ * Issues a fresh HMAC secret and keeps the outgoing one valid for
+ * SECRET_ROTATION_WINDOW_HOURS so receivers can roll over without downtime.
+ * The new secret is returned once; neither secret is ever readable again.
+ */
+export async function rotateWebhookSecret(req: Request, res: Response, next: NextFunction) {
+  try {
+    const webhookId = parseInt(req.params["id"] as string, 10);
+    if (isNaN(webhookId) || webhookId <= 0) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid webhook ID" });
+      return;
+    }
+
+    const newSecret = generateWebhookSecret();
+    const windowHours = secretRotationWindowHours();
+
+    const rows = await query<{ id: number; had_secret: boolean }>(
+      `UPDATE webhooks
+          SET previous_secret = secret,
+              secret = $1,
+              secret_rotated_at = NOW()
+        WHERE id = $2
+        RETURNING id, previous_secret IS NOT NULL AS had_secret`,
+      [newSecret, webhookId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Webhook not found" });
+      return;
+    }
+
+    await logAdminAudit(req, "webhook_rotate_secret", `/api/v1/admin/webhooks/${webhookId}/rotate-secret`);
+
+    res.json({
+      id: webhookId,
+      secret: newSecret,
+      rotationWindowHours: windowHours,
+      previousSecretRetained: rows[0].had_secret,
+      rotatesAt: new Date(Date.now() + windowHours * 60 * 60 * 1000).toISOString(),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /admin/webhooks/deliveries/:deliveryId/replay (#1063)
+ *
+ * Re-enqueues a past delivery verbatim from the delivery log, without
+ * re-indexing the underlying event. The clone is a new row that references
+ * the source via `replayed_from`.
+ */
+export async function replayWebhookDelivery(req: Request, res: Response, next: NextFunction) {
+  try {
+    const deliveryId = parseInt(req.params["deliveryId"] as string, 10);
+    if (isNaN(deliveryId) || deliveryId <= 0) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid delivery ID" });
+      return;
+    }
+
+    const source = await query<{
+      id: number;
+      webhook_id: number;
+      payload: string;
+      circuit_open: boolean;
+      active: boolean;
+    }>(
+      `SELECT wd.id, wd.webhook_id, wd.payload::text AS payload,
+              w.circuit_open, w.active
+         FROM webhook_deliveries wd
+         JOIN webhooks w ON w.id = wd.webhook_id
+        WHERE wd.id = $1`,
+      [deliveryId],
+    );
+    if (source.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Delivery not found" });
+      return;
+    }
+
+    const original = source[0];
+    if (original.circuit_open) {
+      res.status(409).json({
+        error: "Conflict",
+        message:
+          "Webhook circuit is open; reset it before replaying deliveries for this endpoint",
+      });
+      return;
+    }
+
+    const inserted = await query<{ id: number }>(
+      `INSERT INTO webhook_deliveries
+         (webhook_id, payload, attempt, next_retry_at, replayed_from, status)
+       VALUES ($1, $2, 1, NOW(), $3, 'pending')
+       RETURNING id`,
+      [original.webhook_id, original.payload, original.id],
+    );
+
+    await jobQueue.send("webhook-deliver", {
+      webhookId: original.webhook_id,
+      payload: original.payload,
+      deliveryId: inserted[0].id,
+    });
+
+    await logAdminAudit(
+      req,
+      "webhook_replay_delivery",
+      `/api/v1/admin/webhooks/deliveries/${deliveryId}/replay`,
+    );
+
+    res.status(201).json({
+      deliveryId: inserted[0].id,
+      replayedFrom: original.id,
+      webhookId: original.webhook_id,
+      status: "queued",
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function getAdminEvents(req: Request, res: Response, next: NextFunction) {
   try {
     const { contractId, eventType } = req.query as Record<string, string | undefined>;
@@ -500,7 +961,17 @@ export async function getAdminEvents(req: Request, res: Response, next: NextFunc
     }
 
     const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-    const rows = await query(
+    // Issue #918: reads from the live table only; archived is always false for
+    // live events. Events moved to indexed_events_archive are not included here.
+    const rows = await query<{
+      id: number;
+      ledger: number;
+      tx_hash: string;
+      contract_id: string;
+      event_type: string;
+      payload: unknown;
+      created_at: Date;
+    }>(
       `SELECT id, ledger, tx_hash, contract_id, event_type, payload, created_at
        FROM indexed_events
        ${whereClause}
@@ -509,7 +980,7 @@ export async function getAdminEvents(req: Request, res: Response, next: NextFunc
       params,
     );
 
-    res.json(rows);
+    res.json(rows.map((row) => ({ ...row, archived: false })));
   } catch (err) {
     next(err);
   }
@@ -708,16 +1179,178 @@ export async function deleteUser(req: Request, res: Response, next: NextFunction
   }
 }
 
+interface AuditLogFilters {
+  action?: string;
+  actor?: string;
+  from?: string;
+  to?: string;
+}
+
+function buildAuditLogFilters(filters: AuditLogFilters, startIdx = 0): {
+  conditions: string[];
+  params: any[];
+  nextIdx: number;
+} {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  let idx = startIdx;
+
+  if (filters.action && filters.action.trim() !== "") {
+    idx++;
+    conditions.push(`action = $${idx}`);
+    params.push(filters.action.trim());
+  }
+
+  if (filters.actor && filters.actor.trim() !== "") {
+    idx++;
+    conditions.push(`api_key_label = $${idx}`);
+    params.push(filters.actor.trim());
+  }
+
+  if (filters.from && filters.from.trim() !== "") {
+    idx++;
+    conditions.push(`created_at >= $${idx}::timestamptz`);
+    params.push(filters.from.trim());
+  }
+
+  if (filters.to && filters.to.trim() !== "") {
+    idx++;
+    conditions.push(`created_at <= $${idx}::timestamptz`);
+    params.push(filters.to.trim());
+  }
+
+  return { conditions, params, nextIdx: idx };
+}
+
+function decodeAuditCursor(cursorStr: string): { cursorId: number | null; cursorCreatedAt: Date | null } {
+  try {
+    const raw = Buffer.from(cursorStr, "base64url").toString("utf8");
+    const parsed = JSON.parse(raw);
+    const cursorId = typeof parsed.id === "number" ? parsed.id : null;
+    const cursorCreatedAt = parsed.created_at ? new Date(parsed.created_at) : null;
+    if (cursorId !== null) {
+      return { cursorId, cursorCreatedAt };
+    }
+  } catch {
+    // not base64url JSON
+  }
+  const idNum = parseInt(cursorStr, 10);
+  if (!isNaN(idNum)) {
+    return { cursorId: idNum, cursorCreatedAt: null };
+  }
+  return { cursorId: null, cursorCreatedAt: null };
+}
+
+function encodeAuditCursor(id: number, createdAt: Date): string {
+  return Buffer.from(
+    JSON.stringify({
+      id,
+      created_at: createdAt instanceof Date ? createdAt.toISOString() : new Date(createdAt).toISOString(),
+    }),
+  ).toString("base64url");
+}
+
 export async function getAdminAuditLog(req: Request, res: Response, next: NextFunction) {
   try {
+    const action = typeof req.query["action"] === "string" ? req.query["action"] : undefined;
+    const actor = typeof req.query["actor"] === "string" ? req.query["actor"] : undefined;
+    const from = typeof req.query["from"] === "string" ? req.query["from"] : undefined;
+    const to = typeof req.query["to"] === "string" ? req.query["to"] : undefined;
+    const cursorParam = typeof req.query["cursor"] === "string" && req.query["cursor"].trim() !== ""
+      ? req.query["cursor"].trim()
+      : undefined;
+
+    const rawLimit = parseInt(String(req.query["limit"] ?? req.query["pageSize"] ?? "20"), 10);
+    const limit = Math.max(1, Math.min(100, isNaN(rawLimit) ? 20 : rawLimit));
+
+    const { conditions, params, nextIdx } = buildAuditLogFilters({ action, actor, from, to });
+    let paramIdx = nextIdx;
+
+    const countWhere = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const countRows = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM admin_audit_log ${countWhere}`,
+      params,
+    );
+    const total = parseInt(countRows[0]?.count ?? "0", 10);
+
+    const queryConditions = [...conditions];
+    const queryParams = [...params];
+
+    if (cursorParam) {
+      const { cursorId, cursorCreatedAt } = decodeAuditCursor(cursorParam);
+      if (cursorCreatedAt !== null && cursorId !== null) {
+        paramIdx++;
+        queryConditions.push(`(created_at, id) < ($${paramIdx}::timestamptz, $${paramIdx + 1})`);
+        queryParams.push(cursorCreatedAt.toISOString(), cursorId);
+        paramIdx++;
+      } else if (cursorId !== null) {
+        paramIdx++;
+        queryConditions.push(`id < $${paramIdx}`);
+        queryParams.push(cursorId);
+      }
+
+      const whereClause = queryConditions.length > 0 ? `WHERE ${queryConditions.join(" AND ")}` : "";
+      paramIdx++;
+      queryParams.push(limit + 1);
+
+      const rows = await query<{
+        id: number;
+        api_key_label: string | null;
+        action: string;
+        target: string;
+        ip_address: string | null;
+        request_body_hash: string;
+        details: any;
+        created_at: Date;
+      }>(
+        `SELECT id, api_key_label, action, target, ip_address, request_body_hash, details, created_at
+         FROM admin_audit_log
+         ${whereClause}
+         ORDER BY created_at DESC, id DESC
+         LIMIT $${paramIdx}`,
+        queryParams,
+      );
+
+      let nextCursor: string | null = null;
+      if (rows.length > limit) {
+        rows.pop();
+        const lastRow = rows[rows.length - 1];
+        nextCursor = encodeAuditCursor(lastRow.id, lastRow.created_at);
+      }
+
+      if (nextCursor) {
+        res.set("X-Next-Cursor", nextCursor);
+      }
+
+      res.json({
+        data: rows.map((row) => ({
+          id: row.id,
+          apiKeyLabel: row.api_key_label,
+          actor: row.api_key_label,
+          action: row.action,
+          target: row.target,
+          ipAddress: row.ip_address,
+          requestBodyHash: row.request_body_hash,
+          details: row.details ?? null,
+          createdAt: row.created_at,
+        })),
+        nextCursor,
+        total,
+        limit,
+        pageSize: limit,
+      });
+      return;
+    }
+
     const rawPage = parseInt(String(req.query["page"] ?? "1"), 10);
     const page = Math.max(1, isNaN(rawPage) ? 1 : rawPage);
-    const rawPageSize = parseInt(String(req.query["pageSize"] ?? "20"), 10);
-    const pageSize = Math.max(1, Math.min(100, isNaN(rawPageSize) ? 20 : rawPageSize));
-    const offset = (page - 1) * pageSize;
+    const offset = (page - 1) * limit;
 
-    const countRows = await query<{ count: string }>("SELECT COUNT(*)::text AS count FROM admin_audit_log");
-    const total = parseInt(countRows[0]?.count ?? "0", 10);
+    const whereClause = queryConditions.length > 0 ? `WHERE ${queryConditions.join(" AND ")}` : "";
+    queryParams.push(limit + 1);
+    const limitIdx = queryParams.length;
+    queryParams.push(offset);
+    const offsetIdx = queryParams.length;
 
     const rows = await query<{
       id: number;
@@ -726,28 +1359,356 @@ export async function getAdminAuditLog(req: Request, res: Response, next: NextFu
       target: string;
       ip_address: string | null;
       request_body_hash: string;
+      details: any;
       created_at: Date;
     }>(
-      `SELECT id, api_key_label, action, target, ip_address, request_body_hash, created_at
+      `SELECT id, api_key_label, action, target, ip_address, request_body_hash, details, created_at
        FROM admin_audit_log
-       ORDER BY created_at DESC
-       LIMIT $1 OFFSET $2`,
-      [pageSize, offset],
+       ${whereClause}
+       ORDER BY created_at DESC, id DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      queryParams,
     );
+
+    let nextCursor: string | null = null;
+    if (rows.length > limit) {
+      rows.pop();
+      const lastRow = rows[rows.length - 1];
+      nextCursor = encodeAuditCursor(lastRow.id, lastRow.created_at);
+    }
+
+    if (nextCursor) {
+      res.set("X-Next-Cursor", nextCursor);
+    }
 
     res.json({
       data: rows.map((row) => ({
         id: row.id,
         apiKeyLabel: row.api_key_label,
+        actor: row.api_key_label,
         action: row.action,
         target: row.target,
         ipAddress: row.ip_address,
         requestBodyHash: row.request_body_hash,
+        details: row.details ?? null,
         createdAt: row.created_at,
       })),
+      nextCursor,
       total,
       page,
-      pageSize,
+      pageSize: limit,
+      limit,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+const AUDIT_LOG_EXPORT_COLUMNS = [
+  "timestamp",
+  "actor",
+  "action",
+  "target",
+  "details",
+] as const;
+
+export async function exportAdminAuditLogCsv(req: Request, res: Response, next: NextFunction) {
+  const action = typeof req.query["action"] === "string" ? req.query["action"] : undefined;
+  const actor = typeof req.query["actor"] === "string" ? req.query["actor"] : undefined;
+  const from = typeof req.query["from"] === "string" ? req.query["from"] : undefined;
+  const to = typeof req.query["to"] === "string" ? req.query["to"] : undefined;
+
+  const { conditions, params } = buildAuditLogFilters({ action, actor, from, to });
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  let client: any;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    next(err);
+    return;
+  }
+
+  const cursor = client.query(
+    new Cursor(
+      `SELECT created_at,
+              api_key_label AS actor,
+              action,
+              target,
+              details
+         FROM admin_audit_log
+        ${whereClause}
+        ORDER BY created_at DESC, id DESC`,
+      params,
+    ),
+  );
+
+  let released = false;
+  const cleanup = async (): Promise<void> => {
+    if (released) return;
+    released = true;
+    try {
+      await cursor.close();
+    } catch {
+      /* connection may already be gone */
+    }
+    client.release();
+  };
+
+  const stringifier = stringify({ header: true, columns: [...AUDIT_LOG_EXPORT_COLUMNS] });
+
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", 'attachment; filename="audit-log.csv"');
+  res.setHeader("Transfer-Encoding", "chunked");
+
+  stringifier.on("error", (err) => {
+    void cleanup();
+    res.destroy(err);
+  });
+  res.on("close", () => {
+    void cleanup();
+  });
+  stringifier.pipe(res);
+
+  try {
+    for (;;) {
+      const rows = await cursor.read(500);
+      if (!rows || rows.length === 0) break;
+      for (const row of rows) {
+        const timestamp = row.created_at instanceof Date
+          ? row.created_at.toISOString()
+          : row.created_at ? new Date(row.created_at).toISOString() : "";
+        const formattedRow = {
+          timestamp,
+          actor: row.actor ?? "",
+          action: row.action ?? "",
+          target: row.target ?? "",
+          details: row.details != null
+            ? (typeof row.details === "object" ? JSON.stringify(row.details) : String(row.details))
+            : "",
+        };
+        if (!stringifier.write(formattedRow)) {
+          await once(stringifier, "drain");
+        }
+      }
+    }
+    stringifier.end();
+    await cleanup();
+  } catch (err) {
+    await cleanup();
+    if (!res.headersSent) {
+      next(err);
+      return;
+    }
+    res.destroy(err as Error);
+  }
+}
+
+export async function getVaultNotes(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    const rows = await query<{
+      id: number;
+      contract_id: string;
+      author: string;
+      note: string;
+      created_at: Date;
+    }>(
+      `SELECT id, contract_id, author, note, created_at
+         FROM vault_admin_notes
+        WHERE contract_id = $1
+        ORDER BY created_at DESC, id DESC`,
+      [contractId],
+    );
+
+    res.json(
+      rows.map((r) => ({
+        id: r.id,
+        contractId: r.contract_id,
+        author: r.author,
+        note: r.note,
+        createdAt: r.created_at,
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function createVaultNote(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    const { note, author } = (req.body ?? {}) as { note?: unknown; author?: unknown };
+    if (typeof note !== "string" || note.trim().length === 0) {
+      res.status(400).json({ error: "BadRequest", message: "Note is required and cannot be empty" });
+      return;
+    }
+
+    const noteAuthor =
+      typeof author === "string" && author.trim().length > 0
+        ? author.trim()
+        : req.apiKey?.label ?? "admin";
+
+    const rows = await query<{
+      id: number;
+      contract_id: string;
+      author: string;
+      note: string;
+      created_at: Date;
+    }>(
+      `INSERT INTO vault_admin_notes (contract_id, author, note, created_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING id, contract_id, author, note, created_at`,
+      [contractId, noteAuthor, note.trim()],
+    );
+
+    await logAdminAudit(req, "create_vault_note", `/api/v1/admin/vaults/${contractId}/notes`);
+
+    const created = rows[0];
+    res.status(201).json({
+      id: created.id,
+      contractId: created.contract_id,
+      author: created.author,
+      note: created.note,
+      createdAt: created.created_at,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getVaultTags(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const rows = await query<{ tags: string[] | null }>(
+      "SELECT tags FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    res.json({
+      contractId,
+      tags: rows[0].tags ?? [],
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateVaultTags(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    const rawTags = Array.isArray(req.body)
+      ? req.body
+      : req.body?.tags;
+
+    if (!Array.isArray(rawTags)) {
+      res.status(422).json({
+        error: "UnprocessableEntity",
+        message: "tags must be an array of strings",
+      });
+      return;
+    }
+
+    if (rawTags.length > 10) {
+      res.status(422).json({
+        error: "UnprocessableEntity",
+        message: "A vault may have at most 10 tags",
+      });
+      return;
+    }
+
+    const normalizedTags: string[] = [];
+    for (const tag of rawTags) {
+      if (typeof tag !== "string") {
+        res.status(422).json({
+          error: "UnprocessableEntity",
+          message: "Each tag must be a string",
+        });
+        return;
+      }
+      const trimmed = tag.trim();
+      if (trimmed.length === 0 || trimmed.length > 32) {
+        res.status(422).json({
+          error: "UnprocessableEntity",
+          message: "Tag length must be between 1 and 32 characters",
+        });
+        return;
+      }
+      if (!/^[a-z0-9_-]+$/i.test(trimmed)) {
+        res.status(422).json({
+          error: "UnprocessableEntity",
+          message: `Invalid tag characters in "${trimmed}". Tags may only contain alphanumeric characters, hyphens, and underscores.`,
+        });
+        return;
+      }
+      normalizedTags.push(trimmed.toLowerCase());
+    }
+
+    const updateRows = await query<{ tags: string[] }>(
+      "UPDATE vaults SET tags = $1 WHERE contract_id = $2 RETURNING tags",
+      [normalizedTags, contractId],
+    );
+
+    await logAdminAudit(req, "update_vault_tags", `/api/v1/admin/vaults/${contractId}/tags`);
+
+    res.json({
+      contractId,
+      tags: updateRows[0]?.tags ?? normalizedTags,
     });
   } catch (err) {
     next(err);
@@ -1582,6 +2543,108 @@ export async function getBenchmarksByName(req: Request, res: Response, next: Nex
   }
 }
 
+// ── Issue #926: Vault archive exclusion toggle ──────────────────────────────
+export async function toggleVaultArchiveExclusion(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const bodySchema = z.object({ excludeFromArchive: z.boolean() });
+    const bodyParsed = bodySchema.safeParse(req.body);
+    if (!bodyParsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "excludeFromArchive must be a boolean" });
+      return;
+    }
+    const { excludeFromArchive } = bodyParsed.data;
+
+    const rows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    await query(
+      "UPDATE vaults SET exclude_from_archive = $1, updated_at = NOW() WHERE contract_id = $2",
+      [excludeFromArchive, contractId],
+    );
+
+    await logAdminAudit(req, "toggle_vault_archive_exclusion", `/api/v1/admin/vaults/${contractId}/archive-exclusion`);
+
+    res.json({ contractId, excludeFromArchive });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── Issue #927: Archival verification ────────────────────────────────────────
+const ARCHIVABLE_TABLES = ["indexed_events", "share_balance_snapshots", "vault_tvl_snapshots"];
+
+export async function verifyArchiveConsistency(_req: Request, res: Response, next: NextFunction) {
+  try {
+    const tableResults: {
+      name: string;
+      liveRows: number;
+      archiveRows: number;
+      totalRows: number;
+      consistent: boolean;
+    }[] = [];
+
+    for (const table of ARCHIVABLE_TABLES) {
+      const liveRowsResult = await query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM ${table}`,
+      );
+      const liveRows = parseInt(liveRowsResult[0]?.count ?? "0", 10);
+
+      const archiveTable = `${table}_archive`;
+      let archiveRows = 0;
+      try {
+        const archiveRowsResult = await query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM ${archiveTable}`,
+        );
+        archiveRows = parseInt(archiveRowsResult[0]?.count ?? "0", 10);
+      } catch {
+        // Archive table may not exist yet
+      }
+
+      const totalRows = liveRows + archiveRows;
+
+      const auditResult = await query<{ pre_archival_count: string }>(
+        `SELECT pre_archival_count::text
+         FROM archive_audit_log
+         WHERE table_name = $1
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [table],
+      );
+
+      let consistent = true;
+      if (auditResult.length > 0) {
+        const preArchivalCount = parseInt(auditResult[0].pre_archival_count, 10);
+        consistent = totalRows === preArchivalCount;
+      }
+
+      tableResults.push({
+        name: table,
+        liveRows,
+        archiveRows,
+        totalRows,
+        consistent,
+      });
+    }
+
+    res.json({ tables: tableResults });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ── Issue #962: Database VACUUM/ANALYZE ──────────────────────────────────────
 
 const APP_TABLES = [
@@ -1630,130 +2693,316 @@ export async function vacuumDatabase(req: Request, res: Response, next: NextFunc
   }
 }
 
-export const MAX_EVENT_REPROCESS_BATCH_SIZE = 100;
 
-export async function reprocessEventBatch(req: Request, res: Response, next: NextFunction) {
+// Issue #1108: indexer event count per contract
+export async function getIndexerEventCounts(_req: Request, res: Response, next: NextFunction) {
   try {
-    const parsed = z.object({
-      eventIds: z.array(z.number().int().positive()).min(1, "eventIds must not be empty").max(MAX_EVENT_REPROCESS_BATCH_SIZE, `eventIds cannot exceed ${MAX_EVENT_REPROCESS_BATCH_SIZE}`),
-    }).safeParse(req.body);
+    const counts = await indexer.getEventCountsPerContract();
+    res.json(counts);
+  } catch (err) {
+    next(err);
+  }
+}
 
+export const quarterlyReportQuerySchema = z.object({
+  year: z.coerce.number().int().min(2020).max(2100),
+  quarter: z.coerce.number().int().min(1).max(4),
+});
+
+// Issue #1114: quarterly yield report
+export async function getQuarterlyYieldReport(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = quarterlyReportQuerySchema.safeParse(req.query);
     if (!parsed.success) {
-      res.status(400).json({ error: "ValidationError", issues: parsed.error.issues });
+      res.status(400).json({ error: "BadRequest", message: "Invalid year or quarter parameter (quarter must be 1, 2, 3, or 4)" });
       return;
     }
 
-    const { eventIds } = parsed.data;
-    const rows = await query<{ id: number; contract_id: string; event_type: string; ledger: number; payload: Record<string, unknown> }>(
-      `SELECT id, contract_id, event_type, ledger, payload FROM indexed_events WHERE id = ANY($1) ORDER BY id ASC`,
-      [eventIds],
+    const { year, quarter } = parsed.data;
+
+    // Define quarter date ranges in UTC
+    const quarterStarts: Record<number, string> = {
+      1: `${year}-01-01T00:00:00.000Z`,
+      2: `${year}-04-01T00:00:00.000Z`,
+      3: `${year}-07-01T00:00:00.000Z`,
+      4: `${year}-10-01T00:00:00.000Z`,
+    };
+    const quarterEnds: Record<number, string> = {
+      1: `${year}-04-01T00:00:00.000Z`,
+      2: `${year}-07-01T00:00:00.000Z`,
+      3: `${year}-10-01T00:00:00.000Z`,
+      4: `${year + 1}-01-01T00:00:00.000Z`,
+    };
+
+    const start = quarterStarts[quarter];
+    const end = quarterEnds[quarter];
+
+    // totalYieldPaid: sum of finalized epoch yields in the quarter
+    const yieldRows = await query<{ total_yield: string }>(
+      `SELECT COALESCE(SUM(yield_amount), 0)::text AS total_yield
+       FROM epochs
+       WHERE (closed_at >= $1 AND closed_at < $2)
+          OR (closed_at IS NULL AND distributed_at >= $1 AND distributed_at < $2)`,
+      [start, end],
     );
+    const totalYieldPaid = yieldRows[0]?.total_yield ?? "0";
 
-    const byId = new Map(rows.map((row) => [row.id, row]));
-    const processedCount = { value: 0 };
-    const skippedCount = { value: 0 };
-
-    await Promise.all(eventIds.map(async (eventId) => {
-      const row = byId.get(eventId);
-      if (!row) {
-        throw new Error(`Invalid event ID: ${eventId}`);
-      }
-
-      const contractId = row.contract_id;
-      const eventType = row.event_type;
-      const ledgerSeq = row.ledger;
-      const idempotencyKey = createHash("sha256")
-        .update(contractId + eventType + String(ledgerSeq))
-        .digest("hex");
-
-      const existing = await query<{ id: number }>(
-        `SELECT id FROM indexed_events WHERE contract_id = $1 AND event_type = $2 AND ledger = $3 AND id = $4 LIMIT 1`,
-        [contractId, eventType, ledgerSeq, eventId],
+    // totalFeesEarned: fees collected across all vaults in the quarter
+    let totalFeesEarned = "0";
+    try {
+      const feeRows = await query<{ total_fees: string }>(
+        `SELECT COALESCE(SUM(fee_amount), 0)::text AS total_fees
+         FROM transfer_fees
+         WHERE collected_at >= $1 AND collected_at < $2`,
+        [start, end],
       );
-      if (existing.length === 0) {
-        skippedCount.value += 1;
-        return;
-      }
+      totalFeesEarned = feeRows[0]?.total_fees ?? "0";
+    } catch {
+      totalFeesEarned = "0";
+    }
 
-      if (eventType === "yield_claimed" || eventType === "yield_claimed_partial") {
-        const user = String((row.payload as Record<string, unknown>)?.user ?? "");
-        const amount = row.payload && typeof row.payload === "object" && "amount" in row.payload
-          ? String((row.payload as Record<string, unknown>).amount ?? "0")
-          : String((row.payload as Record<string, unknown>).claimed ?? "0");
-
-        await query(
-          `UPDATE share_balance_snapshots
-           SET cumulative_yield_claimed = cumulative_yield_claimed + $1,
-               recorded_at = NOW()
-           WHERE user_address = $2 AND vault_id = (
-             SELECT v.id FROM vaults v WHERE v.contract_id = $3
-           )`,
-          [amount, user, contractId],
-        );
-      }
-
-      processedCount.value += 1;
-    }));
-
-    const auditInsert = await query<{ id: number }>(
-      `INSERT INTO admin_audit_log (api_key_label, action, target, ip_address, request_body_hash, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
-       RETURNING id`,
-      [req.apiKey?.label ?? null, "EVENT_REPROCESS", "/api/v1/admin/events/reprocess-batch", getClientIp(req), getRequestBodyHash(req.body)],
+    // peakTvlUsd: maximum single-day TVL snapshot in the quarter
+    const tvlRows = await query<{ peak_tvl: string }>(
+      `WITH daily AS (
+         SELECT date_trunc('day', recorded_at) AS day,
+                SUM(total_assets) AS daily_assets
+         FROM vault_tvl_snapshots
+         WHERE recorded_at >= $1 AND recorded_at < $2
+         GROUP BY date_trunc('day', recorded_at)
+       )
+       SELECT COALESCE(MAX(daily_assets), 0)::text AS peak_tvl
+       FROM daily`,
+      [start, end],
     );
+    let peakTvlUsd = tvlRows[0]?.peak_tvl ?? "0";
+    if (peakTvlUsd === "0") {
+      const fallbackTvl = await query<{ max_assets: string }>(
+        `SELECT COALESCE(MAX(total_assets), 0)::text AS max_assets
+         FROM vault_tvl_snapshots
+         WHERE recorded_at >= $1 AND recorded_at < $2`,
+        [start, end],
+      );
+      peakTvlUsd = fallbackTvl[0]?.max_assets ?? "0";
+    }
+
+    // uniqueHolders: count of distinct holders with active shares
+    const holderRows = await query<{ count: string }>(
+      `SELECT COUNT(DISTINCT user_address)::text AS count
+       FROM user_vault_positions
+       WHERE shares > 0`,
+    );
+    const uniqueHolders = parseInt(holderRows[0]?.count ?? "0", 10);
 
     res.json({
-      processedCount: processedCount.value,
-      skippedCount: skippedCount.value,
-      auditLogId: auditInsert[0]?.id ?? null,
+      year,
+      quarter,
+      totalYieldPaid,
+      totalFeesEarned,
+      peakTvlUsd,
+      uniqueHolders,
     });
   } catch (err) {
     next(err);
   }
 }
 
-export async function getApiDiff(req: Request, res: Response, next: NextFunction) {
+// ── Issues #1077, #1078: Transfer Alerts ───────────────────────────────────────
+
+interface TransferAlertRow {
+  id: number;
+  vault_id: number | null;
+  contract_id: string | null;
+  type: string;
+  amount: string | null;
+  from_address: string | null;
+  to_address: string | null;
+  tx_hash: string | null;
+  details: Record<string, unknown> | null;
+  created_at: Date;
+  acknowledged_at: Date | null;
+}
+
+/**
+ * GET /api/v1/admin/transfer-alerts
+ * Lists transfer alerts. By default, returns unacknowledged alerts.
+ */
+export async function getTransferAlerts(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
   try {
-    const { from, to } = req.query as { from?: string; to?: string };
+    const { acknowledged, status } = req.query as { acknowledged?: string; status?: string };
 
-    if (!from || !to) {
-      res.status(400).json({
-        error: "BadRequest",
-        message: "Both 'from' and 'to' query parameters are required",
-      });
-      return;
+    let whereClause = "WHERE acknowledged_at IS NULL";
+    if (acknowledged === "true" || status === "acknowledged") {
+      whereClause = "WHERE acknowledged_at IS NOT NULL";
+    } else if (acknowledged === "all" || status === "all") {
+      whereClause = "";
     }
 
-    if ((from !== "v1" && from !== "v2") || (to !== "v1" && to !== "v2")) {
-      res.status(400).json({
-        error: "BadRequest",
-        message: "Invalid version. Only 'v1' and 'v2' are supported",
-      });
-      return;
-    }
-
-    const openApiDir = resolve(process.cwd(), "src/openapi");
-    const readSpec = (version: string) => JSON.parse(
-      readFileSync(resolve(openApiDir, `${version}.json`), "utf8"),
+    const rows = await query<TransferAlertRow>(
+      `SELECT id, vault_id, contract_id, type, amount, from_address, to_address, tx_hash, details, created_at, acknowledged_at
+       FROM transfer_alerts
+       ${whereClause}
+       ORDER BY created_at DESC`,
     );
 
-    const fromSpec = readSpec(from);
-    const toSpec = readSpec(to);
-    const fromPaths = fromSpec.paths ?? {};
-    const toPaths = toSpec.paths ?? {};
-
-    const added = Object.keys(toPaths)
-      .filter((path) => !(path in fromPaths))
-      .sort();
-    const removed = Object.keys(fromPaths)
-      .filter((path) => !(path in toPaths))
-      .sort();
-    const modified = Object.keys(toPaths)
-      .filter((path) => path in fromPaths && JSON.stringify(fromPaths[path]) !== JSON.stringify(toPaths[path]))
-      .sort();
-
-    res.json({ from, to, added, removed, modified });
+    res.json(
+      rows.map((row) => ({
+        id: row.id,
+        vaultId: row.vault_id,
+        contractId: row.contract_id,
+        type: row.type,
+        amount: row.amount ? String(row.amount) : null,
+        fromAddress: row.from_address,
+        toAddress: row.to_address,
+        txHash: row.tx_hash,
+        details: row.details,
+        createdAt: row.created_at,
+        acknowledgedAt: row.acknowledged_at,
+      })),
+    );
   } catch (err) {
     next(err);
   }
 }
+
+/**
+ * GET /api/v1/admin/vaults/:contractId/epoch-anomalies (#1073)
+ *
+ * Lists the epochs whose yield sat far from that vault's own recent history, so
+ * an operator can tell a genuine change in the underlying asset apart from an
+ * indexing fault. Read-only: detection runs on its own schedule and this
+ * endpoint only reports what it found.
+ */
+export async function getEpochAnomalies(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+
+    // Newest epoch first, so the most recent flag is at the top of the response.
+    const rawLimit = parseInt(String(req.query["limit"] ?? "100"), 10);
+    const limit = Math.max(1, Math.min(500, isNaN(rawLimit) ? 100 : rawLimit));
+
+    const anomalies = await new EpochAnomalyService().listForVault(parsed.data, limit);
+    res.json(anomalies);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * PATCH /api/v1/admin/transfer-alerts/:id/acknowledge
+ * Marks a transfer alert as acknowledged.
+ */
+export async function acknowledgeTransferAlert(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (Number.isNaN(id) || id <= 0) {
+      res.status(400).json({ error: "Invalid alert id" });
+      return;
+    }
+
+    const rows = await query<TransferAlertRow>(
+      `UPDATE transfer_alerts
+       SET acknowledged_at = NOW()
+       WHERE id = $1
+       RETURNING id, vault_id, contract_id, type, amount, from_address, to_address, tx_hash, details, created_at, acknowledged_at`,
+      [id],
+    );
+
+    if (rows.length === 0) {
+      res.status(404).json({ error: "Transfer alert not found" });
+      return;
+    }
+
+    const row = rows[0];
+    res.json({
+      id: row.id,
+      vaultId: row.vault_id,
+      contractId: row.contract_id,
+      type: row.type,
+      amount: row.amount ? String(row.amount) : null,
+      fromAddress: row.from_address,
+      toAddress: row.to_address,
+      txHash: row.tx_hash,
+      details: row.details,
+      createdAt: row.created_at,
+      acknowledgedAt: row.acknowledged_at,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// --- #1088 Admin CSV export for all vaults ----------------------------------------
+
+/**
+ * GET /api/v1/admin/reports/vaults.csv
+ *
+ * Streamed CSV export of all active and paused vaults with current metrics.
+ * Columns: contractId, name, status, tvlUsd, totalShares, latestApy, holderCount
+ */
+export async function exportVaultsCsv(_req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const rows = await query<{
+      contract_id: string;
+      name: string;
+      status: string;
+      tvl_usd: string | number;
+      total_shares: string | number;
+      latest_apy: string | number | null;
+      holder_count: string | number;
+    }>(
+      `SELECT v.contract_id, v.name, v.status,
+              COALESCE(v.tvl_usd, 0) AS tvl_usd,
+              COALESCE(v.total_shares, 0) AS total_shares,
+              v.latest_apy,
+              COALESCE(h.holder_count, 0) AS holder_count
+       FROM vaults v
+       LEFT JOIN (
+         SELECT vault_id, COUNT(DISTINCT user_address) AS holder_count
+         FROM user_vault_positions
+         WHERE shares > 0
+         GROUP BY vault_id
+       ) h ON h.vault_id = v.id
+       WHERE v.status IN ('active', 'paused')
+       ORDER BY v.name ASC`,
+    );
+
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="vaults.csv"');
+
+    const csvStream = stringify({
+      header: true,
+      columns: ["contractId", "name", "status", "tvlUsd", "totalShares", "latestApy", "holderCount"],
+    });
+
+    csvStream.pipe(res);
+
+    for (const row of rows) {
+      csvStream.write([
+        row.contract_id,
+        row.name,
+        row.status,
+        row.tvl_usd,
+        row.total_shares,
+        row.latest_apy ?? "",
+        row.holder_count,
+      ]);
+    }
+
+    csvStream.end();
+  } catch (err) {
+    next(err);
+  }
+}
+

@@ -1,3 +1,4 @@
+import { tvlPubSub } from "./tvlPubSub.js";
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
@@ -13,10 +14,16 @@ import { VaultService } from "./vault.js";
 import { UserService } from "./user.js";
 import { YieldService } from "./yield.js";
 import { NotificationService } from "./notifications.js";
-import { indexerEventsProcessedTotal, indexerLastLedger } from "./metrics.js";
+import {
+  indexerEventsProcessedTotal,
+  indexerLastLedger,
+  indexerProcessingDurationSeconds,
+} from "./metrics.js";
 import { cacheDel } from "../cache/redis.js";
 import { sseService } from "./sse.js";
 import { recordRpcSuccess, recordRpcError } from "./rpcMonitor.js";
+import { TOPIC_EVENT_TYPES } from "./indexerEventTypes.js";
+import { logSystemAudit } from "./adminAuditLog.js";
 
 // ── Lightweight trace spans (#827) ────────────────────────────────────────────
 // No external tracing dependency — spans are emitted as structured pino log
@@ -67,6 +74,13 @@ function toBigIntOrZero(value: string | null | undefined): bigint {
   } catch {
     return 0n;
   }
+}
+
+// When an event happened on-chain: the ledger close time, or now if the RPC
+// response did not include it.
+function eventChangedAt(rawEvent: any): Date {
+  const closedAt = typeof rawEvent?.ledgerClosedAt === "string" ? new Date(rawEvent.ledgerClosedAt) : null;
+  return closedAt && !Number.isNaN(closedAt.getTime()) ? closedAt : new Date();
 }
 
 function getEventTopics(rawEvent: any): unknown[] | null {
@@ -167,6 +181,50 @@ export async function storeIndexedEvent(
   );
 }
 
+// ── Per-contract indexer controls (#1106, #1107) ──────────────────────────────
+
+/** Decodes the first topic of a raw RPC event (its symbol), or null. */
+export function eventTopicName(rawEvent: unknown): string | null {
+  const topics = getEventTopics(rawEvent);
+  if (!topics || topics.length === 0) return null;
+  try {
+    const first = topics[0];
+    const scVal = typeof first === "string" ? xdr.ScVal.fromXDR(first, "base64") : first;
+    const name = String(scValToNative(scVal as xdr.ScVal) ?? "");
+    return name || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Stored `event_type` for a raw event, falling back to its topic symbol. */
+export function resolveEventType(rawEvent: unknown): string | null {
+  const name = eventTopicName(rawEvent);
+  if (name === null) return null;
+  return TOPIC_EVENT_TYPES[name] ?? name;
+}
+
+export interface ContractIndexerControl {
+  indexingPaused: boolean;
+  pausedAtLedger: number | null;
+  allowedEventTypes: string[];
+}
+
+/**
+ * Whether an event passes a contract's event-type filter (#1106). An empty
+ * list means no filter. Operators may name either the stored event type
+ * (`yield_distributed`) or the on-chain topic symbol (`yield_dis`).
+ */
+export function isEventTypeAllowed(rawEvent: unknown, allowedTypes: string[]): boolean {
+  if (allowedTypes.length === 0) return true;
+  const topicName = eventTopicName(rawEvent);
+  const eventType = resolveEventType(rawEvent);
+  return (
+    (eventType !== null && allowedTypes.includes(eventType)) ||
+    (topicName !== null && allowedTypes.includes(topicName))
+  );
+}
+
 // ── Indexer ────────────────────────────────────────────────────────────────────
 
 export class Indexer {
@@ -178,6 +236,8 @@ export class Indexer {
   private vaultService: VaultService;
   private userService: UserService;
   private notificationService?: NotificationService;
+  /** Per-contract pause / event-filter settings, refreshed every cycle. */
+  private contractControls = new Map<string, ContractIndexerControl>();
 
   constructor(notificationService?: NotificationService) {
     this.lastLedger = config.indexer.startLedger;
@@ -202,8 +262,19 @@ export class Indexer {
     this.running = true;
 
     try {
+      const { startBlock } = await this.getStartLedgerConfig();
       this.lastLedger = await this.getLastIndexedLedger();
-      logger.info({ ledger: this.lastLedger }, `resuming from ledger ${this.lastLedger}`);
+      // A configured start block (#1105) is the origin of a fresh indexing run:
+      // while the cursor is still 0 no progress has been recorded, so the block
+      // is not being skipped over. Once the cursor advances the start block is
+      // ignored again, which is why the admin endpoint reports it as inactive.
+      if (this.lastLedger === 0 && startBlock > 0) {
+        this.lastLedger = startBlock;
+      }
+      logger.info(
+        { ledger: this.lastLedger, startBlock },
+        `resuming from ledger ${this.lastLedger}`,
+      );
 
       if (!this.vaultFactoryContractId) {
         logger.info("Indexer started in state-only mode (no contract ID configured)");
@@ -290,21 +361,28 @@ export class Indexer {
     const from = this.lastLedger + 1;
     tickSpan.attrs["ledgerRange"] = `${from}-${latestLedger}`;
 
-    const contractIds = Array.from(this.watchedContractIds);
-    const filters = contractIds.length > 0
-      ? contractIds.map((id) => ({ contractIds: [id] }))
-      : [];
+    await this.loadContractControls();
+    await this.replayResumedContracts();
 
-    let events: any[];
-    try {
-      const resp = await withBackoff(() =>
-        server.getEvents({ startLedger: from, filters }),
-      );
-      events = resp.events;
-    } catch (err) {
-      logger.warn({ err, from, to: latestLedger }, "RPC error fetching events during tick");
-      finishSpan(tickSpan, { error: true });
-      return;
+    const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
+    const contractIds = this.activeContractIds();
+
+    let events: any[] = [];
+    // Every watched contract is paused: fetching with no filter would return
+    // all network events, so skip the fetch and just advance the cursor.
+    if (contractIds.length > 0 || this.watchedContractIds.size === 0) {
+      const filters = contractIds.map((id) => ({ contractIds: [id] }));
+      try {
+        const resp = await withBackoff(() =>
+          server.getEvents({ startLedger: from, filters }),
+        );
+        events = resp.events;
+      } catch (err) {
+        logger.warn({ err, from, to: latestLedger }, "RPC error fetching events during tick");
+        endBatchTimer();
+        finishSpan(tickSpan, { error: true });
+        return;
+      }
     }
 
     tickSpan.attrs["eventCount"] = events.length;
@@ -317,6 +395,7 @@ export class Indexer {
     for (const event of events) {
       await this.processEvent(event, tickSpan);
     }
+    endBatchTimer();
 
     await this.notificationService?.processRetries();
 
@@ -338,10 +417,13 @@ export class Indexer {
     const totalRange = Math.max(1, tipLedger - initialLedger);
     let batchCount = 0;
 
-    const contractIds = Array.from(this.watchedContractIds);
-    const filters = contractIds.length > 0
-      ? contractIds.map((id) => ({ contractIds: [id] }))
-      : [];
+    await this.loadContractControls();
+    const contractIds = this.activeContractIds();
+    if (contractIds.length === 0 && this.watchedContractIds.size > 0) {
+      logger.info("All watched contracts are paused; skipping backfill");
+      return;
+    }
+    const filters = contractIds.map((id) => ({ contractIds: [id] }));
 
     while (cursor < tipLedger) {
       const batchTo = Math.min(cursor + batchSize, tipLedger);
@@ -352,6 +434,7 @@ export class Indexer {
         `Backfilling ledgers ${cursor + 1}–${batchTo} (${remaining} remaining)`,
       );
 
+      const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
         const resp = await withBackoff(() =>
           server.getEvents({ startLedger: cursor + 1, filters }),
@@ -364,6 +447,7 @@ export class Indexer {
           );
           await this.processEvent(event);
         }
+        endBatchTimer();
 
         cursor = batchTo;
         this.lastLedger = cursor;
@@ -376,6 +460,7 @@ export class Indexer {
           await onProgress(pct);
         }
       } catch (err) {
+        endBatchTimer();
         logger.warn({ err, from: cursor + 1, to: batchTo }, "RPC error during backfill batch");
         break;
       }
@@ -390,18 +475,122 @@ export class Indexer {
     );
 
     try {
-      await this._processEventInner(event);
+      const control = this.contractControls.get(event.contractId ?? "");
+      if (control?.indexingPaused) {
+        eventSpan.attrs["skipped"] = "contract_paused";
+        return;
+      }
+      if (control && !isEventTypeAllowed(event, control.allowedEventTypes)) {
+        eventSpan.attrs["skipped"] = "event_type_filtered";
+        return;
+      }
+
+      // Count once per event actually indexed (#1109): duplicates, filtered
+      // events and unrecognised events are not counted.
+      if (await this._processEventInner(event)) {
+        indexerEventsProcessedTotal.inc();
+      }
     } finally {
       finishSpan(eventSpan);
     }
   }
 
-  private async _processEventInner(event: any): Promise<void> {
+  /**
+   * Refresh per-contract pause / filter settings from the database. Settings
+   * are written by the admin API, which may run in a different process. On a
+   * read failure the previous settings are kept.
+   */
+  async loadContractControls(): Promise<void> {
+    try {
+      const rows = await query<{
+        contract_id: string;
+        indexing_paused: boolean;
+        paused_at_ledger: number | null;
+        allowed_event_types: string[] | null;
+      }>(
+        `SELECT contract_id, indexing_paused, paused_at_ledger, allowed_event_types
+         FROM indexer_contract_state`,
+      );
+      const controls = new Map<string, ContractIndexerControl>();
+      for (const row of rows ?? []) {
+        controls.set(row.contract_id, {
+          indexingPaused: row.indexing_paused,
+          pausedAtLedger: row.paused_at_ledger ?? null,
+          allowedEventTypes: row.allowed_event_types ?? [],
+        });
+      }
+      this.contractControls = controls;
+    } catch (err) {
+      logger.warn({ err }, "Failed to load indexer contract controls; keeping previous settings");
+    }
+  }
+
+  /** Watched contracts that are not paused (#1107). */
+  private activeContractIds(): string[] {
+    return Array.from(this.watchedContractIds).filter(
+      (id) => !this.contractControls.get(id)?.indexingPaused,
+    );
+  }
+
+  /**
+   * Catch up contracts resumed since the last cycle (#1107). While paused, the
+   * global cursor kept moving without them, so replay each one's events from
+   * the ledger it was paused at up to the current cursor, then clear the
+   * marker. On an RPC failure the marker is kept and the replay retried next
+   * cycle; already-indexed events are de-duplicated by processEvent.
+   */
+  private async replayResumedContracts(): Promise<void> {
+    for (const [contractId, control] of this.contractControls) {
+      if (control.indexingPaused || control.pausedAtLedger === null) continue;
+
+      try {
+        if (control.pausedAtLedger < this.lastLedger) {
+          await this.replayContract(contractId, control.pausedAtLedger + 1, this.lastLedger);
+        }
+        await query(
+          `UPDATE indexer_contract_state
+           SET paused_at_ledger = NULL, updated_at = NOW()
+           WHERE contract_id = $1 AND indexing_paused = FALSE`,
+          [contractId],
+        );
+        control.pausedAtLedger = null;
+        logger.info({ contractId }, "Resumed contract caught up");
+      } catch (err) {
+        logger.warn({ err, contractId }, "Failed to catch up resumed contract; will retry");
+      }
+    }
+  }
+
+  private async replayContract(contractId: string, fromLedger: number, toLedger: number): Promise<void> {
+    const server = getSorobanRpc();
+    const filters = [{ contractIds: [contractId] }];
+    let cursor = fromLedger - 1;
+
+    while (cursor < toLedger) {
+      const batchTo = Math.min(cursor + config.indexer.batchSize, toLedger);
+      const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
+      try {
+        const resp = await withBackoff(() =>
+          server.getEvents({ startLedger: cursor + 1, filters }),
+        );
+        for (const event of resp.events) {
+          // Events past the global cursor are picked up by the regular tick.
+          if ((event.ledger ?? 0) > toLedger) continue;
+          await this.processEvent(event);
+        }
+      } finally {
+        endBatchTimer();
+      }
+      cursor = batchTo;
+    }
+  }
+
+  private async _processEventInner(event: any): Promise<boolean> {
     const existing = await query(
       "SELECT id FROM indexed_events WHERE tx_hash = $1 AND contract_id = $2 AND event_type = $3 AND ledger = $4",
       [event.id ?? event.txHash ?? "", event.contractId ?? "", event.type ?? "", event.ledger ?? 0],
     );
-    if (existing.length > 0) return;
+    if (existing.length > 0) return false;
 
     const deposit = parseDepositEvent(event);
     if (deposit) {
@@ -424,7 +613,7 @@ export class Indexer {
       } catch (e) {
         logger.warn({ err: e }, "NotificationService.notify failed for deposit");
       }
-      return;
+      return true;
     }
 
     const withdraw = parseWithdrawEvent(event);
@@ -449,7 +638,7 @@ export class Indexer {
       } catch (e) {
         logger.warn({ err: e }, "NotificationService.notify failed for withdraw");
       }
-      return;
+      return true;
     }
 
     const yieldDist = parseYieldDistributedEvent(event);
@@ -472,7 +661,6 @@ export class Indexer {
           }),
         ],
       );
-      indexerEventsProcessedTotal.inc();
       const parsedData = await this.handleYieldDistributed(event.contractId ?? "", yieldDist);
       await this.recordEvent(event, "yield_distributed", parsedData);
       try {
@@ -480,7 +668,29 @@ export class Indexer {
       } catch (e) {
         logger.warn({ err: e }, "NotificationService.notify failed for yield_distributed");
       }
-      return;
+      return true;
+    }
+
+    const epochFinalized = parseEpochFinalizedEvent(event);
+    if (epochFinalized) {
+      await this.recordEvent(event, "epoch_finalized", {
+        epochId: epochFinalized.epochId,
+        totalYield: epochFinalized.totalYield.toString(),
+        timestamp: epochFinalized.timestamp.toString(),
+      });
+      try {
+        await this.notificationService?.notify("epoch.finalized", {
+          contractId: event.contractId ?? "",
+          epochId: epochFinalized.epochId,
+          totalYield: epochFinalized.totalYield.toString(),
+          timestamp:
+            (typeof event.ledgerClosedAt === "string" && event.ledgerClosedAt) ||
+            new Date(Number(epochFinalized.timestamp) * 1000).toISOString(),
+        });
+      } catch (e) {
+        logger.warn({ err: e }, "NotificationService.notify failed for epoch.finalized");
+      }
+      return true;
     }
 
     const cancelFunding = parseCancelFundingEvent(event);
@@ -503,7 +713,7 @@ export class Indexer {
       } catch (e) {
         logger.warn({ err: e }, "NotificationService.notify failed for vault.cancelled");
       }
-      return;
+      return true;
     }
 
     const vaultStateChanged = parseVaultStateChangedEvent(event);
@@ -531,54 +741,54 @@ export class Indexer {
           logger.warn({ err: e }, "NotificationService.notify failed for vault.matured");
         }
       }
-      return;
+      return true;
     }
 
     const vaultCreated = parseVaultCreatedEvent(event);
     if (vaultCreated) {
-      await this.handleVaultCreated(event.contractId ?? "", vaultCreated);
+      await this.handleVaultCreated(event.contractId ?? "", vaultCreated, event);
       await this.recordEvent(event, "vault_created");
       try {
         await this.notificationService?.notify("vault_created", vaultCreated as any);
       } catch (e) {
         logger.warn({ err: e }, "NotificationService.notify failed for vault_created");
       }
-      return;
+      return true;
     }
 
     const vaultRemoved = parseVaultRemovedEvent(event);
     if (vaultRemoved) {
       await this.handleVaultRemoved(event.contractId ?? "");
       await this.recordEvent(event, "vault_removed");
-      return;
+      return true;
     }
 
     const opAdded = parseOperatorAddedEvent(event);
     if (opAdded) {
       await this.handleOperatorAdded(event.contractId ?? "", opAdded);
       await this.recordEvent(event, "operator_added");
-      return;
+      return true;
     }
 
     const opRemoved = parseOperatorRemovedEvent(event);
     if (opRemoved) {
       await this.handleOperatorRemoved(event.contractId ?? "", opRemoved);
       await this.recordEvent(event, "operator_removed");
-      return;
+      return true;
     }
 
     const roleGranted = parseRoleGrantedEvent(event);
     if (roleGranted) {
       await this.handleRoleGranted(event.contractId ?? "", roleGranted);
       await this.recordEvent(event, "role_granted");
-      return;
+      return true;
     }
 
     const roleRevoked = parseRoleRevokedEvent(event);
     if (roleRevoked) {
       await this.handleRoleRevoked(event.contractId ?? "", roleRevoked);
       await this.recordEvent(event, "role_revoked");
-      return;
+      return true;
     }
 
     const redemptionRequest = parseRequestEarlyRedemptionEvent(event);
@@ -604,7 +814,7 @@ export class Indexer {
       } catch (e) {
         logger.warn({ err: e }, "NotificationService.notify failed for user.early_redemption_requested");
       }
-      return;
+      return true;
     }
 
     const yieldClaimed = parseYieldClaimedEvent(event);
@@ -625,8 +835,7 @@ export class Indexer {
           }),
         ],
       );
-      indexerEventsProcessedTotal.inc();
-      return;
+      return true;
     }
 
     const yieldClaimedPartial = parseYieldClaimedPartialEvent(event);
@@ -648,36 +857,56 @@ export class Indexer {
           }),
         ],
       );
-      indexerEventsProcessedTotal.inc();
-      return;
+      return true;
     }
 
     const earlyProcessed = parseEarlyRedemptionProcessedEvent(event);
     if (earlyProcessed) {
       await this.handleEarlyRedemptionProcessed(event.contractId ?? "", earlyProcessed);
       await this.recordEvent(event, "early_redemption_processed");
-      return;
+      return true;
     }
 
     const earlyCancelled = parseEarlyRedemptionCancelledEvent(event);
     if (earlyCancelled) {
       await this.handleEarlyRedemptionCancelled(event.contractId ?? "", earlyCancelled);
       await this.recordEvent(event, "early_redemption_cancelled");
-      return;
+      return true;
     }
 
     const feeUpdated = parseOperatorFeeUpdatedEvent(event);
     if (feeUpdated) {
       await this.handleOperatorFeeUpdated(event.contractId ?? "", feeUpdated);
       await this.recordEvent(event, "operator_fee_updated");
-      return;
+      return true;
+    }
+
+    const pauseReasonSet = parsePauseReasonSetEvent(event);
+    if (pauseReasonSet) {
+      await this.handlePauseReasonSet(event.contractId ?? "", pauseReasonSet);
+      await this.recordEvent(event, "pause_reason_set");
+      return true;
+    }
+
+    const redemptionQueueUpdated = parseRedemptionQueueUpdatedEvent(event);
+    if (redemptionQueueUpdated) {
+      await this.handleRedemptionQueueUpdated(event.contractId ?? "", redemptionQueueUpdated);
+      await this.recordEvent(event, "redemption_queue_updated");
+      return true;
+    }
+
+    const minimumDepositUpdated = parseMinimumDepositUpdatedEvent(event);
+    if (minimumDepositUpdated) {
+      await this.handleMinimumDepositUpdated(event.contractId ?? "", minimumDepositUpdated);
+      await this.recordEvent(event, "minimum_deposit_updated");
+      return true;
     }
 
     const zkmeUpd = parseZkmeVerifierUpdatedEvent(event);
     if (zkmeUpd) {
       await this.handleZkmeVerifierUpdated(event.contractId ?? "", zkmeUpd);
       await this.recordEvent(event, "zkme_upd");
-      return;
+      return true;
     }
 
     const adminTransferred = parseAdminTransferredEvent(event);
@@ -687,7 +916,7 @@ export class Indexer {
         oldAdmin: adminTransferred.oldAdmin,
         newAdmin: adminTransferred.newAdmin,
       });
-      return;
+      return true;
     }
 
     const defaultsUpdated = parseDefaultsUpdatedEvent(event);
@@ -697,7 +926,18 @@ export class Indexer {
         zkmeVerifier: defaultsUpdated.zkmeVerifier,
         cooperator: defaultsUpdated.cooperator,
       });
-      return;
+      return true;
+    }
+
+    const wasmHashUpdated = parseWasmHashUpdatedEvent(event);
+    if (wasmHashUpdated) {
+      await this.handleWasmHashUpdated(event.ledger ?? 0, wasmHashUpdated);
+      await this.recordEvent(event, "wasm_upd", {
+        oldHash: wasmHashUpdated.oldHash,
+        newHash: wasmHashUpdated.newHash,
+        updatedBy: wasmHashUpdated.updatedBy,
+      });
+      return true;
     }
 
     const kycSet = parseKycSetEvent(event);
@@ -714,21 +954,21 @@ export class Indexer {
           JSON.stringify({ user: kycSet.user, verified: kycSet.verified, timestamp: Number(kycSet.timestamp) }),
         ],
       );
-      return;
+      return true;
     }
 
     const paused = parsePausedEvent(event);
     if (paused) {
       await this.handlePauseState(event.contractId ?? "", true);
       await this.recordEvent(event, "paused");
-      return;
+      return true;
     }
 
     const unpaused = parseUnpausedEvent(event);
     if (unpaused) {
       await this.handlePauseState(event.contractId ?? "", false);
       await this.recordEvent(event, "unpaused");
-      return;
+      return true;
     }
 
     const kycUpdate = parseKycVerifiedEvent(event);
@@ -739,7 +979,7 @@ export class Indexer {
         { user: kycUpdate.user, verified: kycUpdate.verified },
         "Processed kyc_set event",
       );
-      return;
+      return true;
     }
 
     const metadataUpdated = parseMetadataUpdatedEvent(event);
@@ -765,8 +1005,100 @@ export class Indexer {
       } catch (e) {
         logger.warn({ err: e }, "NotificationService.notify failed for vault.metadata_updated");
       }
-      return;
+      return true;
     }
+
+    // ── Issue #968: vault_name_updated ────────────────────────────────────────
+    const vaultNameUpdated = parseVaultNameUpdatedEvent(event);
+    if (vaultNameUpdated) {
+      await this.handleVaultNameUpdated(event.contractId ?? "", vaultNameUpdated);
+      await this.recordEvent(event, "vault_name_updated", {
+        caller: vaultNameUpdated.caller,
+        oldName: vaultNameUpdated.oldName,
+        newName: vaultNameUpdated.newName,
+      });
+      return true;
+    }
+
+    // ── #1094: whitelist_updated ──────────────────────────────────────────────
+    const whitelistUpdated = parseWhitelistUpdatedEvent(event);
+    if (whitelistUpdated) {
+      // The transaction hash is what an auditor follows, so it is preferred over
+      // the event id that the rest of the indexer falls back to.
+      await this.handleWhitelistUpdated(
+        event.contractId ?? "",
+        whitelistUpdated,
+        event.txHash ?? event.id ?? "",
+        event.ledger ?? 0,
+      );
+      await this.recordEvent(event, "whitelist_updated", {
+        address: whitelistUpdated.address,
+        action: whitelistUpdated.action,
+        caller: whitelistUpdated.caller,
+      });
+      return true;
+    }
+
+    // ── #1065: vault_status_changed ───────────────────────────────────────────
+    const vaultStatusChanged = parseVaultStatusChangedEvent(event);
+    if (vaultStatusChanged) {
+      const previousStatus = await this.handleVaultStatusChanged(vaultStatusChanged, event);
+      await this.recordEvent(event, "vault_status_changed", {
+        vault: vaultStatusChanged.vault,
+        previousStatus,
+        newStatus: vaultStatusChanged.status,
+      });
+      return true;
+    }
+
+    // ── #1068: vault_manager_changed ──────────────────────────────────────────
+    const managerChanged = parseVaultManagerChangedEvent(event);
+    if (managerChanged) {
+      const previousManager = await this.handleVaultManagerChanged(managerChanged, event);
+      await this.recordEvent(event, "vault_manager_changed", {
+        vault: managerChanged.vault,
+        previousManager,
+        newManager: managerChanged.newManager,
+      });
+      try {
+        await this.notificationService?.notify("vault.manager_changed", {
+          contractId: managerChanged.vault,
+          previousManager,
+          newManager: managerChanged.newManager,
+          txHash: event.txHash ?? event.id ?? "",
+          ledger: event.ledger ?? 0,
+        });
+      } catch (e) {
+        logger.warn({ err: e }, "NotificationService.notify failed for vault.manager_changed");
+      }
+      return true;
+    }
+
+    // ── #1077 / #1113: transfer ───────────────────────────────────────────────
+    const transfer = parseTransferEvent(event);
+    if (transfer) {
+      await this.handleTransfer(event.contractId ?? "", transfer, event);
+      await this.recordEvent(event, "transfer", {
+        from: transfer.from,
+        to: transfer.to,
+        amount: transfer.amount.toString(),
+      });
+      return true;
+    }
+
+    // ── #1076: transfer_fee_collected ────────────────────────────────────────
+    const transferFee = parseTransferFeeCollectedEvent(event);
+    if (transferFee) {
+      await this.handleTransferFeeCollected(event.contractId ?? transferFee.contractId ?? "", transferFee, event);
+      await this.recordEvent(event, "transfer_fee_collected", {
+        from: transferFee.from,
+        to: transferFee.to,
+        feeAmount: transferFee.feeAmount.toString(),
+      });
+      return true;
+    }
+
+    return false;
   }
 
   private async handleMetadataUpdated(
@@ -832,6 +1164,40 @@ export class Indexer {
     logger.info({ contractId }, "Processed rwa_details_updated event");
   }
 
+  // ── Issue #968: handle vault_name_updated ─────────────────────────────────
+  private async handleVaultNameUpdated(
+    contractId: string,
+    event: ParsedVaultNameUpdatedEvent,
+  ): Promise<void> {
+    const vaultRows = await query<{ id: number; name: string }>(
+      "SELECT id, name FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      logger.warn({ contractId }, "vault_name_updated for unknown vault — skipping");
+      return;
+    }
+    const { id: vaultId, name: currentName } = vaultRows[0];
+
+    // Update the canonical vault name
+    await query(
+      "UPDATE vaults SET name = $1, updated_at = NOW() WHERE id = $2",
+      [event.newName, vaultId],
+    );
+
+    // Record the change in vault_metadata_history
+    await query(
+      `INSERT INTO vault_metadata_history (vault_id, field, old_value, new_value, changed_by, recorded_at)
+       VALUES ($1, 'name', $2, $3, $4, NOW())`,
+      [vaultId, event.oldName || currentName, event.newName, event.caller],
+    );
+
+    logger.info(
+      { contractId, caller: event.caller, oldName: event.oldName, newName: event.newName },
+      "Processed vault_name_updated event",
+    );
+  }
+
   isRunning(): boolean {
     return this.running;
   }
@@ -850,13 +1216,15 @@ export class Indexer {
     deposit: { caller: string; receiver: string; assets: bigint; shares: bigint },
   ): Promise<void> {
     await query(
-      `INSERT INTO user_vault_positions (user_address, vault_id, shares, deposited, updated_at)
-       SELECT $1, v.id, $2, $3, NOW()
+      `INSERT INTO user_vault_positions (user_address, vault_id, shares, deposited, updated_at, first_entry_at)
+       SELECT $1, v.id, $2, $3, NOW(), NOW()
        FROM vaults v WHERE v.contract_id = $4
        ON CONFLICT (user_address, vault_id)
        DO UPDATE SET
          shares    = user_vault_positions.shares    + EXCLUDED.shares,
          deposited = user_vault_positions.deposited + EXCLUDED.deposited,
+         first_entry_at = COALESCE(user_vault_positions.first_entry_at, NOW()),
+         last_exit_at = NULL,
          updated_at = NOW()`,
       [deposit.receiver, deposit.shares.toString(), deposit.assets.toString(), contractId],
     );
@@ -912,12 +1280,13 @@ export class Indexer {
     withdraw: { owner: string; assets: bigint; shares: bigint },
   ): Promise<void> {
     await query(
-      `INSERT INTO user_vault_positions (user_address, vault_id, shares, deposited)
-       SELECT $1, v.id, 0, 0
+      `INSERT INTO user_vault_positions (user_address, vault_id, shares, deposited, last_exit_at)
+       SELECT $1, v.id, 0, 0, NOW()
        FROM vaults v WHERE v.contract_id = $4
        ON CONFLICT (user_address, vault_id) DO UPDATE SET
          shares    = GREATEST(0, user_vault_positions.shares    - $2),
          deposited = GREATEST(0, user_vault_positions.deposited - $3),
+         last_exit_at = CASE WHEN GREATEST(0, user_vault_positions.shares - $2) = 0 THEN NOW() ELSE NULL END,
          updated_at = NOW()`,
       [withdraw.owner, withdraw.shares.toString(), withdraw.assets.toString(), contractId],
     );
@@ -1027,6 +1396,7 @@ export class Indexer {
       minDeposit: string | null;
       maxDepositPerUser: string | null;
     },
+    rawEvent?: { ledger?: number; id?: string; txHash?: string } | null,
   ): Promise<void> {
     logger.info(
       { vault: vaultCreated.contractId, factoryId, name: vaultCreated.name },
@@ -1057,6 +1427,23 @@ export class Indexer {
     });
 
     this.watchedContractIds.add(vaultCreated.contractId);
+
+    // Compliance trace (#1064): record where this vault came from. The insert
+    // is replay-guarded so a backfill re-reading the ledger range cannot
+    // produce a second entry for the same vault.
+    try {
+      await logSystemAudit(
+        "VAULT_INDEXED",
+        vaultCreated.contractId,
+        {
+          blockNumber: rawEvent?.ledger ?? null,
+          txHash: rawEvent?.txHash ?? rawEvent?.id ?? "",
+        },
+        { conflictTarget: true },
+      );
+    } catch (e) {
+      logger.warn({ err: e, vault: vaultCreated.contractId }, "Failed to write VAULT_INDEXED audit entry");
+    }
   }
 
   private async handleCancelFunding(contractId: string): Promise<void> {
@@ -1429,6 +1816,164 @@ export class Indexer {
     );
   }
 
+  // ── #1098: handlePauseReasonSet ──────────────────────────────────────────────
+
+  private async handlePauseReasonSet(
+    contractId: string,
+    ev: { caller: string; reason: string },
+  ): Promise<void> {
+    await query(
+      `UPDATE vaults SET pause_reason = $1, updated_at = NOW() WHERE contract_id = $2`,
+      [ev.reason || null, contractId],
+    );
+    await cacheDel(`vault:${contractId}`);
+    logger.info(
+      { contractId, reason: ev.reason },
+      "Processed pause_reason_set event",
+    );
+  }
+
+  // ── #1097: handleRedemptionQueueUpdated ──────────────────────────────────────
+
+  private async handleRedemptionQueueUpdated(
+    contractId: string,
+    ev: { address: string; amount: bigint; position: number; status: string },
+  ): Promise<void> {
+    await query(
+      `INSERT INTO redemption_queue (contract_id, address, amount, position, status, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (contract_id, address) DO UPDATE SET
+         amount = EXCLUDED.amount,
+         position = EXCLUDED.position,
+         status = EXCLUDED.status,
+         updated_at = NOW()`,
+      [contractId, ev.address, ev.amount.toString(), ev.position, ev.status],
+    );
+    logger.info(
+      { contractId, address: ev.address, position: ev.position, status: ev.status },
+      "Processed redemption_queue_updated event",
+    );
+  }
+
+  // ── #1096: handleMinimumDepositUpdated ──────────────────────────────────────
+
+  private async handleMinimumDepositUpdated(
+    contractId: string,
+    ev: { caller: string; oldMinimum: bigint; newMinimum: bigint },
+  ): Promise<void> {
+    await query(
+      `UPDATE vaults SET minimum_deposit = $1, updated_at = NOW() WHERE contract_id = $2`,
+      [ev.newMinimum.toString(), contractId],
+    );
+    await query(
+      `INSERT INTO minimum_deposit_history (contract_id, old_minimum, new_minimum, changed_by, recorded_at)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [contractId, ev.oldMinimum.toString(), ev.newMinimum.toString(), ev.caller],
+    );
+    await cacheDel(`vault:${contractId}`);
+    logger.info(
+      { contractId, oldMinimum: ev.oldMinimum.toString(), newMinimum: ev.newMinimum.toString() },
+      "Processed minimum_deposit_updated event",
+    );
+  }
+
+  // ── #1094: handleWhitelistUpdated ───────────────────────────────────────────
+
+  private async handleWhitelistUpdated(
+    contractId: string,
+    ev: { address: string; action: WhitelistAction; caller: string },
+    txHash: string,
+    ledger: number,
+  ): Promise<void> {
+    // Whitelist changes are only auditable against a known contract, so an
+    // event without one is dropped rather than stored unattributably.
+    if (!contractId) {
+      logger.warn({ txHash, ledger }, "Dropped whitelist_updated event with no contract id");
+      return;
+    }
+
+    // ON CONFLICT guards against a backfill re-reading a ledger range that was
+    // already indexed — each on-chain change must produce exactly one row.
+    await query(
+      `INSERT INTO whitelist_events (contract_id, address, action, tx_hash, ledger)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (contract_id, tx_hash, ledger, address, action) DO NOTHING`,
+      [contractId, ev.address, ev.action, txHash, ledger],
+    );
+    logger.info(
+      { contractId, address: ev.address, action: ev.action, caller: ev.caller, ledger },
+      "Processed whitelist_updated event",
+    );
+  }
+
+  /**
+   * Apply a `vault_status_changed` event (#1065): update vaults.status and
+   * append a vault_status_history row. Returns the status the vault had
+   * before, or null when the vault is not indexed yet.
+   */
+  private async handleVaultStatusChanged(
+    ev: ParsedVaultStatusChangedEvent,
+    rawEvent: any,
+  ): Promise<string | null> {
+    const prev = await query<{ status: string }>(
+      "SELECT status FROM vaults WHERE contract_id = $1",
+      [ev.vault],
+    );
+    const previousStatus = prev[0]?.status ?? null;
+
+    await query(
+      "UPDATE vaults SET status = $1, updated_at = NOW() WHERE contract_id = $2",
+      [ev.status, ev.vault],
+    );
+    // The history row is written even for a vault the indexer has not seen
+    // yet: the on-chain transition happened and must be auditable.
+    await query(
+      `INSERT INTO vault_status_history
+         (contract_id, event_type, previous_status, new_status, changed_at, tx_hash, ledger)
+       VALUES ($1, 'status_changed', $2, $3, $4, $5, $6)
+       ON CONFLICT (contract_id, event_type, tx_hash, ledger) DO NOTHING`,
+      [ev.vault, previousStatus, ev.status, eventChangedAt(rawEvent), rawEvent.txHash ?? rawEvent.id ?? "", rawEvent.ledger ?? 0],
+    );
+    logger.info(
+      { contractId: ev.vault, previousStatus, newStatus: ev.status },
+      "Processed vault_status_changed event",
+    );
+    return previousStatus;
+  }
+
+  /**
+   * Apply a `vault_manager_changed` event (#1068): update
+   * vaults.manager_address and append a vault_status_history row. Returns the
+   * previous manager (from the event, falling back to the stored value).
+   */
+  private async handleVaultManagerChanged(
+    ev: ParsedVaultManagerChangedEvent,
+    rawEvent: any,
+  ): Promise<string | null> {
+    const prev = await query<{ manager_address: string | null }>(
+      "SELECT manager_address FROM vaults WHERE contract_id = $1",
+      [ev.vault],
+    );
+    const previousManager = ev.oldManager ?? prev[0]?.manager_address ?? null;
+
+    await query(
+      "UPDATE vaults SET manager_address = $1, updated_at = NOW() WHERE contract_id = $2",
+      [ev.newManager, ev.vault],
+    );
+    await query(
+      `INSERT INTO vault_status_history
+         (contract_id, event_type, previous_manager, new_manager, changed_at, tx_hash, ledger)
+       VALUES ($1, 'manager_changed', $2, $3, $4, $5, $6)
+       ON CONFLICT (contract_id, event_type, tx_hash, ledger) DO NOTHING`,
+      [ev.vault, previousManager, ev.newManager, eventChangedAt(rawEvent), rawEvent.txHash ?? rawEvent.id ?? "", rawEvent.ledger ?? 0],
+    );
+    logger.info(
+      { contractId: ev.vault, previousManager, newManager: ev.newManager },
+      "Processed vault_manager_changed event",
+    );
+    return previousManager;
+  }
+
   private async handleZkmeVerifierUpdated(
     contractId: string,
     ev: { newVerifier: string },
@@ -1453,12 +1998,112 @@ export class Indexer {
     logger.info({ oldAdmin: ev.oldAdmin, newAdmin: ev.newAdmin, ledger }, "Processed adm_xfr event");
   }
 
+  private async handleWasmHashUpdated(
+    ledger: number,
+    ev: { oldHash: string; newHash: string; updatedBy: string },
+  ): Promise<void> {
+    await query(
+      `INSERT INTO factory_wasm_history (old_hash, new_hash, updated_by, ledger, recorded_at)
+       VALUES ($1, $2, $3, $4, NOW())`,
+      [ev.oldHash, ev.newHash, ev.updatedBy, ledger],
+    );
+    logger.info(
+      { oldHash: ev.oldHash, newHash: ev.newHash, updatedBy: ev.updatedBy, ledger },
+      "Processed wasm_upd event",
+    );
+  }
+
   private async handleKycSet(
     contractId: string,
     ev: { user: string; verified: boolean; timestamp: bigint },
   ): Promise<void> {
     await this.userService.upsertUser(ev.user, ev.verified);
     logger.info({ contractId, user: ev.user, verified: ev.verified }, "Processed kyc_set event");
+  }
+
+  private async handleTransfer(
+    contractId: string,
+    transfer: ParsedTransferEvent,
+    event: any,
+  ): Promise<void> {
+    let vaultId: number | null = null;
+    try {
+      const vaultRows = await query<{ id: number }>(
+        "SELECT id FROM vaults WHERE contract_id = $1",
+        [contractId],
+      );
+      if (vaultRows.length > 0) {
+        vaultId = vaultRows[0].id;
+      }
+    } catch (err) {
+      logger.warn({ err, contractId }, "Failed to find vault for transfer");
+    }
+
+    const txHash = event.id ?? event.txHash ?? null;
+    const ledger = typeof event.ledger === "number" ? event.ledger : null;
+    const amountStr = transfer.amount.toString();
+
+    // 1. Insert into transfers table
+    await query(
+      `INSERT INTO transfers (vault_id, from_address, to_address, amount, tx_hash, ledger, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [vaultId, transfer.from, transfer.to, amountStr, txHash, ledger],
+    );
+
+    // 2. Issue #1077: Check LARGE_TRANSFER_THRESHOLD
+    try {
+      const largeThreshold = BigInt(config.largeTransferThreshold);
+      if (transfer.amount > largeThreshold) {
+        logger.warn(
+          {
+            contractId,
+            vaultId,
+            from: transfer.from,
+            to: transfer.to,
+            amount: amountStr,
+            threshold: largeThreshold.toString(),
+          },
+          "Large transfer alert: transfer amount exceeds threshold",
+        );
+
+        await query(
+          `INSERT INTO transfer_alerts (vault_id, contract_id, type, amount, from_address, to_address, tx_hash, details, created_at)
+           VALUES ($1, $2, 'LARGE_TRANSFER', $3, $4, $5, $6, $7, NOW())`,
+          [
+            vaultId,
+            contractId,
+            amountStr,
+            transfer.from,
+            transfer.to,
+            txHash,
+            JSON.stringify({
+              threshold: largeThreshold.toString(),
+              amount: amountStr,
+              from: transfer.from,
+              to: transfer.to,
+            }),
+          ],
+        );
+      }
+    } catch (err) {
+      logger.warn({ err, contractId }, "Failed to process large transfer check");
+    }
+  }
+
+  private async handleTransferFeeCollected(
+    contractId: string,
+    feeEvent: ParsedTransferFeeCollectedEvent,
+    event: any,
+  ): Promise<void> {
+    const txHash = event.id ?? event.txHash ?? null;
+    const ledger = typeof event.ledger === "number" ? event.ledger : null;
+    const feeAmountStr = feeEvent.feeAmount.toString();
+
+    await query(
+      `INSERT INTO transfer_fees (contract_id, from_address, to_address, fee_amount, tx_hash, ledger, fee_type, created_at, collected_at)
+       VALUES ($1, $2, $3, $4, $5, $6, 'transfer_fee', NOW(), NOW())`,
+      [contractId, feeEvent.from, feeEvent.to, feeAmountStr, txHash, ledger],
+    );
   }
 
   private async recordEvent(
@@ -1479,7 +2124,6 @@ export class Indexer {
         parsedData ? JSON.stringify(parsedData) : null,
       ],
     );
-    indexerEventsProcessedTotal.inc();
   }
 
   private async persistLastLedger(): Promise<void> {
@@ -1499,6 +2143,33 @@ export class Indexer {
       `INSERT INTO indexer_state (id, last_ledger) VALUES (1, $1)
        ON CONFLICT (id) DO UPDATE SET last_ledger = EXCLUDED.last_ledger, updated_at = NOW()`,
       [ledger],
+    );
+  }
+
+  /**
+   * Configured start block (#1105): the ledger a fresh indexing run starts
+   * from. `indexer_state.start_ledger` wins when set, otherwise the
+   * INDEXER_START_LEDGER env var is the fallback (reported as
+   * `source: "environment"`). Deliberately separate from the
+   * `last_ledger` cursor so an operator can move the start block without
+   * rewinding progress.
+   */
+  async getStartLedgerConfig(): Promise<{ startBlock: number; source: "database" | "environment" }> {
+    const rows = await query<{ start_ledger: number | null }>(
+      "SELECT start_ledger FROM indexer_state WHERE id = 1",
+    );
+    const startLedger = rows[0]?.start_ledger;
+    if (startLedger === null || startLedger === undefined) {
+      return { startBlock: config.indexer.startLedger, source: "environment" };
+    }
+    return { startBlock: startLedger, source: "database" };
+  }
+
+  async saveStartLedgerConfig(startBlock: number): Promise<void> {
+    await query(
+      `INSERT INTO indexer_state (id, start_ledger, updated_at) VALUES (1, $1, NOW())
+       ON CONFLICT (id) DO UPDATE SET start_ledger = EXCLUDED.start_ledger, updated_at = NOW()`,
+      [startBlock],
     );
   }
 
@@ -1536,6 +2207,53 @@ export class Indexer {
    * Record a TVL snapshot for a vault contract.
    * Called after deposit, withdraw, or yield_distributed events.
    */
+  /**
+   * Return event count breakdown per contract for admin visibility (#1108).
+   */
+  async getEventCountsPerContract(): Promise<Array<{
+    contractId: string;
+    totalEvents: number;
+    eventsByType: Record<string, number>;
+  }>> {
+    const rows = await query<{ contract_id: string; event_type: string; count: string }>(
+      `SELECT contract_id, event_type, COUNT(*)::text AS count
+       FROM indexed_events
+       GROUP BY contract_id, event_type`,
+    );
+
+    const allContracts = new Set<string>(this.watchedContractIds);
+    try {
+      const vaultRows = await query<{ contract_id: string }>("SELECT contract_id FROM vaults");
+      for (const v of vaultRows) allContracts.add(v.contract_id);
+    } catch {
+      // ignore
+    }
+    for (const r of rows) allContracts.add(r.contract_id);
+
+    const contractMap = new Map<string, { totalEvents: number; eventsByType: Record<string, number> }>();
+    for (const c of allContracts) {
+      contractMap.set(c, { totalEvents: 0, eventsByType: {} });
+    }
+
+    for (const row of rows) {
+      if (!contractMap.has(row.contract_id)) {
+        contractMap.set(row.contract_id, { totalEvents: 0, eventsByType: {} });
+      }
+      const entry = contractMap.get(row.contract_id)!;
+      const c = parseInt(row.count, 10);
+      entry.eventsByType[row.event_type] = c;
+      entry.totalEvents += c;
+    }
+
+    return Array.from(contractMap.entries())
+      .map(([contractId, data]) => ({
+        contractId,
+        totalEvents: data.totalEvents,
+        eventsByType: data.eventsByType,
+      }))
+      .sort((a, b) => a.contractId.localeCompare(b.contractId));
+  }
+
   private async recordTvlSnapshot(contractId: string): Promise<void> {
     try {
       const vaultRow = await query<{ id: number; total_assets: string; total_supply: string }>(
@@ -1545,11 +2263,19 @@ export class Indexer {
       if (vaultRow.length === 0) return;
 
       const { id: vaultId, total_assets: totalAssets, total_supply: totalSupply } = vaultRow[0];
+      const snapshotAt = new Date();
       await query(
         `INSERT INTO vault_tvl_snapshots (vault_id, total_assets, total_supply, recorded_at)
-         VALUES ($1, $2, $3, NOW())`,
-        [vaultId, totalAssets, totalSupply],
+         VALUES ($1, $2, $3, $4)`,
+        [vaultId, totalAssets, totalSupply, snapshotAt],
       );
+
+      // Emit TVL update event for GraphQL subscriptions (#1115)
+      tvlPubSub.publish({
+        contractId,
+        tvlUsd: totalAssets,
+        snapshotAt: snapshotAt.toISOString(),
+      });
     } catch (err) {
       logger.warn({ err, contractId }, "Failed to record TVL snapshot");
     }
@@ -1688,6 +2414,45 @@ export function parseYieldDistributedEvent(rawEvent: unknown): ParsedYieldDistri
     const timestamp = decodeBigInt(arr[1]);
 
     return { epoch, amount, timestamp };
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedEpochFinalizedEvent {
+  epochId: number;
+  totalYield: bigint;
+  timestamp: bigint;
+}
+
+export function parseEpochFinalizedEvent(rawEvent: unknown): ParsedEpochFinalizedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 2 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    const eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    if (eventName !== "epoch_finalized" && eventName !== "epoch_fin") return null;
+
+    const epochId = Number(scValToNative(parsedTopics[1]) ?? 0);
+    const data = scValToNative(parsedValue as xdr.ScVal);
+    const arr = Array.isArray(data) ? data : Object.values((data as Record<string, unknown>) ?? {});
+
+    return {
+      epochId,
+      totalYield: decodeBigInt(arr[0]),
+      timestamp: decodeBigInt(arr[1]),
+    };
   } catch {
     return null;
   }
@@ -2459,6 +3224,79 @@ export function parseDefaultsUpdatedEvent(rawEvent: unknown): ParsedDefaultsUpda
   }
 }
 
+// ── Issue #837: parseWasmHashUpdatedEvent ─────────────────────────────────────
+
+export interface ParsedWasmHashUpdatedEvent {
+  oldHash: string;
+  newHash: string;
+  updatedBy: string;
+}
+
+/**
+ * Parse the factory's `wasm_upd` event: topics are
+ * `(symbol!("wasm_upd"), updated_by)` and the value is `(old_hash, new_hash)`.
+ */
+export function parseWasmHashUpdatedEvent(rawEvent: unknown): ParsedWasmHashUpdatedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 1 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "wasm_upd" && eventName !== "wasm_hash_updated") return null;
+
+    let updatedBy = "";
+    if (topics.length > 1) {
+      try {
+        updatedBy = String(scValToNative(parsedTopics[1]) ?? "");
+      } catch {
+        updatedBy = "";
+      }
+    }
+
+    const data = scValToNative(parsedValue as xdr.ScVal);
+    const arr = Array.isArray(data) ? data : Object.values((data as Record<string, unknown>) ?? {});
+    const oldHash = normalizeHash(arr[0]);
+    const newHash = normalizeHash(arr[1]);
+
+    if (!newHash) return null;
+
+    return { oldHash, newHash, updatedBy };
+  } catch {
+    return null;
+  }
+}
+
+/** Render a hash ScVal as a lowercase hex string, tolerating Buffer/bytes input. */
+function normalizeHash(value: unknown): string {
+  if (value == null) return "";
+  if (Buffer.isBuffer(value)) return value.toString("hex");
+  if (value instanceof Uint8Array) return Buffer.from(value).toString("hex");
+  if (Array.isArray(value)) {
+    try {
+      return Buffer.from(value as number[]).toString("hex");
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
 // ── Issue #594: role events ─────────────────────────────────────────────────
 
 export interface ParsedRoleGrantedEvent {
@@ -2698,3 +3536,606 @@ export function parseOperatorFeeUpdatedEvent(rawEvent: unknown): ParsedOperatorF
     return null;
   }
 }
+
+// ── Issue #968: parseVaultNameUpdatedEvent ────────────────────────────────────
+
+export interface ParsedVaultNameUpdatedEvent {
+  caller: string;
+  oldName: string;
+  newName: string;
+}
+
+/**
+ * Parses a `vault_name_updated` (or `v_name_upd`) on-chain event emitted when
+ * an operator renames a vault after deployment.
+ *
+ * Expected event shape:
+ *   topics[0]: symbol "vault_name_updated" or "v_name_upd"
+ *   topics[1]: account address of the caller
+ *   value:     tuple [old_name: string, new_name: string]
+ */
+export function parseVaultNameUpdatedEvent(rawEvent: unknown): ParsedVaultNameUpdatedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 2 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "vault_name_updated" && eventName !== "v_name_upd") return null;
+
+    const caller = String(scValToNative(parsedTopics[1]) ?? "");
+
+    const data = scValToNative(parsedValue as xdr.ScVal);
+    const arr = Array.isArray(data)
+      ? data
+      : Object.values((data as Record<string, unknown>) ?? {});
+
+    const oldName = String(arr[0] ?? "");
+    const newName = String(arr[1] ?? "");
+
+    return { caller, oldName, newName };
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedFeeRateChangedEvent {
+  feeBps: number;
+  oldFeeBps: number | null;
+}
+
+/**
+ * Parse the `fee_set` (a.k.a. `fee_rate_changed`) event emitted by
+ * `set_early_redemption_fee`.
+ *
+ * The contract publishes the new fee in basis points as the event data. A
+ * `(old_fee_bps, new_fee_bps)` tuple or `{ oldFeeBps, feeBps }` map is also
+ * accepted so richer payloads decode without changes here. Returns null when
+ * the event is not a fee rate change or the fee is out of range (0–10000 bps).
+ */
+export function parseFeeRateChangedEvent(rawEvent: unknown): ParsedFeeRateChangedEvent | null {
+  try {
+    const parsed = parseRawEventName(rawEvent);
+    if (!parsed) return null;
+
+    const { topics, data } = parsed;
+    let eventName = "";
+    try {
+      const firstTopic = typeof topics[0] === "string"
+        ? xdr.ScVal.fromXDR(topics[0], "base64")
+        : (topics[0] as xdr.ScVal);
+      eventName = String(scValToNative(firstTopic) ?? "");
+    } catch {
+      return null;
+    }
+
+    if (eventName !== "fee_set" && eventName !== "fee_rate_changed") return null;
+
+    const parsedValue = typeof data === "string"
+      ? xdr.ScVal.fromXDR(data, "base64")
+      : (data as xdr.ScVal);
+    const native = scValToNative(parsedValue) as unknown;
+
+    let feeBps: number;
+    let oldFeeBps: number | null = null;
+    if (Array.isArray(native)) {
+      if (native.length < 2) return null;
+      oldFeeBps = Number(native[0]);
+      feeBps = Number(native[1]);
+    } else if (native !== null && typeof native === "object") {
+      const obj = native as Record<string, unknown>;
+      feeBps = Number(obj["feeBps"] ?? obj["fee_bps"] ?? obj["new_fee_bps"]);
+      const old = obj["oldFeeBps"] ?? obj["old_fee_bps"];
+      oldFeeBps = old === undefined ? null : Number(old);
+    } else {
+      feeBps = Number(native);
+    }
+
+    const valid = (n: number) => Number.isInteger(n) && n >= 0 && n <= 10_000;
+    if (!valid(feeBps)) return null;
+    if (oldFeeBps !== null && !valid(oldFeeBps)) return null;
+
+    return { feeBps, oldFeeBps };
+  } catch {
+    return null;
+  }
+}
+
+// ── #1098: parsePauseReasonSetEvent ──────────────────────────────────────────
+
+export interface ParsedPauseReasonSetEvent {
+  caller: string;
+  reason: string;
+}
+
+export function parsePauseReasonSetEvent(rawEvent: unknown): ParsedPauseReasonSetEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 2 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "pause_reason_set") return null;
+
+    const caller = String(scValToNative(parsedTopics[1]) ?? "");
+    const data = scValToNative(parsedValue as xdr.ScVal);
+    const reason = String(Array.isArray(data) ? data[0] ?? "" : data ?? "");
+
+    return { caller, reason };
+  } catch {
+    return null;
+  }
+}
+
+// ── #1097: parseRedemptionQueueUpdatedEvent ──────────────────────────────────
+
+export interface ParsedRedemptionQueueUpdatedEvent {
+  address: string;
+  amount: bigint;
+  position: number;
+  status: string;
+}
+
+export function parseRedemptionQueueUpdatedEvent(rawEvent: unknown): ParsedRedemptionQueueUpdatedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 1 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "redemption_queue_updated") return null;
+
+    const data = scValToNative(parsedValue as xdr.ScVal);
+    const arr = Array.isArray(data) ? data : Object.values((data as Record<string, unknown>) ?? {});
+
+    const address = String(arr[0] ?? "");
+    const amount = decodeBigInt(arr[1]);
+    const position = Number(decodeBigInt(arr[2]));
+    const status = String(arr[3] ?? "pending");
+
+    return { address, amount, position, status };
+  } catch {
+    return null;
+  }
+}
+
+// ── #1096: parseMinimumDepositUpdatedEvent ──────────────────────────────────
+
+export interface ParsedMinimumDepositUpdatedEvent {
+  caller: string;
+  oldMinimum: bigint;
+  newMinimum: bigint;
+}
+
+export function parseMinimumDepositUpdatedEvent(rawEvent: unknown): ParsedMinimumDepositUpdatedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 2 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "minimum_deposit_updated") return null;
+
+    const caller = String(scValToNative(parsedTopics[1]) ?? "");
+    const data = scValToNative(parsedValue as xdr.ScVal);
+    const arr = Array.isArray(data) ? data : Object.values((data as Record<string, unknown>) ?? {});
+
+    const oldMinimum = decodeBigInt(arr[0]);
+    const newMinimum = decodeBigInt(arr[1]);
+
+    return { caller, oldMinimum, newMinimum };
+  } catch {
+    return null;
+  }
+}
+
+// ── #1094: parseWhitelistUpdatedEvent ────────────────────────────────────────
+
+export type WhitelistAction = "added" | "removed";
+
+export interface ParsedWhitelistUpdatedEvent {
+  address: string;
+  action: WhitelistAction;
+  caller: string;
+}
+
+/**
+ * Normalise the event payload onto the two values stored in `whitelist_events`.
+ *
+ * A Soroban event payload reaches us either as a positional tuple or as a
+ * struct, and the change may be published as a string ("added" / "removed") or
+ * as a boolean allow flag, so all of those shapes are folded into the same pair
+ * here. Anything else is rejected (null) rather than guessed at — a wrong action
+ * in an audit table is worse than a missing event.
+ */
+function decodeWhitelistAction(payload: unknown): WhitelistAction | null {
+  let value: unknown = payload;
+
+  if (Array.isArray(value)) {
+    value = value[0];
+  } else if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const named = record["action"] ?? record["whitelisted"] ?? record["allowed"];
+    value = named !== undefined ? named : Object.values(record)[0];
+  }
+
+  if (typeof value === "boolean") return value ? "added" : "removed";
+
+  if (typeof value === "string") {
+    switch (value.trim().toLowerCase()) {
+      case "added":
+      case "add":
+      case "allow":
+      case "whitelisted":
+        return "added";
+      case "removed":
+      case "remove":
+      case "revoked":
+      case "denied":
+        return "removed";
+      default:
+        return null;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Parse the `whitelist_updated` event emitted when a vault adds or removes an
+ * address from its whitelist. `topics[0]` is the event name, `topics[1]` the
+ * affected address and the optional `topics[2]` the admin that made the change.
+ */
+export function parseWhitelistUpdatedEvent(rawEvent: unknown): ParsedWhitelistUpdatedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 2 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "whitelist_updated") return null;
+
+    const address = String(scValToNative(parsedTopics[1]) ?? "");
+    if (!address) return null;
+
+    const caller = topics.length > 2 ? String(scValToNative(parsedTopics[2]) ?? "") : "";
+
+    const action = decodeWhitelistAction(scValToNative(parsedValue as xdr.ScVal));
+    if (!action) return null;
+
+    return { address, action, caller };
+  } catch {
+    return null;
+  }
+}
+
+// ── #1065: parseVaultStatusChangedEvent ───────────────────────────────────────
+
+export type VaultStatus = "active" | "inactive";
+
+export interface ParsedVaultStatusChangedEvent {
+  /** The vault whose status changed (not the emitting factory). */
+  vault: string;
+  status: VaultStatus;
+}
+
+function decodeVaultStatus(native: unknown): VaultStatus | null {
+  if (typeof native === "boolean") return native ? "active" : "inactive";
+  if (typeof native === "string") {
+    const s = native.toLowerCase();
+    return s === "active" || s === "inactive" ? s : null;
+  }
+  if (Array.isArray(native)) return decodeVaultStatus(native[0]);
+  if (native && typeof native === "object") {
+    const obj = native as Record<string, unknown>;
+    return decodeVaultStatus(obj["active"] ?? obj["status"]);
+  }
+  return null;
+}
+
+/**
+ * Parses the factory's `v_status` (a.k.a. `vault_status_changed`) event,
+ * emitted by `set_vault_status`. Topics are (symbol, vault) and the data is
+ * the new active flag. A vault emitting the event about itself may omit the
+ * vault topic, in which case the emitting contract is the vault.
+ */
+export function parseVaultStatusChangedEvent(rawEvent: unknown): ParsedVaultStatusChangedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 1 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "v_status" && eventName !== "vault_status_changed") return null;
+
+    const vault = topics.length > 1
+      ? String(scValToNative(parsedTopics[1]) ?? "")
+      : String(ev["contractId"] ?? "");
+    if (!vault) return null;
+
+    const status = decodeVaultStatus(scValToNative(parsedValue as xdr.ScVal));
+    if (!status) return null;
+
+    return { vault, status };
+  } catch {
+    return null;
+  }
+}
+
+// ── #1068: parseVaultManagerChangedEvent ──────────────────────────────────────
+
+export interface ParsedVaultManagerChangedEvent {
+  /** The vault whose manager changed. */
+  vault: string;
+  /** Previous manager as reported by the event, or null when not emitted. */
+  oldManager: string | null;
+  newManager: string;
+}
+
+/**
+ * Parses a `vault_manager_changed` (a.k.a. `mgr_chg`) event. The vault is the
+ * contract address in topics[1] when a factory emits the event, otherwise the
+ * emitting contract. The data is either (old_manager, new_manager), a struct
+ * with those fields, or just the new manager address.
+ */
+export function parseVaultManagerChangedEvent(rawEvent: unknown): ParsedVaultManagerChangedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 1 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "vault_manager_changed" && eventName !== "mgr_chg") return null;
+
+    // Only a contract address (C...) in topics[1] names the vault; anything
+    // else there is an account and the emitting contract is the vault.
+    const topicVault = topics.length > 1 ? String(scValToNative(parsedTopics[1]) ?? "") : "";
+    const vault = topicVault.startsWith("C") ? topicVault : String(ev["contractId"] ?? "");
+    if (!vault) return null;
+
+    const data = scValToNative(parsedValue as xdr.ScVal) as unknown;
+    let oldManager: unknown = null;
+    let newManager: unknown;
+    if (Array.isArray(data)) {
+      [oldManager, newManager] = data.length > 1 ? data : [null, data[0]];
+    } else if (data && typeof data === "object") {
+      const obj = data as Record<string, unknown>;
+      oldManager = obj["old_manager"] ?? obj["oldManager"] ?? null;
+      newManager = obj["new_manager"] ?? obj["newManager"];
+    } else {
+      newManager = data;
+    }
+
+    if (typeof newManager !== "string" || !newManager) return null;
+
+    return {
+      vault,
+      oldManager: typeof oldManager === "string" && oldManager ? oldManager : null,
+      newManager,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedTransferEvent {
+  from: string;
+  to: string;
+  amount: bigint;
+}
+
+export function parseTransferEvent(rawEvent: unknown): ParsedTransferEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 3 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "transfer") return null;
+
+    const from = String(scValToNative(parsedTopics[1]) ?? "");
+    const to = String(scValToNative(parsedTopics[2]) ?? "");
+    if (!from || !to) return null;
+
+    const data = parsedValue instanceof xdr.ScVal ? scValToNative(parsedValue) : parsedValue;
+    const amount = decodeBigInt(data);
+
+    return { from, to, amount };
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedTransferFeeCollectedEvent {
+  from: string;
+  to: string;
+  feeAmount: bigint;
+  contractId?: string;
+}
+
+export function parseTransferFeeCollectedEvent(rawEvent: unknown): ParsedTransferFeeCollectedEvent | null {
+  try {
+    if (!rawEvent || typeof rawEvent !== "object") return null;
+    const ev = rawEvent as Record<string, unknown>;
+    const topics = (ev["topic"] ?? ev["topics"]) as unknown[] | undefined;
+    const value = ev["value"] ?? ev["data"];
+
+    if (!Array.isArray(topics) || topics.length < 1 || value == null) return null;
+
+    const parsedTopics = topics.map((t) =>
+      typeof t === "string" ? xdr.ScVal.fromXDR(t, "base64") : (t as xdr.ScVal),
+    );
+    const parsedValue = typeof value === "string"
+      ? xdr.ScVal.fromXDR(value, "base64")
+      : value;
+
+    let eventName: string;
+    try {
+      eventName = String(scValToNative(parsedTopics[0]) ?? "");
+    } catch {
+      return null;
+    }
+    if (eventName !== "transfer_fee_collected" && eventName !== "xfr_fee" && eventName !== "transfer_fee") {
+      return null;
+    }
+
+    let from = "";
+    let to = "";
+    let feeAmount = 0n;
+
+    if (parsedTopics.length >= 3) {
+      from = String(scValToNative(parsedTopics[1]) ?? "");
+      to = String(scValToNative(parsedTopics[2]) ?? "");
+      const data = parsedValue instanceof xdr.ScVal ? scValToNative(parsedValue) : parsedValue;
+      feeAmount = decodeBigInt(data);
+    } else {
+      const data = parsedValue instanceof xdr.ScVal ? scValToNative(parsedValue) : parsedValue;
+      if (Array.isArray(data)) {
+        if (data.length >= 3) {
+          from = String(data[0] ?? "");
+          to = String(data[1] ?? "");
+          feeAmount = decodeBigInt(data[2]);
+        } else if (data.length === 1) {
+          feeAmount = decodeBigInt(data[0]);
+        }
+      } else if (data && typeof data === "object") {
+        from = String((data as any).from ?? (data as any).from_address ?? (data as any).fromAddress ?? "");
+        to = String((data as any).to ?? (data as any).to_address ?? (data as any).toAddress ?? "");
+        feeAmount = decodeBigInt((data as any).feeAmount ?? (data as any).fee_amount ?? (data as any).amount ?? (data as any).fee ?? 0);
+      } else {
+        feeAmount = decodeBigInt(data);
+      }
+    }
+
+    return {
+      from,
+      to,
+      feeAmount,
+      contractId: typeof ev["contractId"] === "string" ? ev["contractId"] : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+

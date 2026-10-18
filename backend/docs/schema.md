@@ -8,6 +8,8 @@
 erDiagram
     vaults ||--o{ user_vault_positions : "has positions"
     vaults ||--o{ epochs : "has epochs"
+    vaults ||--o{ epoch_anomalies : "has flagged epochs"
+    vaults ||--o{ transfers : "has transfers"
     vaults ||--o{ indexed_events : "emits events"
     vaults ||--o{ redemption_requests : "has requests"
     vaults ||--o{ vault_tvl_snapshots : "has TVL snapshots"
@@ -82,6 +84,29 @@ erDiagram
         numeric yield_amount
         numeric total_shares
         timestamptz distributed_at
+    }
+
+    epoch_anomalies {
+        int id PK
+        int vault_id FK
+        int epoch
+        numeric yield_amount
+        numeric mean_yield
+        numeric stddev_yield
+        int sample_size
+        numeric z_score
+        timestamptz detected_at
+    }
+
+    transfers {
+        int id PK
+        int vault_id FK
+        text from_address
+        text to_address
+        numeric amount
+        text tx_hash
+        int ledger
+        timestamptz created_at
     }
 
     indexed_events {
@@ -323,6 +348,59 @@ Yield distribution epochs per vault.
 
 ---
 
+### `epoch_anomalies`
+
+Epochs whose yield deviated sharply from that vault's recent history, recorded by the daily anomaly scan (#1073).
+
+Only finalized epochs are scored. Each row keeps the window statistics next to the score, so a flag can be reviewed later without re-running the query.
+
+| Column | Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `id` | `SERIAL` | NOT NULL | — | Primary key |
+| `vault_id` | `INT` | NOT NULL | — | References `vaults(id)` |
+| `epoch` | `INT` | NOT NULL | — | Flagged epoch number |
+| `yield_amount` | `NUMERIC` | NOT NULL | — | Gross yield distributed in that epoch |
+| `mean_yield` | `NUMERIC` | NOT NULL | — | Mean of the preceding 30 epochs |
+| `stddev_yield` | `NUMERIC` | NOT NULL | — | Population standard deviation of that window |
+| `sample_size` | `INT` | NOT NULL | — | Epochs the statistics came from (minimum 7) |
+| `z_score` | `NUMERIC` | YES | — | Signed distance from the mean; `NULL` when `stddev_yield` is 0 |
+| `detected_at` | `TIMESTAMPTZ` | NOT NULL | `NOW()` | When the scan flagged it |
+
+`z_score` is nullable on purpose. A perfectly flat window has no meaningful deviation, so the score is undefined rather than infinite.
+
+**Primary key:** `id`  
+**Unique constraints:** `(vault_id, epoch)` — the scan re-scores on every run, so this is what makes retries idempotent  
+**Foreign keys:** `vault_id` → `vaults(id)`  
+**Indexes:**
+- `idx_epoch_anomalies_vault_epoch` on `(vault_id, epoch DESC)` — serves the admin listing, which reads newest first
+
+---
+
+### `transfers`
+
+Vault share transfers parsed from SEP-41 `transfer` events. Added in #1113, populated by the indexer added in #1076/#1077 and read by the sanctions worker. #1074 adds the transfer-volume endpoint that reads them.
+
+| Column | Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `id` | `SERIAL` | NOT NULL | — | Primary key |
+| `vault_id` | `INT` | YES | — | References `vaults(id)` |
+| `from_address` | `TEXT` | NOT NULL | — | Sender account |
+| `to_address` | `TEXT` | NOT NULL | — | Recipient account |
+| `amount` | `NUMERIC` | NOT NULL | — | Share amount moved |
+| `tx_hash` | `TEXT` | YES | — | Source transaction |
+| `ledger` | `INT` | YES | — | Stellar ledger sequence number |
+| `created_at` | `TIMESTAMPTZ` | YES | `NOW()` | Row creation timestamp, used as the volume window clock |
+
+**Primary key:** `id`  
+**Foreign keys:** `vault_id` → `vaults(id)`  
+**Indexes:**
+- `idx_transfers_from_address` on `(from_address)`
+- `idx_transfers_to_address` on `(to_address)`
+- `idx_transfers_vault_id` on `(vault_id)`
+- `idx_transfers_vault_created_at` on `(vault_id, created_at DESC)` — added in #1074 so the transfer-volume aggregate can seek to its window instead of scanning the vault's whole history
+
+---
+
 ### `indexed_events`
 
 Raw on-chain events indexed by the indexer service.
@@ -385,6 +463,10 @@ Configured webhook endpoints for event notifications.
 | `allowed_methods` | `TEXT[]` | YES | — | HTTP methods this key may use; `NULL` means all methods (#935) |
 | `active` | `BOOLEAN` | YES | `true` | Whether the webhook is active |
 | `consecutive_failures` | `INT` | NOT NULL | `0` | Consecutive delivery failures |
+| `circuit_open` | `BOOLEAN` | NOT NULL | `false` | Circuit breaker open; deliveries are skipped (#1061) |
+| `circuit_opened_at` | `TIMESTAMPTZ` | YES | — | When the circuit last opened (#1061) |
+| `previous_secret` | `TEXT` | YES | — | Retired secret kept live during the rotation window (#1062) |
+| `secret_rotated_at` | `TIMESTAMPTZ` | YES | — | When `secret` was last rotated (#1062) |
 | `created_at` | `TIMESTAMPTZ` | YES | `NOW()` | Row creation timestamp |
 
 **Primary key:** `id`
@@ -404,12 +486,16 @@ Delivery attempt log for webhook notifications.
 | `next_retry_at` | `TIMESTAMPTZ` | YES | — | Next scheduled retry |
 | `delivered_at` | `TIMESTAMPTZ` | YES | — | Successful delivery timestamp |
 | `last_error` | `TEXT` | YES | — | Last error message |
+| `status` | `TEXT` | NOT NULL | `'pending'` | `pending` / `failed` / `failed_permanent` / `delivered` (#1061) |
+| `replayed_from` | `INT` | YES | — | Source delivery when this row is a replay (#1063) |
 | `created_at` | `TIMESTAMPTZ` | YES | `NOW()` | Row creation timestamp |
 
 **Primary key:** `id`  
-**Foreign keys:** `webhook_id` → `webhooks(id)`  
+**Foreign keys:** `webhook_id` → `webhooks(id)`, `replayed_from` → `webhook_deliveries(id)`  
 **Indexes:**
 - `idx_webhook_deliveries_retry` on `(next_retry_at)` WHERE `delivered_at IS NULL AND attempt < 6`
+- `idx_webhook_deliveries_status` on `(webhook_id, status)`
+- `idx_webhook_deliveries_replayed_from` on `(replayed_from)` WHERE `replayed_from IS NOT NULL`
 
 ---
 
@@ -572,6 +658,7 @@ Audit trail for admin API actions.
 | `target` | `TEXT` | NOT NULL | — | Target resource identifier |
 | `ip_address` | `TEXT` | YES | — | Requesting IP address |
 | `request_body_hash` | `TEXT` | NOT NULL | — | SHA hash of the request body |
+| `details` | `JSONB` | YES | — | Structured context, e.g. `{ blockNumber, txHash }` for `VAULT_INDEXED` (#1064) |
 | `created_at` | `TIMESTAMPTZ` | YES | `NOW()` | Row creation timestamp |
 
 **Primary key:** `id`

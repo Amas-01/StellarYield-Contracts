@@ -16,7 +16,9 @@ mod tests;
 pub use crate::types::*;
 
 use soroban_sdk::xdr::ToXdr;
-use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, panic_with_error, Address, BytesN, Env, IntoVal, String, Vec,
+};
 
 use crate::errors::Error;
 use crate::events::*;
@@ -158,6 +160,11 @@ impl VaultFactory {
             0i128,  // min_deposit
             0i128,  // max_deposit_per_user
             200u32, // early_redemption_fee_bps (2 %)
+            None,   // share_decimals_override
+            None,   // vault_admin_override
+            None,   // zkme_verifier_override
+            None,   // cooperator_override
+            None,   // max_investors
         )
     }
 
@@ -194,6 +201,11 @@ impl VaultFactory {
             params.min_deposit,
             params.max_deposit_per_user,
             params.early_redemption_fee_bps,
+            params.share_decimals,
+            params.vault_admin,
+            params.zkme_verifier,
+            params.cooperator,
+            params.max_investors,
         )
     }
 
@@ -230,6 +242,11 @@ impl VaultFactory {
             params.min_deposit,
             params.max_deposit_per_user,
             params.early_redemption_fee_bps,
+            params.share_decimals,
+            params.vault_admin,
+            params.zkme_verifier,
+            params.cooperator,
+            params.max_investors,
         )
     }
 
@@ -269,6 +286,11 @@ impl VaultFactory {
                 p.min_deposit,
                 p.max_deposit_per_user,
                 p.early_redemption_fee_bps,
+                p.share_decimals,
+                p.vault_admin,
+                p.zkme_verifier,
+                p.cooperator,
+                p.max_investors,
             );
             vaults.push_back(vault);
         }
@@ -413,10 +435,7 @@ impl VaultFactory {
     /// # Returns
     /// `Vec<Option<i128>>` in the same order as `requests`; `None` for any
     /// vault not registered with this factory.
-    pub fn bulk_preview_deposit(
-        e: &Env,
-        requests: Vec<(Address, i128)>,
-    ) -> Vec<Option<i128>> {
+    pub fn bulk_preview_deposit(e: &Env, requests: Vec<(Address, i128)>) -> Vec<Option<i128>> {
         let mut results: Vec<Option<i128>> = Vec::new(e);
         let preview_symbol = soroban_sdk::Symbol::new(e, "preview_deposit");
 
@@ -425,7 +444,7 @@ impl VaultFactory {
                 results.push_back(None);
                 continue;
             }
-            let args: Vec<soroban_sdk::Val> = soroban_sdk::vec![e, assets.into()];
+            let args: Vec<soroban_sdk::Val> = soroban_sdk::vec![e, assets.into_val(e)];
             let shares: i128 = e.invoke_contract(&vault, &preview_symbol, args);
             results.push_back(Some(shares));
         }
@@ -907,6 +926,11 @@ impl VaultFactory {
         min_deposit: i128,
         max_deposit_per_user: i128,
         early_redemption_fee_bps: u32,
+        share_decimals_override: Option<u32>,
+        vault_admin_override: Option<Address>,
+        zkme_verifier_override: Option<Address>,
+        cooperator_override: Option<Address>,
+        max_investors: Option<u32>,
     ) -> Address {
         // --- Validation ---
         if asset == e.current_contract_address() {
@@ -956,16 +980,23 @@ impl VaultFactory {
         salt_bytes.append(&name.clone().to_xdr(e));
         let salt = e.crypto().sha256(&salt_bytes);
 
+        // Use overrides if provided, otherwise fall back to factory defaults
+        let final_share_decimals = share_decimals_override.unwrap_or(7u32);
+        let final_vault_admin = vault_admin_override.unwrap_or(admin.clone());
+        let final_zkme = zkme_verifier_override.unwrap_or(zkme.clone());
+        let final_coop = cooperator_override.unwrap_or(coop.clone());
+        let final_max_investors = max_investors.unwrap_or(0u32);
+
         // Build the InitParams struct for the vault constructor.
         // Using a struct keeps us under Soroban's 10-arg limit per function.
         let init_params = SingleRwaVaultInitParams {
             asset: vault_asset.clone(),
             share_name: name.clone(),
             share_symbol: symbol.clone(),
-            share_decimals: 6u32, // USDC convention
-            admin: admin.clone(),
-            zkme_verifier: zkme.clone(),
-            cooperator: coop.clone(),
+            share_decimals: final_share_decimals,
+            admin: final_vault_admin.clone(),
+            zkme_verifier: final_zkme.clone(),
+            cooperator: final_coop.clone(),
             funding_target,
             maturity_date,
             funding_deadline,
@@ -981,9 +1012,10 @@ impl VaultFactory {
             // These three must be present for the vault's `InitParams` to unpack;
             // omitting them makes every `create_*_vault` call trap with
             // Error(Object, UnexpectedSize) inside the vault constructor.
-            operator_fee_bps: 0u32,      // no operator cut on distributed yield
-            timelock_delay: 172_800u64,  // 48 hours, matching the vault's own default
-            yield_vesting_period: 0u64,  // yield claimable immediately
+            operator_fee_bps: 0u32,     // no operator cut on distributed yield
+            timelock_delay: 172_800u64, // 48 hours, matching the vault's own default
+            yield_vesting_period: 0u64, // yield claimable immediately
+            max_investors: final_max_investors,
         };
 
         let vault_addr = e

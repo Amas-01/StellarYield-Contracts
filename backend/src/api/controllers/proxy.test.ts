@@ -8,6 +8,7 @@ vi.mock("../../logger.js", () => ({
     child: vi.fn(() => ({ info: vi.fn(), error: vi.fn(), warn: vi.fn() })),
   },
 }));
+vi.mock("pino-http", () => ({ pinoHttp: () => (_req: any, _res: any, next: any) => next() }));
 
 vi.mock("../../db/index.js", () => ({ query: vi.fn() }));
 vi.mock("../../services/indexerSingleton.js", () => ({

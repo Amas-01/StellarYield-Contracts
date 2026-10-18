@@ -5,6 +5,7 @@ import { readKycVerified } from "../../services/stellar.js";
 import { query } from "../../db/index.js";
 import { AppError, ErrorCode } from "../middleware/errors.js";
 import { userServiceInstance } from "../../services/userSingleton.js";
+import { decrementSseConnections, incrementSseConnections } from "../../services/metrics.js";
 
 const userService = new UserService();
 
@@ -463,6 +464,10 @@ export async function streamUserPositions(req: Request, res: Response, next: Nex
 
     res.write(`data: ${JSON.stringify({ type: "initial", portfolio })}\n\n`);
 
+    // This stream is written straight to the response instead of going through
+    // SseManager/SseService, so the connection gauge is maintained here (#1092).
+    incrementSseConnections();
+
     const unsubscribe = userServiceInstance.onPositionUpdate(address, (position) => {
       const event = {
         type: "position_updated",
@@ -475,6 +480,7 @@ export async function streamUserPositions(req: Request, res: Response, next: Nex
 
     req.on("close", () => {
       unsubscribe();
+      decrementSseConnections();
       res.end();
     });
   } catch (err) {
@@ -482,56 +488,61 @@ export async function streamUserPositions(req: Request, res: Response, next: Nex
   }
 }
 
-export async function getUserLifetimeYield(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-) {
+export async function getUserPortfolioValue(req: Request, res: Response, next: NextFunction) {
   try {
     const address = String(req.params["address"]);
-    const contractId = String(req.params["contractId"]);
+    const portfolioValue = await userService.getUserPortfolioValue(address);
+    res.json(portfolioValue);
+  } catch (err) {
+    next(err);
+  }
+}
 
-    const rows = await query<{
-      cumulative_yield_claimed: string;
-    }>(
-      `SELECT sbs.cumulative_yield_claimed
-       FROM share_balance_snapshots sbs
-       JOIN vaults v ON v.id = sbs.vault_id
-       WHERE sbs.user_address = $1 AND v.contract_id = $2
-       ORDER BY sbs.recorded_at DESC, sbs.epoch DESC
-       LIMIT 1`,
-      [address, contractId],
-    );
+export async function getUserPortfolioHistory(req: Request, res: Response, next: NextFunction) {
+  try {
+    const address = String(req.params["address"]);
+    const fromParam = req.query["from"];
+    const toParam = req.query["to"];
+    const intervalParam = req.query["interval"];
 
-    if (rows.length === 0) {
-      res.status(404).json({ error: "NotFound", message: "No yield history found for this user/vault pair" });
+    const from = fromParam ? new Date(String(fromParam)) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const to = toParam ? new Date(String(toParam)) : new Date();
+    const interval = (intervalParam === "1d" || intervalParam === "7d") ? intervalParam : "1d";
+
+    const history = await userService.getUserPortfolioHistory(address, from, to, interval);
+    res.json(history);
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getUserFirstDeposit(req: Request, res: Response, next: NextFunction) {
+  try {
+    const address = String(req.params["address"]);
+    const firstDeposit = await userService.getUserFirstDeposit(address);
+
+    if (!firstDeposit) {
+      res.status(404).json({ error: "NotFound", message: "No deposit found for this address" });
       return;
     }
 
-    const claimStats = await query<{
-      claim_count: string;
-      last_claimed_at: Date | null;
-    }>(
-      `SELECT COUNT(DISTINCT ie.payload->>'epoch')::text AS claim_count,
-              MAX(ie.created_at) AS last_claimed_at
-       FROM indexed_events ie
-       WHERE ie.contract_id = $1
-         AND ie.event_type IN ('yield_claimed', 'yield_claimed_partial')
-         AND (ie.payload->>'user' = $2 OR ie.payload->>'address' = $2)`,
-      [contractId, address],
-    );
+    res.json(firstDeposit);
+  } catch (err) {
+    next(err);
+  }
+}
 
-    const cumulativeYield = rows[0].cumulative_yield_claimed ?? "0";
-    const claimCount = parseInt(claimStats[0]?.claim_count ?? "0", 10);
-    const averagePerClaim = claimCount > 0 ? (BigInt(cumulativeYield) / BigInt(claimCount)).toString() : "0";
-    const lastClaimedAt = claimStats[0]?.last_claimed_at?.toISOString() ?? null;
+export async function getUserRealizedYield(req: Request, res: Response, next: NextFunction) {
+  try {
+    const address = String(req.params["address"]);
+    const fromParam = req.query["from"];
+    const toParam = req.query["to"];
 
-    res.json({
-      cumulativeYield,
-      claimCount,
-      averagePerClaim,
-      lastClaimedAt,
-    });
+    const from = fromParam ? new Date(String(fromParam)) : undefined;
+    const to = toParam ? new Date(String(toParam)) : undefined;
+
+    const realizedYield = await userService.getUserRealizedYield(address, from, to);
+    res.json(realizedYield);
   } catch (err) {
     next(err);
   }

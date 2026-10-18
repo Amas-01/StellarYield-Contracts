@@ -25,22 +25,32 @@ export class EventsPruner {
   private async runOnce(): Promise<void> {
     const retentionDays = config.eventsRetentionDays;
 
-    const pruned = await query<{ count: string }>(
-      `WITH deleted AS (
+    // Issue #918: move expired events into indexed_events_archive instead of
+    // permanently deleting them so they remain available for long-term audit.
+    const archived = await query<{ count: string }>(
+      `WITH moved AS (
+         INSERT INTO indexed_events_archive (id, ledger, tx_hash, contract_id, event_type, payload, parsed_data, created_at)
+         SELECT id, ledger, tx_hash, contract_id, event_type, payload, parsed_data, created_at
+           FROM indexed_events
+          WHERE created_at < NOW() - ($1::int * INTERVAL '1 day')
+         ON CONFLICT (id) DO NOTHING
+         RETURNING id
+       ),
+       deleted AS (
          DELETE FROM indexed_events
-         WHERE created_at < NOW() - ($1::int * INTERVAL '1 day')
+          WHERE id IN (SELECT id FROM moved)
          RETURNING id
        )
        SELECT COUNT(*)::text AS count FROM deleted`,
       [retentionDays],
     );
-    const deletedCount = parseInt(pruned[0]?.count ?? "0", 10);
+    const archivedCount = parseInt(archived[0]?.count ?? "0", 10);
 
     const sizeRows = await query<{ total_bytes: string }>(
       `SELECT pg_total_relation_size('indexed_events')::text AS total_bytes`,
     );
     const totalBytes = sizeRows[0]?.total_bytes ?? "0";
 
-    logger.info({ deletedCount, totalBytes, retentionDays }, "EventsPruner: pruning complete");
+    logger.info({ archivedCount, totalBytes, retentionDays }, "EventsPruner: archival complete");
   }
 }

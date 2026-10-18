@@ -221,6 +221,10 @@ impl SingleRWAVault {
         // Lock-up period configuration
         put_lock_up_period(e, params.lock_up_period);
 
+        // Investor count configuration
+        put_investor_count(e, 0);
+        put_max_investors(e, params.max_investors);
+
         e.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -422,6 +426,15 @@ impl SingleRWAVault {
         // --- Effects (state changes first) ---
         let is_new_investor =
             get_share_balance(e, &receiver) == 0 && get_escrowed_shares(e, &receiver) == 0;
+
+        if is_new_investor {
+            let max_investors = get_max_investors(e);
+            if max_investors > 0 && get_investor_count(e) >= max_investors {
+                panic_with_error!(e, Error::MaxInvestorsReached);
+            }
+            increment_investor_count(e);
+        }
+
         update_user_snapshot(e, &receiver);
         put_user_deposited(e, &receiver, get_user_deposited(e, &receiver) + assets);
         put_total_deposited(e, get_total_deposited(e) + assets);
@@ -479,6 +492,15 @@ impl SingleRWAVault {
         // --- Effects (state changes first) ---
         let is_new_investor =
             get_share_balance(e, &receiver) == 0 && get_escrowed_shares(e, &receiver) == 0;
+
+        if is_new_investor {
+            let max_investors = get_max_investors(e);
+            if max_investors > 0 && get_investor_count(e) >= max_investors {
+                panic_with_error!(e, Error::MaxInvestorsReached);
+            }
+            increment_investor_count(e);
+        }
+
         update_user_snapshot(e, &receiver);
         put_user_deposited(e, &receiver, get_user_deposited(e, &receiver) + assets);
         put_total_deposited(e, get_total_deposited(e) + assets);
@@ -544,9 +566,16 @@ impl SingleRWAVault {
         put_user_deposited(e, &owner, (user_dep - assets).max(0));
 
         let is_exiting = get_share_balance(e, &owner) == 0 && get_escrowed_shares(e, &owner) == 0;
+        if is_exiting {
+            decrement_investor_count(e);
+        }
         record_withdrawal_activity(e, get_current_epoch(e), assets, is_exiting);
 
         // --- Interaction ---
+        let vault_bal = asset_balance_of_vault(e);
+        if vault_bal < assets {
+            panic_with_error!(e, Error::InsufficientVaultBalance);
+        }
         transfer_asset_from_vault(e, &receiver, assets);
 
         emit_withdraw(e, caller, receiver, owner, assets, shares);
@@ -597,9 +626,16 @@ impl SingleRWAVault {
         put_user_deposited(e, &owner, (user_dep - assets).max(0));
 
         let is_exiting = get_share_balance(e, &owner) == 0 && get_escrowed_shares(e, &owner) == 0;
+        if is_exiting {
+            decrement_investor_count(e);
+        }
         record_withdrawal_activity(e, get_current_epoch(e), assets, is_exiting);
 
         // --- Interaction ---
+        let vault_bal = asset_balance_of_vault(e);
+        if vault_bal < assets {
+            panic_with_error!(e, Error::InsufficientVaultBalance);
+        }
         transfer_asset_from_vault(e, &receiver, assets);
 
         emit_withdraw(e, caller, receiver, owner, assets, shares);
@@ -1491,6 +1527,10 @@ impl SingleRWAVault {
         }
 
         // --- Interaction ---
+        let vault_bal = asset_balance_of_vault(e);
+        if vault_bal < amount {
+            panic_with_error!(e, Error::InsufficientVaultBalance);
+        }
         transfer_asset_from_vault(e, &user, amount);
 
         // --- Effects ---
@@ -2494,9 +2534,16 @@ impl SingleRWAVault {
         }
 
         let is_exiting = get_share_balance(e, &owner) == 0 && get_escrowed_shares(e, &owner) == 0;
+        if is_exiting {
+            decrement_investor_count(e);
+        }
         record_redemption_activity(e, get_current_epoch(e), total_out, is_exiting);
 
         // --- Interaction ---
+        let vault_bal = asset_balance_of_vault(e);
+        if vault_bal < total_out {
+            panic_with_error!(e, Error::InsufficientVaultBalance);
+        }
         transfer_asset_from_vault(e, &receiver, total_out);
 
         // Emit ERC-4626 compliant Withdraw event
@@ -2845,6 +2892,24 @@ impl SingleRWAVault {
         let now = e.ledger().timestamp();
         let unlock_at = deposit_ts + period;
         unlock_at.saturating_sub(now)
+    }
+
+    /// Returns the current count of unique investors (users with non-zero balance).
+    pub fn investor_count(e: &Env) -> u32 {
+        get_investor_count(e)
+    }
+
+    /// Returns the maximum allowed number of investors (0 = unlimited).
+    pub fn max_investors(e: &Env) -> u32 {
+        get_max_investors(e)
+    }
+
+    /// Update the maximum allowed number of investors. Admin-only.
+    pub fn set_max_investors(e: &Env, admin: Address, max: u32) {
+        admin.require_auth();
+        require_admin(e, &admin);
+        put_max_investors(e, max);
+        bump_instance(e);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -3759,6 +3824,12 @@ impl SingleRWAVault {
         get_escrowed_shares(e, &id)
     }
 
+    /// Returns the vault's current asset token balance.
+    /// Allows frontends to verify vault solvency before submitting transactions.
+    pub fn vault_asset_balance(e: &Env) -> i128 {
+        asset_balance_of_vault(e)
+    }
+
     pub fn transfer(e: &Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
         require_lock_up_elapsed(e, &from);
@@ -4316,6 +4387,7 @@ mod test {
             timelock_delay: 172800u64,  // 48 hours
             yield_vesting_period: 0u64, // Default to 0 for instant claiming
             lock_up_period: 0u64,
+            max_investors: 0, // unlimited by default
         };
 
         let vault_addr = e.register(SingleRWAVault, (params,));

@@ -1,0 +1,18 @@
+{
+  "$comment": "Native values (not XDR) the mock encodes into a successful simulateTransaction response with retval set. Keyed by the invoked contract method; 'default' is used when the envelope cannot be decoded.",
+  "contractMethods": {
+    "vault_count": 2,
+    "vault_state": "Active",
+    "current_epoch": 1,
+    "name": "Stellar Lumens Vault",
+    "symbol": "SVXLM",
+    "asset": "XLM",
+    "total_assets": "1000000",
+    "total_supply": "500000",
+    "funding_target": "10000000",
+    "is_paused": false,
+    "is_kyc_verified": true,
+    "balance": "0"
+  },
+  "default": 0
+}

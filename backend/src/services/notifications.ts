@@ -7,6 +7,13 @@ import { jobQueue } from "./jobQueue.js";
 import { sendEmail } from "./email.js";
 import { resolveUserEvent } from "./notificationEvents.js";
 import { isDeliveryEnabled } from "./notificationPreferences.js";
+import { buildSignatureHeaders, secretRotationWindowHours } from "./webhookSignature.js";
+
+/**
+ * Circuit breaker threshold (#1061). After this many consecutive failed
+ * deliveries the endpoint is suspended until an operator resets it.
+ */
+export const CIRCUIT_BREAKER_THRESHOLD = 5;
 
 const BLOCKED_HOSTNAMES = new Set([
   "localhost",
@@ -64,6 +71,11 @@ interface WebhookRow {
   channel: string | null;
   priority: number;
   fallback_channel: number | null;
+  /** Circuit breaker state (#1061). */
+  circuit_open?: boolean;
+  /** Retired secret kept live for the rotation transition window (#1062). */
+  previous_secret?: string | null;
+  secret_rotated_at?: Date | string | null;
 }
 
 const GLOBAL_OPT_OUT_KEY = "notificationsGloballyEnabled";
@@ -112,9 +124,10 @@ export class NotificationService {
     if (!(await this.isGloballyEnabled())) return;
 
     const webhooks = await query<WebhookRow>(
-      `SELECT id, url, events, secret, consecutive_failures, channel, priority, fallback_channel
+      `SELECT id, url, events, secret, consecutive_failures, channel, priority, fallback_channel,
+              circuit_open, previous_secret, secret_rotated_at
        FROM webhooks
-       WHERE active = TRUE AND $1 = ANY(events)
+       WHERE active = TRUE AND circuit_open = FALSE AND $1 = ANY(events)
        ORDER BY priority ASC, created_at DESC`,
       [event],
     );
@@ -281,7 +294,10 @@ export class NotificationService {
     }>(
       `SELECT wd.id, wd.webhook_id, wd.payload, wd.attempt, w.fallback_channel
        FROM webhook_deliveries wd
-       JOIN webhooks w ON w.id = wd.webhook_id AND w.active = TRUE
+       JOIN webhooks w
+         ON w.id = wd.webhook_id
+        AND w.active = TRUE
+        AND w.circuit_open = FALSE
        WHERE wd.next_retry_at <= NOW()
          AND wd.delivered_at IS NULL
          AND wd.attempt < 6
@@ -289,15 +305,24 @@ export class NotificationService {
        LIMIT 50`,
     );
 
+    // Drop rotated-out secrets whose transition window has elapsed (#1062).
+    await this.purgeExpiredRotatedSecrets();
+
     for (const row of dueRows) {
       try {
         const webhookRows = await query<WebhookRow>(
-          `SELECT id, url, events, secret, consecutive_failures, priority, fallback_channel, channel
+          `SELECT id, url, events, secret, consecutive_failures, priority, fallback_channel, channel,
+                  circuit_open, previous_secret, secret_rotated_at
            FROM webhooks WHERE id = $1`,
           [row.webhook_id],
         );
         if (webhookRows.length === 0) continue;
         const webhook = webhookRows[0];
+
+        if (webhook.circuit_open) {
+          // Circuit opened between the scan and this attempt (#1061).
+          continue;
+        }
 
         const deliveryResult = await this.deliver(webhook, row.payload);
 
@@ -311,7 +336,7 @@ export class NotificationService {
 
         if (deliveryResult.success) {
           await query(
-            "UPDATE webhook_deliveries SET delivered_at = NOW() WHERE id = $1",
+            "UPDATE webhook_deliveries SET delivered_at = NOW(), status = 'delivered', last_error = NULL WHERE id = $1",
             [row.id],
           );
           if ((webhook.consecutive_failures ?? 0) > 0) {
@@ -319,6 +344,7 @@ export class NotificationService {
           }
         } else {
           const nextAttempt = row.attempt + 1;
+          await this.registerRetryFailure(webhook);
           const delaySeconds = Math.min(Math.pow(2, row.attempt) * 5, 3600);
           await query(
             `UPDATE webhook_deliveries
@@ -339,6 +365,50 @@ export class NotificationService {
         );
         await this.maybeEscalateToFallback(row, nextAttempt);
       }
+    }
+  }
+
+  /**
+   * Records a failed retry against the endpoint and opens the circuit once the
+   * consecutive-failure threshold is reached (#1061).
+   */
+  private async registerRetryFailure(webhook: WebhookRow): Promise<void> {
+    const failures = (webhook.consecutive_failures ?? 0) + 1;
+
+    if (failures >= CIRCUIT_BREAKER_THRESHOLD) {
+      await query(
+        "UPDATE webhooks SET consecutive_failures = $1, circuit_open = TRUE, circuit_opened_at = COALESCE(circuit_opened_at, NOW()) WHERE id = $2",
+        [failures, webhook.id],
+      );
+      logger.warn(
+        { webhookId: webhook.id, consecutiveFailures: failures },
+        "Webhook circuit opened after reaching consecutive failure threshold",
+      );
+      return;
+    }
+
+    await query("UPDATE webhooks SET consecutive_failures = $1 WHERE id = $2", [failures, webhook.id]);
+  }
+
+  /**
+   * Deletes rotated-out secrets once `SECRET_ROTATION_WINDOW_HOURS` has elapsed,
+   * so a retired secret can no longer authenticate against us (#1062).
+   */
+  private async purgeExpiredRotatedSecrets(): Promise<void> {
+    const purged = await query<{ id: number }>(
+      `UPDATE webhooks
+          SET previous_secret = NULL, secret_rotated_at = NULL
+        WHERE previous_secret IS NOT NULL
+          AND secret_rotated_at IS NOT NULL
+          AND secret_rotated_at <= NOW() - (INTERVAL '1 hour' * $1)
+        RETURNING id`,
+      [secretRotationWindowHours()],
+    );
+    if (purged.length > 0) {
+      logger.info(
+        { count: purged.length, ids: purged.map((r) => r.id) },
+        "Purged webhook secrets past their rotation window",
+      );
     }
   }
 
@@ -379,10 +449,7 @@ export class NotificationService {
     });
 
     const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (webhook.secret) {
-      const signature = createHmac("sha256", webhook.secret).update(payload).digest("hex");
-      headers["X-StellarYield-Signature"] = `sha256=${signature}`;
-    }
+    Object.assign(headers, buildSignatureHeaders(webhook, payload));
 
     const start = Date.now();
     try {
@@ -439,11 +506,7 @@ export class NotificationService {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
     };
-
-    if (webhook.secret) {
-      const signature = createHmac("sha256", webhook.secret).update(payload).digest("hex");
-      headers["X-StellarYield-Signature"] = `sha256=${signature}`;
-    }
+    Object.assign(headers, buildSignatureHeaders(webhook, payload));
 
     try {
       const response = await fetch(webhook.url, {

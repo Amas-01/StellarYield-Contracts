@@ -1779,6 +1779,294 @@
         }
       }
     },
+    "/api/v1/admin/indexer/start-block": {
+      "get": {
+        "summary": "Get the indexer start block and cursor (requires API key)",
+        "tags": [
+          "Admin"
+        ],
+        "responses": {
+          "200": {
+            "description": "Configured start block plus the current cursor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "startBlock": {
+                      "type": "number"
+                    },
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "database",
+                        "environment"
+                      ]
+                    },
+                    "envStartLedger": {
+                      "type": "number"
+                    },
+                    "lastLedger": {
+                      "type": "number"
+                    },
+                    "running": {
+                      "type": "boolean"
+                    },
+                    "active": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "startBlock",
+                    "source",
+                    "envStartLedger",
+                    "lastLedger",
+                    "running",
+                    "active"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Set the indexer start block (requires admin API key)",
+        "tags": [
+          "Admin"
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "startBlock": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "startBlock"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Start block persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "startBlock": {
+                      "type": "number"
+                    },
+                    "lastLedger": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "startBlock",
+                    "lastLedger"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The address is not a valid Stellar address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "statusCode": {
+                      "type": "number"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No data held for the address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/gdpr/users/{address}": {
+      "delete": {
+        "summary": "Erase all data held for an address (GDPR Art. 17, requires admin API key)",
+        "description": "Preview with ?dryRun=true, apply with ?confirm=true; supplying neither is rejected. Immutable financial records are anonymised and event payloads redacted rather than deleted. Refused while the subject is under an active AML hold, and applied in a single transaction that is rolled back on failure.",
+        "tags": [
+          "Users"
+        ],
+        "parameters": [
+          {
+            "name": "address",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "dryRun",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
+            }
+          },
+          {
+            "name": "confirm",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Erasure result, or the dry-run plan",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "address": {
+                      "type": "string"
+                    },
+                    "mode": {
+                      "type": "string",
+                      "enum": [
+                        "dry-run",
+                        "applied"
+                      ]
+                    },
+                    "erasedAt": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "erased": {
+                      "type": "object",
+                      "description": "Row counts deleted, per table (plus the user profile)"
+                    },
+                    "anonymized": {
+                      "type": "object",
+                      "description": "Row counts anonymised or redacted, per table"
+                    },
+                    "retentionNote": {
+                      "type": "string",
+                      "nullable": true
+                    }
+                  },
+                  "required": [
+                    "address",
+                    "mode",
+                    "erased",
+                    "anonymized"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Neither dryRun nor confirm was supplied",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No data held for the address",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Refused: the subject is under an active AML hold",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "amlFlaggedAt": {
+                      "type": "string",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The erasure failed and the transaction was rolled back"
+          }
+        }
+      }
+    },
     "/api/v1/admin/events": {
       "get": {
         "summary": "Get indexed events (requires API key)",

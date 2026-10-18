@@ -19,7 +19,9 @@ checks between iterations.
 `start()`:
 
 1. Reads the last indexed ledger from the `indexer_state` table (`getLastIndexedLedger()`),
-   falling back to `INDEXER_START_LEDGER` if no row exists yet.
+   falling back to `INDEXER_START_LEDGER` if no row exists yet. While that cursor is still
+   `0` — no progress recorded yet — the configured start block is used as the origin
+   instead (see [Start block configuration](#start-block-configuration)).
 2. If `VAULT_FACTORY_CONTRACT_ID` is not configured, the indexer runs in **state-only mode**:
    it loops calling `tickStateOnly()`, which only advances `lastLedger` to the chain tip
    without fetching or processing any events. This exists so the service still starts up
@@ -38,11 +40,14 @@ checks between iterations.
 2. If the indexer has fallen more than `INDEXER_LAG_ALERT_LEDGERS` behind the tip, logs an
    error (alerting hook, not a hard failure).
 3. If there are no new ledgers, returns early — nothing else runs.
-4. Calls `server.getEvents({ startLedger, filters })`, filtered to the set of watched
+4. Reloads the per-contract controls from `indexer_contract_state` and replays any
+   contract resumed since the last cycle (see [Per-contract controls](#per-contract-controls)).
+5. Calls `server.getEvents({ startLedger, filters })`, filtered to the set of watched
    contract IDs (the factory contract plus every vault contract discovered via
-   `vault_created` events), and passes each returned event to `processEvent()` in order.
-5. Runs any due notification retries (`notificationService.processRetries()`).
-6. Advances and persists `lastLedger` (`indexer_state.last_ledger`) — this is the resume
+   `vault_created` events) minus any paused contracts, and passes each returned event to
+   `processEvent()` in order.
+6. Runs any due notification retries (`notificationService.processRetries()`).
+7. Advances and persists `lastLedger` (`indexer_state.last_ledger`) — this is the resume
    point on restart.
 
 Each tick and each `processEvent()` call opens a lightweight trace span (`startSpan`/`finishSpan`
@@ -69,10 +74,58 @@ Backfill runs in two situations:
   Queuing (rather than an inline HTTP-triggered backfill) means the job survives an API
   process restart and the request range is capped at 10,000 ledgers.
 
+## Per-contract controls
+
+Operators can pause a single contract or restrict which event types are indexed for it,
+without touching the others. Settings live in `indexer_contract_state` (one row per
+configured contract; contracts without a row are indexed normally) and are written by the
+admin API, which may run in a different process — the indexer reloads them at the start of
+every tick and backfill.
+
+- **Pause / resume** — `POST /api/v1/admin/indexer/:contractId/pause` and `.../resume`
+  toggle `indexing_paused`. A paused contract is left out of the `getEvents` filters and its
+  events are skipped in `processEvent()`. Pausing also records the global
+  `indexer_state.last_ledger` in `paused_at_ledger`. The global cursor keeps moving while the
+  contract is paused, so on the first tick after a resume the indexer replays that contract
+  alone from `paused_at_ledger + 1` up to the cursor, then clears `paused_at_ledger`. If the
+  replay fails it is retried on the next tick; already-indexed events are de-duplicated.
+- **Event-type filter** — `PATCH /api/v1/admin/indexer/:contractId/event-filter` with
+  `{ "allowedTypes": ["deposit"] }` limits the contract to those types from the next run;
+  `[]` removes the filter. Types may be stored `event_type` names (`yield_distributed`) or
+  on-chain topic symbols (`yield_dis`); the mapping is in `indexerEventTypes.ts`. Filtered
+  events are skipped before any handler runs, so they change no state.
+
+## Metrics
+
+Exposed on `GET /metrics`:
+
+- `indexer_events_processed_total` (counter) — incremented once per event actually indexed,
+  in `processEvent()`. Duplicates, unrecognised events and events skipped by a pause or
+  filter are not counted, so `rate(indexer_events_processed_total[5m])` is the indexing
+  throughput.
+- `indexer_processing_duration_seconds` (histogram) — one observation per batch: each tick,
+  each backfill chunk and each resume-replay chunk, covering the event fetch and processing.
+- `indexer_last_ledger` (gauge) — the last persisted ledger.
+## Start block configuration
+
+The ledger a **fresh** indexing run starts from is runtime-configurable (#1105) and lives in
+`indexer_state.start_ledger`, which is independent of the `last_ledger` cursor so moving it
+never rewinds progress. `NULL` means "not configured" and the `INDEXER_START_LEDGER` env var
+is used instead.
+
+- `GET /api/v1/admin/indexer/start-block` — reads the effective block, where it came from
+  (`source: "database" | "environment"`), the current cursor and `active` (false once the
+  cursor has moved, since the start block is only consulted while it is still `0`).
+- `PUT /api/v1/admin/indexer/start-block` — body `{ "startBlock": <ledger> }`, admin keys
+  only. A block ahead of the current cursor is rejected (it would skip the ledgers in
+  between) and the write is audit-logged. The value is picked up on the next `start()`, never
+  mid-run.
+
 ## Event dispatch: `processEvent`
 
-`processEvent(event, parentSpan)` is a thin span wrapper around `_processEventInner(event)`,
-which does the real dispatch. It is **not** a lookup table — it's a sequential chain of
+`processEvent(event, parentSpan)` applies the per-contract controls, then calls
+`_processEventInner(event)`, which does the real dispatch and returns whether the event was
+indexed. It is **not** a lookup table — it's a sequential chain of
 `const parsed = parseXEvent(event); if (parsed) { ...handle...; return; }` blocks, one per
 event type, tried in the order they appear in the method. Each `parseXEvent` function:
 
@@ -93,7 +146,7 @@ const existing = await query(
   "SELECT id FROM indexed_events WHERE tx_hash = $1 AND contract_id = $2 AND event_type = $3 AND ledger = $4",
   [event.id ?? event.txHash ?? "", event.contractId ?? "", event.type ?? "", event.ledger ?? 0],
 );
-if (existing.length > 0) return;
+if (existing.length > 0) return false;
 ```
 
 This is the actual dedup guard — it's a plain `SELECT`-then-skip, not a DB constraint. Note
@@ -119,17 +172,19 @@ database concurrently would race past this check.
      await this.handleX(event.contractId ?? "", x);
      await this.recordEvent(event, "x_event_type");
      // optional: await this.notificationService?.notify("x.event", {...});
-     return;
+     return true; // counted in indexer_events_processed_total
    }
    ```
-   `recordEvent()` writes the raw + parsed payload to `indexed_events` for audit/replay and
-   increments the `indexerEventsProcessedTotal` metric — always call it (or insert into
+   `recordEvent()` writes the raw + parsed payload to `indexed_events` for audit/replay —
+   always call it (or insert into
    `indexed_events` directly, as `yield_distributed`/`yield_claimed` do when they need to
    store extra derived fields) so the event shows up in `GET /api/v1/admin/indexer` history.
 4. **Notify subscribers, if relevant.** Call
    `this.notificationService?.notify("webhook.event.name", payload)` inside a `try/catch`
    (a notification failure must never fail event processing) and document the payload shape
    in [`webhooks.md`](./webhooks.md).
-5. **Document it.** Add a row to the table in [`events.md`](./events.md).
-6. **Test it.** Add a unit test for the parser (decode a fixture event, assert the parsed
+5. **Make it filterable.** Map the topic symbol to its stored type in
+   `TOPIC_EVENT_TYPES` (`indexerEventTypes.ts`) so the event-type filter accepts it.
+6. **Document it.** Add a row to the table in [`events.md`](./events.md).
+7. **Test it.** Add a unit test for the parser (decode a fixture event, assert the parsed
    fields) and, if the handler has non-trivial DB logic, a test for `handleX` mocking `query`.

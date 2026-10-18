@@ -15,7 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Outbound HTTP client (`backend/src/services/apiClient.ts`) with retry using
+  exponential backoff, a per-request timeout, and automatic `Authorization:
+  Bearer` API key attachment. Defaults come from the new `API_CLIENT_BASE_URL`,
+  `API_CLIENT_API_KEY`, `API_CLIENT_TIMEOUT_MS` and `API_CLIENT_MAX_RETRIES`
+  env vars.
+
 ### Changed
+
+- `GET /api/v1/vaults/simulate/translate-error` now returns the error names and
+  numbers defined by the `#[contracterror]` enum in
+  `soroban-contracts/contracts/single_rwa_vault/src/errors.rs` instead of a
+  hand-maintained approximation.
 
 ### Deprecated
 

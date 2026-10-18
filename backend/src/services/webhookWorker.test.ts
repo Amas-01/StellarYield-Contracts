@@ -79,13 +79,13 @@ describe("processWebhookDelivery", () => {
     );
   });
 
-  it("auto-deactivates webhook after 10 consecutive failures", async () => {
+  it("opens the circuit after 5 consecutive failures (#1061)", async () => {
     const { processWebhookDelivery } = await import("./webhookWorker.js");
     const notifMod = await import("./notifications.js");
     vi.spyOn(notifMod, "validateWebhookUrl").mockResolvedValue(undefined);
 
     mockQuery.mockResolvedValueOnce([
-      { id: 3, url: "https://example.com/hook", events: ["deposit"], secret: null, consecutive_failures: 9 },
+      { id: 3, url: "https://example.com/hook", events: ["deposit"], secret: null, consecutive_failures: 4 },
     ]);
 
     (fetch as any).mockResolvedValueOnce({ ok: false, status: 500, statusText: "Internal Server Error" });
@@ -94,9 +94,53 @@ describe("processWebhookDelivery", () => {
     await processWebhookDelivery(boss, 3, '{"event":"deposit"}');
 
     expect(mockQuery).toHaveBeenCalledWith(
-      expect.stringContaining("active = FALSE"),
-      [10, 3],
+      expect.stringContaining("circuit_open = TRUE"),
+      [5, 3],
     );
+    // The endpoint is suspended, not deactivated, so a reset alone resumes it.
+    expect(mockQuery).not.toHaveBeenCalledWith(
+      expect.stringContaining("active = FALSE"),
+      expect.anything(),
+    );
+  });
+
+  it("marks the delivery failed_permanent once the circuit opens (#1061)", async () => {
+    const { processWebhookDelivery } = await import("./webhookWorker.js");
+    const notifMod = await import("./notifications.js");
+    vi.spyOn(notifMod, "validateWebhookUrl").mockResolvedValue(undefined);
+
+    mockQuery.mockResolvedValueOnce([
+      { id: 6, url: "https://example.com/hook", events: ["deposit"], secret: null, consecutive_failures: 4 },
+    ]);
+    (fetch as any).mockResolvedValueOnce({ ok: false, status: 503, statusText: "Unavailable" });
+
+    await processWebhookDelivery(makeBossMock(), 6, '{"event":"deposit"}');
+
+    const deliveryInsert = mockQuery.mock.calls.find(([sql]) =>
+      String(sql).includes("INSERT INTO webhook_deliveries"),
+    );
+    expect(deliveryInsert?.[1][3]).toBe("failed_permanent");
+  });
+
+  it("makes no delivery attempt while the circuit is open (#1061)", async () => {
+    const { processWebhookDelivery } = await import("./webhookWorker.js");
+
+    mockQuery.mockResolvedValueOnce([
+      {
+        id: 7,
+        url: "https://example.com/hook",
+        events: ["deposit"],
+        secret: null,
+        consecutive_failures: 5,
+        circuit_open: true,
+      },
+    ]);
+
+    await processWebhookDelivery(makeBossMock(), 7, '{"event":"deposit"}');
+
+    expect(fetch).not.toHaveBeenCalled();
+    // Only the initial SELECT ran — no failure bookkeeping, no retry row.
+    expect(mockQuery).toHaveBeenCalledTimes(1);
   });
 
   it("broadcasts via SSE on delivery success", async () => {

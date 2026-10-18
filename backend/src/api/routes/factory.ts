@@ -5,6 +5,7 @@ import {
   getVaultCreationRate,
   getFactoryDefaults,
   getFactoryEvents,
+  getFactoryOperators,
 } from "../controllers/factory.js";
 import { validateQuery } from "../middleware/validate.js";
 import { requireApiKey } from "../middleware/auth.js";
@@ -24,3 +25,6 @@ factoryRouter.get("/vault-creation-rate", getVaultCreationRate);
 factoryRouter.get("/defaults", getFactoryDefaults);
 // Paginated, reverse-ledger-order factory event log (#842)
 factoryRouter.get("/events", requireApiKey(), validateQuery(factoryEventsQuerySchema), getFactoryEvents);
+// Active factory role holders
+factoryRouter.get("/operators", requireApiKey(), getFactoryOperators);
+

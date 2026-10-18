@@ -1,0 +1,409 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "StellarYield API",
+    "version": "0.1.0",
+    "description": "REST API for StellarYield — mock server spec for frontend development (Issue #869). Served by `npm run mock-server` via Prism on port 3001."
+  },
+  "servers": [{ "url": "http://localhost:3001" }],
+  "paths": {
+    "/api/v1/health": {
+      "get": {
+        "summary": "Health check (versioned alias)",
+        "responses": {
+          "200": {
+            "description": "Server is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["version", "status"],
+                  "properties": {
+                    "version": { "type": "string", "example": "0.1.0" },
+                    "status": { "type": "string", "example": "ok" }
+                  },
+                  "example": { "version": "0.1.0", "status": "ok" }
+                },
+                "example": { "version": "0.1.0", "status": "ok" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "responses": {
+          "200": {
+            "description": "Server is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["version", "status"],
+                  "properties": {
+                    "version": { "type": "string", "example": "0.1.0" },
+                    "status": { "type": "string", "example": "ok" }
+                  },
+                  "example": { "version": "0.1.0", "status": "ok" }
+                },
+                "example": { "version": "0.1.0", "status": "ok" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vaults": {
+      "get": {
+        "summary": "List vaults",
+        "parameters": [
+          { "name": "page", "in": "query", "schema": { "type": "integer", "example": 1 } },
+          { "name": "pageSize", "in": "query", "schema": { "type": "integer", "example": 20 } },
+          { "name": "state", "in": "query", "schema": { "type": "string", "example": "Active" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paginated list of vaults",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["data", "total", "page", "pageSize"],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/Vault" }
+                    },
+                    "total": { "type": "integer", "example": 1 },
+                    "page": { "type": "integer", "example": 1 },
+                    "pageSize": { "type": "integer", "example": 20 }
+                  },
+                  "example": {
+                    "data": [
+                      {
+                        "id": 1,
+                        "contractId": "CAUZE223Z3225XAS6DTIAV3ZCK4SD3XSKURGALZJNSCW7CW5QYEHF557",
+                        "factoryId": "CDVBDO2GW7445HWUITG6E437GZERAUYBG4X5HZRQC2ZEFMV3Y5HGDY52",
+                        "asset": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEADQSKZRXGQ6E4DFR",
+                        "name": "Treasury Bill Vault",
+                        "symbol": "sTBill",
+                        "state": "Active",
+                        "totalAssets": "1000000000000",
+                        "totalSupply": "950000000000",
+                        "depositorCount": 42,
+                        "fundingTarget": "5000000000000",
+                        "fundingDeadline": "2026-12-31T00:00:00.000Z",
+                        "fundingProgress": 20.5,
+                        "minDeposit": "10000000",
+                        "maxDepositPerUser": "100000000000",
+                        "rwaName": "US Treasury Bill",
+                        "rwaSymbol": "USTB",
+                        "rwaDocumentUri": "https://example.com/docs/tbill.pdf",
+                        "rwaCategory": "Government Debt",
+                        "description": "Tokenized short-term US Treasury bills",
+                        "logoUri": "https://example.com/logo.png",
+                        "createdAt": "2026-01-15T00:00:00.000Z",
+                        "updatedAt": "2026-09-20T00:00:00.000Z"
+                      }
+                    ],
+                    "total": 1,
+                    "page": 1,
+                    "pageSize": 20
+                  }
+                },
+                "example": {
+                  "data": [
+                    {
+                      "id": 1,
+                      "contractId": "CAUZE223Z3225XAS6DTIAV3ZCK4SD3XSKURGALZJNSCW7CW5QYEHF557",
+                      "factoryId": "CDVBDO2GW7445HWUITG6E437GZERAUYBG4X5HZRQC2ZEFMV3Y5HGDY52",
+                      "asset": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEADQSKZRXGQ6E4DFR",
+                      "name": "Treasury Bill Vault",
+                      "symbol": "sTBill",
+                      "state": "Active",
+                      "totalAssets": "1000000000000",
+                      "totalSupply": "950000000000",
+                      "depositorCount": 42,
+                      "fundingTarget": "5000000000000",
+                      "fundingDeadline": "2026-12-31T00:00:00.000Z",
+                      "fundingProgress": 20.5,
+                      "minDeposit": "10000000",
+                      "maxDepositPerUser": "100000000000",
+                      "rwaName": "US Treasury Bill",
+                      "rwaSymbol": "USTB",
+                      "rwaDocumentUri": "https://example.com/docs/tbill.pdf",
+                      "rwaCategory": "Government Debt",
+                      "description": "Tokenized short-term US Treasury bills",
+                      "logoUri": "https://example.com/logo.png",
+                      "createdAt": "2026-01-15T00:00:00.000Z",
+                      "updatedAt": "2026-09-20T00:00:00.000Z"
+                    }
+                  ],
+                  "total": 1,
+                  "page": 1,
+                  "pageSize": 20
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vaults/{contractId}": {
+      "get": {
+        "summary": "Get vault by contract ID",
+        "parameters": [{ "name": "contractId", "in": "path", "required": true, "schema": { "type": "string", "example": "CAUZE223Z3225XAS6DTIAV3ZCK4SD3XSKURGALZJNSCW7CW5QYEHF557" } }],
+        "responses": {
+          "200": {
+            "description": "Vault details",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Vault" }
+              }
+            }
+          },
+          "404": {
+            "description": "Vault not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vaults/{contractId}/tvl-history": {
+      "get": {
+        "summary": "Get vault TVL history",
+        "parameters": [
+          { "name": "contractId", "in": "path", "required": true, "schema": { "type": "string", "example": "CAUZE223Z3225XAS6DTIAV3ZCK4SD3XSKURGALZJNSCW7CW5QYEHF557" } },
+          { "name": "from", "in": "query", "required": false, "schema": { "type": "string", "example": "2026-09-01T00:00:00.000Z" } },
+          { "name": "to", "in": "query", "required": false, "schema": { "type": "string", "example": "2026-09-20T00:00:00.000Z" } },
+          { "name": "bucket", "in": "query", "required": false, "schema": { "type": "string", "enum": ["hour", "day", "week"], "example": "day" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "TVL history (raw points, or per-bucket aggregates when ?bucket is set)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/TvlBucket" },
+                  "example": [
+                    {
+                      "bucket": "2026-09-20T00:00:00.000Z",
+                      "avgTotalAssets": "1000000000000",
+                      "maxTotalAssets": "1100000000000",
+                      "minTotalAssets": "900000000000"
+                    }
+                  ]
+                },
+                "example": [
+                  {
+                    "bucket": "2026-09-20T00:00:00.000Z",
+                    "avgTotalAssets": "1000000000000",
+                    "maxTotalAssets": "1100000000000",
+                    "minTotalAssets": "900000000000"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/analytics/summary": {
+      "get": {
+        "summary": "Get analytics summary",
+        "responses": {
+          "200": {
+            "description": "Platform analytics summary",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["totalUsers", "totalVaults", "totalValueLocked", "totalYieldDistributed", "totalDepositors"],
+                  "properties": {
+                    "totalUsers": { "type": "integer", "example": 340 },
+                    "totalVaults": { "type": "integer", "example": 12 },
+                    "totalValueLocked": { "type": "string", "example": "25000000000000" },
+                    "totalYieldDistributed": { "type": "string", "example": "1200000000000" },
+                    "totalDepositors": { "type": "integer", "example": 300 }
+                  },
+                  "example": {
+                    "totalUsers": 340,
+                    "totalVaults": 12,
+                    "totalValueLocked": "25000000000000",
+                    "totalYieldDistributed": "1200000000000",
+                    "totalDepositors": 300
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/analytics/tvl": {
+      "get": {
+        "summary": "Get cross-vault TVL aggregate",
+        "responses": {
+          "200": {
+            "description": "TVL aggregate",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["totalValueLocked", "activeVaultCount", "fundingVaultCount"],
+                  "properties": {
+                    "totalValueLocked": { "type": "string", "example": "25000000000000" },
+                    "activeVaultCount": { "type": "integer", "example": 7 },
+                    "fundingVaultCount": { "type": "integer", "example": 3 }
+                  },
+                  "example": {
+                    "totalValueLocked": "25000000000000",
+                    "activeVaultCount": 7,
+                    "fundingVaultCount": 3
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/analytics/vaults/group-by": {
+      "get": {
+        "summary": "Group vault analytics by category, state, or maturity month",
+        "parameters": [
+          {
+            "name": "by",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "enum": ["rwa_category", "state", "maturityMonth"], "example": "state" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One row per non-empty group",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/VaultGroupBy" },
+                  "example": [
+                    { "group": "Active", "vaultCount": 7, "totalValueLocked": "25000000000000", "averageApy": 5.25 }
+                  ]
+                },
+                "example": [
+                  { "group": "Active", "vaultCount": 7, "totalValueLocked": "25000000000000", "averageApy": 5.25 }
+                ]
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid group-by dimension",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Vault": {
+        "type": "object",
+        "required": ["id", "contractId", "asset", "state", "totalAssets", "totalSupply", "depositorCount", "createdAt", "updatedAt"],
+        "properties": {
+          "id": { "type": "integer", "example": 1 },
+          "contractId": { "type": "string", "example": "CAUZE223Z3225XAS6DTIAV3ZCK4SD3XSKURGALZJNSCW7CW5QYEHF557" },
+          "factoryId": { "type": "string", "nullable": true, "example": "CDVBDO2GW7445HWUITG6E437GZERAUYBG4X5HZRQC2ZEFMV3Y5HGDY52" },
+          "asset": { "type": "string", "example": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEADQSKZRXGQ6E4DFR" },
+          "name": { "type": "string", "nullable": true, "example": "Treasury Bill Vault" },
+          "symbol": { "type": "string", "nullable": true, "example": "sTBill" },
+          "state": { "type": "string", "enum": ["Funding", "Active", "Matured", "Closed", "Cancelled"], "example": "Active" },
+          "totalAssets": { "type": "string", "example": "1000000000000" },
+          "totalSupply": { "type": "string", "example": "950000000000" },
+          "totalSharesEverMinted": { "type": "string", "example": "960000000000" },
+          "totalSharesEverBurned": { "type": "string", "example": "10000000000" },
+          "depositorCount": { "type": "integer", "example": 42 },
+          "fundingTarget": { "type": "string", "nullable": true, "example": "5000000000000" },
+          "fundingDeadline": { "type": "string", "nullable": true, "example": "2026-12-31T00:00:00.000Z" },
+          "fundingProgress": { "type": "number", "nullable": true, "example": 20.5 },
+          "minDeposit": { "type": "string", "nullable": true, "example": "10000000" },
+          "maxDepositPerUser": { "type": "string", "nullable": true, "example": "100000000000" },
+          "zkmeVerifier": { "type": "string", "nullable": true, "example": "CDVBDO2GW7445HWUITG6E437GZERAUYBG4X5HZRQC2ZEFMV3Y5HGDY52" },
+          "rwaName": { "type": "string", "nullable": true, "example": "US Treasury Bill" },
+          "rwaSymbol": { "type": "string", "nullable": true, "example": "USTB" },
+          "rwaDocumentUri": { "type": "string", "nullable": true, "example": "https://example.com/docs/tbill.pdf" },
+          "rwaCategory": { "type": "string", "nullable": true, "example": "Government Debt" },
+          "description": { "type": "string", "nullable": true, "example": "Tokenized short-term US Treasury bills" },
+          "logoUri": { "type": "string", "nullable": true, "example": "https://example.com/logo.png" },
+          "createdAt": { "type": "string", "example": "2026-01-15T00:00:00.000Z" },
+          "updatedAt": { "type": "string", "example": "2026-09-20T00:00:00.000Z" }
+        },
+        "example": {
+          "id": 1,
+          "contractId": "CAUZE223Z3225XAS6DTIAV3ZCK4SD3XSKURGALZJNSCW7CW5QYEHF557",
+          "factoryId": "CDVBDO2GW7445HWUITG6E437GZERAUYBG4X5HZRQC2ZEFMV3Y5HGDY52",
+          "asset": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEADQSKZRXGQ6E4DFR",
+          "name": "Treasury Bill Vault",
+          "symbol": "sTBill",
+          "state": "Active",
+          "totalAssets": "1000000000000",
+          "totalSupply": "950000000000",
+          "depositorCount": 42,
+          "fundingTarget": "5000000000000",
+          "fundingDeadline": "2026-12-31T00:00:00.000Z",
+          "fundingProgress": 20.5,
+          "rwaCategory": "Government Debt",
+          "createdAt": "2026-01-15T00:00:00.000Z",
+          "updatedAt": "2026-09-20T00:00:00.000Z"
+        }
+      },
+      "TvlBucket": {
+        "type": "object",
+        "required": ["bucket", "avgTotalAssets", "maxTotalAssets", "minTotalAssets"],
+        "properties": {
+          "bucket": { "type": "string", "example": "2026-09-20T00:00:00.000Z" },
+          "avgTotalAssets": { "type": "string", "example": "1000000000000" },
+          "maxTotalAssets": { "type": "string", "example": "1100000000000" },
+          "minTotalAssets": { "type": "string", "example": "900000000000" }
+        },
+        "example": {
+          "bucket": "2026-09-20T00:00:00.000Z",
+          "avgTotalAssets": "1000000000000",
+          "maxTotalAssets": "1100000000000",
+          "minTotalAssets": "900000000000"
+        }
+      },
+      "VaultGroupBy": {
+        "type": "object",
+        "required": ["group", "vaultCount", "totalValueLocked", "averageApy"],
+        "properties": {
+          "group": { "type": "string", "example": "Active" },
+          "vaultCount": { "type": "integer", "example": 7 },
+          "totalValueLocked": { "type": "string", "example": "25000000000000" },
+          "averageApy": { "type": "number", "nullable": true, "example": 5.25 }
+        },
+        "example": { "group": "Active", "vaultCount": 7, "totalValueLocked": "25000000000000", "averageApy": 5.25 }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error", "message"],
+        "properties": {
+          "error": { "type": "string", "example": "NotFound" },
+          "message": { "type": "string", "example": "Vault not found" }
+        },
+        "example": { "error": "NotFound", "message": "Vault not found" }
+      }
+    }
+  }
+}
