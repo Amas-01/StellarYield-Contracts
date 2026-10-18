@@ -9,7 +9,6 @@ import {
   getVaultLiveState,
   getVaultLiveTotalAssets,
   getRedemptionQueue,
-  getVaultSnapshot,
   getVaultMetadataHistory,
   getWhitelistHistory,
   getVaultStatusHistory,
@@ -42,6 +41,10 @@ import {
   streamVaultEvents,
   getVaultsBulkStatus,
   validateVaultMetadata,
+  getHoldingDuration,
+  getVaultSnapshotWithRatios,
+  getFundingVelocity,
+  getRedemptionQueueEta,
 } from "../controllers/vaults.js";
 import {
   translateSimulationError,
@@ -286,7 +289,18 @@ vaultsRouter.get(
   getVaultHolders,
 );
 // Get vault snapshot: GET /api/v1/vaults/:contractId/snapshot
-vaultsRouter.get("/:contractId/snapshot", validateParams(vaultParamsSchema), getVaultSnapshot);
+// Issue #1267: snapshot now includes withdrawalRatio7d and withdrawalRatio30d
+vaultsRouter.get("/:contractId/snapshot", validateParams(vaultParamsSchema), getVaultSnapshotWithRatios);
+// Issue #1264: average holding duration: GET /api/v1/vaults/:contractId/holding-duration
+vaultsRouter.get("/:contractId/holding-duration", validateParams(vaultParamsSchema), getHoldingDuration);
+// Issue #1268: funding velocity: GET /api/v1/vaults/:contractId/funding-velocity
+vaultsRouter.get("/:contractId/funding-velocity", validateParams(vaultParamsSchema), getFundingVelocity);
+// Issue #1269: redemption queue ETA: GET /api/v1/vaults/:contractId/redemption-queue/:address/eta
+vaultsRouter.get(
+  "/:contractId/redemption-queue/:address/eta",
+  validateParams(z.object({ contractId: contractAddressSchema, address: z.string().min(1) })),
+  getRedemptionQueueEta,
+);
 // Metadata change history: GET /api/v1/vaults/:contractId/metadata-history (#973)
 vaultsRouter.get(
   "/:contractId/metadata-history",

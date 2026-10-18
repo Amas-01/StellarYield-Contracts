@@ -1893,3 +1893,204 @@ export async function getVaultTransferLeaderboard(
     next(err);
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #1264 — Average holding duration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/vaults/:contractId/holding-duration
+ *
+ * Returns { averageDays, medianDays, sampleSize } for all distinct holders.
+ * Active holders contribute duration = NOW − first_entry_at; fully-exited
+ * holders contribute duration = last_exit_at − first_entry_at.
+ */
+export async function getHoldingDuration(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const result = await vaultService.getHoldingDuration(contractId);
+    if (result === null) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    setCacheHeaders(res);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #1267 — Withdrawal-to-deposit ratio (snapshot augmentation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/vaults/:contractId/snapshot (augmented)
+ *
+ * The existing snapshot handler is extended in-place; this helper is kept
+ * separate for testability.  It is called by the route-level handler below.
+ */
+export async function getVaultSnapshotWithRatios(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vault = await vaultService.getVault(contractId);
+    if (!vault) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    // Get epoch count for this vault
+    const epochRows = await query<{ count: string }>(
+      "SELECT COUNT(*)::text as count FROM epochs WHERE vault_id = $1",
+      [vault.id],
+    );
+    const epochCount = parseInt(epochRows[0]?.count ?? "0", 10);
+
+    // Get last indexed event timestamp for this vault
+    const lastEventRows = await query<{ created_at: Date }>(
+      "SELECT created_at FROM indexed_events WHERE contract_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [contractId],
+    );
+    const lastIndexedAt = lastEventRows[0]?.created_at?.toISOString() ?? null;
+
+    // Compute top-10 holder concentration metric
+    const top10Rows = await query<{ top10_shares: string }>(
+      `SELECT COALESCE(SUM(shares), 0)::text AS top10_shares
+       FROM (
+         SELECT uvp.shares
+         FROM user_vault_positions uvp
+         WHERE uvp.vault_id = $1 AND uvp.shares > 0
+         ORDER BY uvp.shares DESC
+         LIMIT 10
+       ) top10`,
+      [vault.id],
+    );
+    const totalSupplyNum = parseFloat(vault.totalSupply);
+    let top10HolderSharePercent: number | null = null;
+    if (totalSupplyNum > 0) {
+      const top10Shares = parseFloat(top10Rows[0]?.top10_shares ?? "0");
+      top10HolderSharePercent = Math.round((top10Shares / totalSupplyNum) * 100 * 100) / 100;
+    }
+
+    // Issue #1267: withdrawal ratios
+    const ratios = await vaultService.getWithdrawalRatios(contractId);
+
+    const snapshot = {
+      state: vault.state,
+      totalAssets: vault.totalAssets,
+      totalSupply: vault.totalSupply,
+      depositorCount: vault.depositorCount,
+      epochCount,
+      lastIndexedAt,
+      top10HolderSharePercent,
+      withdrawalRatio7d: ratios?.withdrawalRatio7d ?? null,
+      withdrawalRatio30d: ratios?.withdrawalRatio30d ?? null,
+    };
+
+    setCacheHeaders(res);
+    res.json(snapshot);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #1268 — Funding velocity metric
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/vaults/:contractId/funding-velocity
+ *
+ * Only meaningful for vaults in the Funding state. Returns
+ * { fundingVelocityPerDay, projectedFundingDate } or 404 for non-funding vaults.
+ */
+export async function getFundingVelocity(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const result = await vaultService.getFundingVelocity(contractId);
+    if (result === null) {
+      // Either vault not found, or not in Funding state
+      const vault = await vaultService.getVault(contractId);
+      if (!vault) {
+        res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      } else {
+        res.status(404).json({
+          error: "NotFound",
+          message: "Vault is not in Funding state",
+        });
+      }
+      return;
+    }
+
+    setCacheHeaders(res);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #1269 — Redemption queue ETA
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/vaults/:contractId/redemption-queue/:address/eta
+ *
+ * Returns { position, amountAhead, estimatedProcessingDate } for the given
+ * address. Returns 404 when the address has no pending request.
+ * estimatedProcessingDate is null when fewer than 5 requests have been
+ * processed (insufficient history).
+ */
+export async function getRedemptionQueueEta(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsedContract = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsedContract.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsedContract.data;
+
+    const userAddress = String(req.params["address"]);
+    if (!userAddress || userAddress.length < 1) {
+      res.status(400).json({ error: "BadRequest", message: "Missing address param" });
+      return;
+    }
+
+    const result = await vaultService.getRedemptionQueueEta(contractId, userAddress);
+    if (result === null) {
+      res.status(404).json({
+        error: "NotFound",
+        message: "No pending redemption request found for this address in the specified vault",
+      });
+      return;
+    }
+
+    setCacheHeaders(res);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
