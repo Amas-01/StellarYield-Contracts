@@ -19,6 +19,8 @@ import {
   getVaultHolderCount,
   exportVaultHoldersCsv,
   getVaultTvlHistory,
+  getVaultTvlGrowth,
+  getVaultFlowsDaily,
   getEarlyRedemptionFee,
   exportVaultCsv,
   getVaultOperators,
@@ -377,4 +379,10 @@ vaultsRouter.get(
 
 // Holder cohorts by first-deposit month: GET /api/v1/vaults/:contractId/cohorts (#1266)
 vaultsRouter.get("/:contractId/cohorts", validateParams(vaultParamsSchema), getVaultCohorts);
+
+// Issue #1260: TVL growth rate: GET /api/v1/vaults/:contractId/tvl/growth
+vaultsRouter.get("/:contractId/tvl/growth", validateParams(vaultParamsSchema), getVaultTvlGrowth);
+
+// Issue #1261: Net deposits per day: GET /api/v1/vaults/:contractId/flows/daily?from=&to=
+vaultsRouter.get("/:contractId/flows/daily", validateParams(vaultParamsSchema), getVaultFlowsDaily);
 

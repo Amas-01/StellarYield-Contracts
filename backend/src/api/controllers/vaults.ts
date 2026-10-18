@@ -2173,3 +2173,192 @@ export async function getVaultCohorts(req: Request, res: Response, next: NextFun
     next(err);
   }
 }
+
+// ── Issue #1260: TVL growth rate ─────────────────────────────────────────────
+//
+// Compares the current TVL to snapshots at day, week, and month offsets and
+// returns the growth as a decimal fraction: (current - previous) / previous.
+// Returns null for a period when no earlier snapshot exists.
+export async function getVaultTvlGrowth(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+    const vaultId = vaultRows[0].id;
+
+    // Most recent TVL snapshot for the vault.
+    const currentRows = await query<{ total_assets: string }>(
+      `SELECT total_assets::text
+       FROM vault_tvl_snapshots
+       WHERE vault_id = $1
+       ORDER BY recorded_at DESC
+       LIMIT 1`,
+      [vaultId],
+    );
+    if (currentRows.length === 0) {
+      // No snapshots at all — every period is null.
+      setCacheHeaders(res);
+      res.json({ day: null, week: null, month: null });
+      return;
+    }
+    const current = parseFloat(currentRows[0].total_assets);
+
+    // Look up the closest snapshot at least N days before the latest one.
+    async function growthFor(days: number): Promise<number | null> {
+      const rows = await query<{ total_assets: string }>(
+        `SELECT total_assets::text
+         FROM vault_tvl_snapshots
+         WHERE vault_id = $1
+           AND recorded_at <= (SELECT MAX(recorded_at) FROM vault_tvl_snapshots WHERE vault_id = $1) - ($2 || ' days')::INTERVAL
+         ORDER BY recorded_at DESC
+         LIMIT 1`,
+        [vaultId, String(days)],
+      );
+      if (rows.length === 0) return null;
+      const previous = parseFloat(rows[0].total_assets);
+      if (previous === 0) return null;
+      return (current - previous) / previous;
+    }
+
+    const [day, week, month] = await Promise.all([growthFor(1), growthFor(7), growthFor(30)]);
+
+    setCacheHeaders(res);
+    res.json({ day, week, month });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── Issue #1261: Net deposits per day ─────────────────────────────────────────
+//
+// Returns daily deposit and withdrawal volume (and the net) for a vault.
+// Days with no activity are included with zeroes so the series is contiguous.
+export async function getVaultFlowsDaily(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+    const vaultId = vaultRows[0].id;
+
+    const fromParam = req.query["from"] as string | undefined;
+    const toParam = req.query["to"] as string | undefined;
+
+    let fromDate: Date | null = null;
+    let toDate: Date | null = null;
+    if (fromParam) {
+      fromDate = new Date(fromParam);
+      if (isNaN(fromDate.getTime())) {
+        res.status(400).json({ error: "BadRequest", message: "Invalid from date format" });
+        return;
+      }
+    }
+    if (toParam) {
+      toDate = new Date(toParam);
+      if (isNaN(toDate.getTime())) {
+        res.status(400).json({ error: "BadRequest", message: "Invalid to date format" });
+        return;
+      }
+    }
+
+    // Aggregate deposit/withdraw amounts per day from indexed_events.
+    const params: unknown[] = [contractId];
+    const whereConditions: string[] = ["ie.contract_id = $1", "ie.event_type IN ('deposit', 'withdraw')"];
+    if (fromDate) {
+      params.push(fromDate);
+      whereConditions.push(`ie.created_at >= $${params.length}`);
+    }
+    if (toDate) {
+      params.push(toDate);
+      whereConditions.push(`ie.created_at < $${params.length}`);
+    }
+    const whereClause = whereConditions.join(" AND ");
+
+    const rows = await query<{
+      day: Date;
+      deposits: string;
+      withdrawals: string;
+    }>(
+      `SELECT
+         date_trunc('day', ie.created_at) AS day,
+         COALESCE(SUM(CASE WHEN ie.event_type = 'deposit'
+                           THEN COALESCE((ie.parsed_data->>'assets')::numeric, (ie.payload->>'assets')::numeric, (ie.payload->>'amount')::numeric, 0)
+                           ELSE 0 END), 0)::text AS deposits,
+         COALESCE(SUM(CASE WHEN ie.event_type = 'withdraw'
+                           THEN COALESCE((ie.parsed_data->>'assets')::numeric, (ie.payload->>'assets')::numeric, 0)
+                           ELSE 0 END), 0)::text AS withdrawals
+       FROM indexed_events ie
+       WHERE ${whereClause}
+       GROUP BY 1
+       ORDER BY 1 ASC`,
+      params,
+    );
+
+    // Fill contiguous days with zeroes for days without activity.
+    const byDay = new Map<string, { deposits: number; withdrawals: number }>();
+    for (const r of rows) {
+      const key = r.day.toISOString().slice(0, 10);
+      byDay.set(key, {
+        deposits: parseFloat(r.deposits),
+        withdrawals: parseFloat(r.withdrawals),
+      });
+    }
+
+    const result: Array<{ date: string; deposits: number; withdrawals: number; net: number }> = [];
+    if (fromDate && toDate) {
+      const cursor = new Date(fromDate);
+      cursor.setUTCHours(0, 0, 0, 0);
+      const end = new Date(toDate);
+      end.setUTCHours(0, 0, 0, 0);
+      while (cursor <= end) {
+        const key = cursor.toISOString().slice(0, 10);
+        const entry = byDay.get(key) ?? { deposits: 0, withdrawals: 0 };
+        result.push({
+          date: key,
+          deposits: entry.deposits,
+          withdrawals: entry.withdrawals,
+          net: entry.deposits - entry.withdrawals,
+        });
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+    } else {
+      // No range provided — just return the days that have activity.
+      for (const [date, entry] of byDay) {
+        result.push({
+          date,
+          deposits: entry.deposits,
+          withdrawals: entry.withdrawals,
+          net: entry.deposits - entry.withdrawals,
+        });
+      }
+    }
+
+    setCacheHeaders(res);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
