@@ -9,7 +9,7 @@ import {
   getVaultLiveState,
   getVaultLiveTotalAssets,
   getRedemptionQueue,
-  getVaultSnapshot,
+  getVaultSnapshotV2 as getVaultSnapshot,
   getVaultMetadataHistory,
   getWhitelistHistory,
   getVaultStatusHistory,
@@ -42,6 +42,8 @@ import {
   streamVaultEvents,
   getVaultsBulkStatus,
   validateVaultMetadata,
+  getDepositDistribution,
+  getVaultCohorts,
 } from "../controllers/vaults.js";
 import {
   translateSimulationError,
@@ -350,4 +352,18 @@ vaultsRouter.get("/:contractId/similar", validateParams(vaultParamsSchema), getS
 vaultsRouter.get("/:contractId/transfer-fees", validateParams(vaultParamsSchema), getVaultTransferFees);
 // Transfer leaderboard: GET /api/v1/vaults/:contractId/transfer-leaderboard?limit=10 (#1075)
 vaultsRouter.get("/:contractId/transfer-leaderboard", validateParams(vaultParamsSchema), getVaultTransferLeaderboard);
+
+// Deposit size distribution histogram: GET /api/v1/vaults/:contractId/deposit-distribution?buckets=N (#1265)
+const depositDistributionQuerySchema = z.object({
+  buckets: z.coerce.number().int().min(2).max(50).default(10),
+});
+vaultsRouter.get(
+  "/:contractId/deposit-distribution",
+  validateParams(vaultParamsSchema),
+  validateQuery(depositDistributionQuerySchema),
+  getDepositDistribution,
+);
+
+// Holder cohorts by first-deposit month: GET /api/v1/vaults/:contractId/cohorts (#1266)
+vaultsRouter.get("/:contractId/cohorts", validateParams(vaultParamsSchema), getVaultCohorts);
 
