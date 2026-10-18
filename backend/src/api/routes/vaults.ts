@@ -9,7 +9,7 @@ import {
   getVaultLiveState,
   getVaultLiveTotalAssets,
   getRedemptionQueue,
-  getVaultSnapshot,
+  getVaultSnapshotV2 as getVaultSnapshot,
   getVaultMetadataHistory,
   getWhitelistHistory,
   getVaultStatusHistory,
@@ -42,10 +42,8 @@ import {
   streamVaultEvents,
   getVaultsBulkStatus,
   validateVaultMetadata,
-  getMaturityCountdown,
-  getRedemptionStats,
-  getRedemptionCancellationRate,
-  getHolderRetention,
+  getDepositDistribution,
+  getVaultCohorts,
 } from "../controllers/vaults.js";
 import {
   translateSimulationError,
@@ -290,7 +288,18 @@ vaultsRouter.get(
   getVaultHolders,
 );
 // Get vault snapshot: GET /api/v1/vaults/:contractId/snapshot
-vaultsRouter.get("/:contractId/snapshot", validateParams(vaultParamsSchema), getVaultSnapshot);
+// Issue #1267: snapshot now includes withdrawalRatio7d and withdrawalRatio30d
+vaultsRouter.get("/:contractId/snapshot", validateParams(vaultParamsSchema), getVaultSnapshotWithRatios);
+// Issue #1264: average holding duration: GET /api/v1/vaults/:contractId/holding-duration
+vaultsRouter.get("/:contractId/holding-duration", validateParams(vaultParamsSchema), getHoldingDuration);
+// Issue #1268: funding velocity: GET /api/v1/vaults/:contractId/funding-velocity
+vaultsRouter.get("/:contractId/funding-velocity", validateParams(vaultParamsSchema), getFundingVelocity);
+// Issue #1269: redemption queue ETA: GET /api/v1/vaults/:contractId/redemption-queue/:address/eta
+vaultsRouter.get(
+  "/:contractId/redemption-queue/:address/eta",
+  validateParams(z.object({ contractId: contractAddressSchema, address: z.string().min(1) })),
+  getRedemptionQueueEta,
+);
 // Metadata change history: GET /api/v1/vaults/:contractId/metadata-history (#973)
 vaultsRouter.get(
   "/:contractId/metadata-history",
@@ -363,4 +372,18 @@ vaultsRouter.get("/:contractId/redemption-stats/cancellation", validateParams(va
 // Holder retention across epochs: GET /api/v1/vaults/:contractId/retention?epochs=5 (#1263)
 const retentionQuerySchema = z.object({ epochs: z.coerce.number().int().min(1).max(100).default(5) });
 vaultsRouter.get("/:contractId/retention", validateParams(vaultParamsSchema), validateQuery(retentionQuerySchema), getHolderRetention);
+
+// Deposit size distribution histogram: GET /api/v1/vaults/:contractId/deposit-distribution?buckets=N (#1265)
+const depositDistributionQuerySchema = z.object({
+  buckets: z.coerce.number().int().min(2).max(50).default(10),
+});
+vaultsRouter.get(
+  "/:contractId/deposit-distribution",
+  validateParams(vaultParamsSchema),
+  validateQuery(depositDistributionQuerySchema),
+  getDepositDistribution,
+);
+
+// Holder cohorts by first-deposit month: GET /api/v1/vaults/:contractId/cohorts (#1266)
+vaultsRouter.get("/:contractId/cohorts", validateParams(vaultParamsSchema), getVaultCohorts);
 

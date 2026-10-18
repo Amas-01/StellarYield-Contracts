@@ -468,6 +468,7 @@ interface VaultRow {
   logo_uri: string | null;
   created_at: Date;
   updated_at: Date;
+  settlement_status: string | null;
 }
 
 function computeFundingProgress(totalAssets: string, fundingTarget: string | null): number | null {
@@ -518,6 +519,7 @@ function mapVaultRow(row: VaultRow): Vault {
     logoUri: row.logo_uri ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    settlementStatus: (row.settlement_status as Vault["settlementStatus"]) ?? null,
   };
 }
 
@@ -646,6 +648,7 @@ export class VaultService {
                v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
                v.description, v.logo_uri,
+               v.settlement_status,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -664,6 +667,7 @@ export class VaultService {
                v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
                v.description, v.logo_uri,
+               v.settlement_status,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -817,6 +821,7 @@ export class VaultService {
               v.zkme_verifier_address,
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
               v.description, v.logo_uri,
+              v.settlement_status,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp
@@ -1995,5 +2000,291 @@ export class VaultService {
       uniqueSenders: parseInt(row?.unique_senders ?? "0", 10),
       uniqueRecipients: parseInt(row?.unique_recipients ?? "0", 10),
     };
+  }
+
+  // ── Issue #1264: Average holding duration ─────────────────────────────────
+  /**
+   * Compute average and median holding duration across all distinct holders of
+   * a vault.
+   *
+   * - Active holders: duration = NOW() − first_entry_at
+   * - Fully-exited holders (last_exit_at IS NOT NULL): duration = last_exit_at − first_entry_at
+   * - Only holders with a recorded first_entry_at are included in the sample.
+   *
+   * Median is computed with the percentile_cont aggregate to avoid pulling all
+   * rows into the application layer.
+   */
+  async getHoldingDuration(contractId: string): Promise<{
+    averageDays: number;
+    medianDays: number;
+    sampleSize: number;
+  } | null> {
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1 LIMIT 1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) return null;
+    const vaultId = vaultRows[0].id;
+
+    const rows = await query<{
+      average_days: string | null;
+      median_days: string | null;
+      sample_size: string;
+    }>(
+      `SELECT
+         AVG(
+           EXTRACT(EPOCH FROM
+             COALESCE(uvp.last_exit_at, NOW()) - uvp.first_entry_at
+           ) / 86400.0
+         )::text AS average_days,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (
+           ORDER BY
+             EXTRACT(EPOCH FROM
+               COALESCE(uvp.last_exit_at, NOW()) - uvp.first_entry_at
+             ) / 86400.0
+         )::text AS median_days,
+         COUNT(*)::text AS sample_size
+       FROM user_vault_positions uvp
+       WHERE uvp.vault_id = $1
+         AND uvp.first_entry_at IS NOT NULL`,
+      [vaultId],
+    );
+
+    const row = rows[0];
+    const sampleSize = parseInt(row?.sample_size ?? "0", 10);
+    if (sampleSize === 0) {
+      return { averageDays: 0, medianDays: 0, sampleSize: 0 };
+    }
+
+    return {
+      averageDays: Math.round(parseFloat(row?.average_days ?? "0") * 100) / 100,
+      medianDays: Math.round(parseFloat(row?.median_days ?? "0") * 100) / 100,
+      sampleSize,
+    };
+  }
+
+  // ── Issue #1267: Withdrawal-to-deposit ratio ──────────────────────────────
+  /**
+   * Compute the withdrawal-to-deposit volume ratio over 7-day and 30-day
+   * trailing windows.  Values are derived from indexed_events where
+   * event_type is 'deposit' or 'withdraw'.
+   *
+   * Amounts are stored in the JSONB payload under
+   * `{value,vec,0,i128,lo}` (low 64 bits of a u128 — sufficient for practical
+   * vault sizes; the same path is used throughout the codebase for deposit
+   * totals).
+   *
+   * Returns null for a window where no deposits occurred.
+   */
+  async getWithdrawalRatios(contractId: string): Promise<{
+    withdrawalRatio7d: number | null;
+    withdrawalRatio30d: number | null;
+  } | null> {
+    // Verify vault exists
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1 LIMIT 1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) return null;
+
+    const rows = await query<{
+      period_days: string;
+      deposited: string;
+      withdrawn: string;
+    }>(
+      `SELECT
+         period_days,
+         COALESCE(SUM(CASE WHEN event_type = 'deposit'  THEN amount ELSE 0 END), 0)::text AS deposited,
+         COALESCE(SUM(CASE WHEN event_type = 'withdraw' THEN amount ELSE 0 END), 0)::text AS withdrawn
+       FROM (
+         SELECT
+           event_type,
+           7 AS period_days,
+           (payload #>> '{value,vec,0,i128,lo}')::numeric AS amount
+         FROM indexed_events
+         WHERE contract_id = $1
+           AND event_type IN ('deposit', 'withdraw')
+           AND created_at >= NOW() - INTERVAL '7 days'
+         UNION ALL
+         SELECT
+           event_type,
+           30 AS period_days,
+           (payload #>> '{value,vec,0,i128,lo}')::numeric AS amount
+         FROM indexed_events
+         WHERE contract_id = $1
+           AND event_type IN ('deposit', 'withdraw')
+           AND created_at >= NOW() - INTERVAL '30 days'
+       ) combined
+       GROUP BY period_days`,
+      [contractId],
+    );
+
+    let withdrawalRatio7d: number | null = null;
+    let withdrawalRatio30d: number | null = null;
+
+    for (const r of rows) {
+      const deposited = parseFloat(r.deposited);
+      const withdrawn = parseFloat(r.withdrawn);
+      const ratio = deposited > 0 ? Math.round((withdrawn / deposited) * 10000) / 10000 : null;
+
+      if (r.period_days === "7") {
+        withdrawalRatio7d = ratio;
+      } else if (r.period_days === "30") {
+        withdrawalRatio30d = ratio;
+      }
+    }
+
+    return { withdrawalRatio7d, withdrawalRatio30d };
+  }
+
+  // ── Issue #1268: Funding velocity ─────────────────────────────────────────
+  /**
+   * Compute funding velocity for a vault in the Funding state.
+   *
+   * Velocity = total deposits in the last 7 days ÷ 7 (average per day).
+   * projectedFundingDate is estimated by:
+   *   remaining = fundingTarget − totalAssets
+   *   daysNeeded = remaining / velocityPerDay
+   *   projectedFundingDate = NOW + daysNeeded
+   *
+   * Returns null for non-funding vaults.
+   * Returns projectedFundingDate = null when velocity is zero.
+   */
+  async getFundingVelocity(contractId: string): Promise<{
+    fundingVelocityPerDay: number;
+    projectedFundingDate: string | null;
+  } | null> {
+    const vaultRows = await query<{
+      id: number;
+      state: string;
+      total_assets: string | null;
+      funding_target: string | null;
+    }>(
+      `SELECT id, state, total_assets, funding_target
+       FROM vaults WHERE contract_id = $1 LIMIT 1`,
+      [contractId],
+    );
+
+    if (vaultRows.length === 0) return null;
+    const vault = vaultRows[0];
+    if (vault.state !== "Funding") return null;
+
+    // Sum deposits over the trailing 7 days
+    const depositRows = await query<{ total_deposited: string }>(
+      `SELECT COALESCE(
+         SUM((payload #>> '{value,vec,0,i128,lo}')::numeric), 0
+       )::text AS total_deposited
+       FROM indexed_events
+       WHERE contract_id = $1
+         AND event_type = 'deposit'
+         AND created_at >= NOW() - INTERVAL '7 days'`,
+      [contractId],
+    );
+
+    const totalDeposited = parseFloat(depositRows[0]?.total_deposited ?? "0");
+    const velocityPerDay = totalDeposited / 7;
+
+    let projectedFundingDate: string | null = null;
+    if (velocityPerDay > 0 && vault.funding_target !== null) {
+      const remaining = parseFloat(vault.funding_target) - parseFloat(vault.total_assets ?? "0");
+      if (remaining > 0) {
+        const daysNeeded = remaining / velocityPerDay;
+        const projectedMs = Date.now() + daysNeeded * 24 * 60 * 60 * 1000;
+        projectedFundingDate = new Date(projectedMs).toISOString();
+      } else {
+        // Already at or past target
+        projectedFundingDate = new Date().toISOString();
+      }
+    }
+
+    return {
+      fundingVelocityPerDay: Math.round(velocityPerDay * 100) / 100,
+      projectedFundingDate,
+    };
+  }
+
+  // ── Issue #1269: Redemption queue ETA ─────────────────────────────────────
+  /**
+   * Estimate the processing wait time for a specific address in the
+   * early-redemption queue.
+   *
+   * Position is based on request_time ASC (FIFO).  Throughput is computed as
+   * the number of requests processed (processed = TRUE) divided by the span
+   * between the oldest and newest processed_at timestamps.  Returns null for
+   * the estimate when fewer than 5 requests have been processed (insufficient
+   * history).
+   */
+  async getRedemptionQueueEta(
+    contractId: string,
+    userAddress: string,
+  ): Promise<{
+    position: number;
+    amountAhead: string;
+    estimatedProcessingDate: string | null;
+  } | null> {
+    // Verify vault exists
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1 LIMIT 1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) return null;
+    const vaultId = vaultRows[0].id;
+
+    // Find the user's earliest unprocessed request
+    const userRows = await query<{ request_time: Date; shares: string }>(
+      `SELECT request_time, shares
+       FROM redemption_requests
+       WHERE vault_id = $1 AND user_address = $2 AND processed = FALSE
+       ORDER BY request_time ASC
+       LIMIT 1`,
+      [vaultId, userAddress],
+    );
+
+    if (userRows.length === 0) return null;
+    const userRequestTime = userRows[0].request_time;
+
+    // Count requests ahead (submitted strictly before the user's earliest request)
+    const aheadRows = await query<{ position: string; amount_ahead: string }>(
+      `SELECT
+         COUNT(*)::text AS position,
+         COALESCE(SUM(shares), 0)::text AS amount_ahead
+       FROM redemption_requests
+       WHERE vault_id = $1
+         AND processed = FALSE
+         AND request_time < $2`,
+      [vaultId, userRequestTime],
+    );
+
+    const position = parseInt(aheadRows[0]?.position ?? "0", 10) + 1;
+    const amountAhead = aheadRows[0]?.amount_ahead ?? "0";
+
+    // Compute throughput from processed requests using processed_at
+    const throughputRows = await query<{
+      processed_count: string;
+      span_seconds: string | null;
+    }>(
+      `SELECT
+         COUNT(*)::text AS processed_count,
+         EXTRACT(EPOCH FROM (MAX(processed_at) - MIN(processed_at)))::text AS span_seconds
+       FROM redemption_requests
+       WHERE vault_id = $1 AND processed = TRUE AND processed_at IS NOT NULL`,
+      [vaultId],
+    );
+
+    const processedCount = parseInt(throughputRows[0]?.processed_count ?? "0", 10);
+    const spanSeconds = parseFloat(throughputRows[0]?.span_seconds ?? "0");
+
+    let estimatedProcessingDate: string | null = null;
+
+    if (processedCount >= 5 && spanSeconds > 0) {
+      // Requests per second throughput
+      const throughputPerSecond = processedCount / spanSeconds;
+      const secondsUntilProcessed = position / throughputPerSecond;
+      const estimatedMs = Date.now() + secondsUntilProcessed * 1000;
+      estimatedProcessingDate = new Date(estimatedMs).toISOString();
+    }
+    // < 5 processed → estimatedProcessingDate stays null
+
+    return { position, amountAhead, estimatedProcessingDate };
   }
 }
