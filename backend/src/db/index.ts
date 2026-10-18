@@ -19,6 +19,50 @@ export const pool = new Pool({
   query_timeout: config.db.queryTimeoutMs,
 });
 
+// ── Reconnect state (#1255) ───────────────────────────────────────────────────
+// When the database connection is lost (restart, network partition), the pool
+// emits 'error'. We retry `SELECT 1` with exponential backoff (max 30 s) until
+// the connection is restored. `dbStatus` is read by /health to report
+// "reconnecting" so operators can see the transient state.
+let dbStatus: "connected" | "reconnecting" = "connected";
+
+export function getDbStatus(): "connected" | "reconnecting" {
+  return dbStatus;
+}
+
+const MAX_BACKOFF_MS = 30_000;
+let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+
+function scheduleReconnect(): void {
+  if (reconnectTimer) return; // already scheduled
+  let attempt = 0;
+  const tryReconnect = async (): Promise<void> => {
+    attempt += 1;
+    try {
+      const client = await pool.connect();
+      await client.query("SELECT 1");
+      client.release();
+      dbStatus = "connected";
+      reconnectTimer = undefined;
+      logger.info({ attempts: attempt }, "Database reconnected");
+    } catch {
+      const backoff = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** attempt);
+      logger.warn({ attempt, backoffMs: backoff }, "Database reconnect failed; retrying");
+      reconnectTimer = setTimeout(tryReconnect, backoff);
+    }
+  };
+  dbStatus = "reconnecting";
+  reconnectTimer = setTimeout(tryReconnect, 1000);
+}
+
+// Emit a reconnect attempt whenever the pool loses a connection unexpectedly.
+pool.on("error", (err: Error) => {
+  logger.error({ err }, "Database pool error");
+  if (dbStatus !== "reconnecting") {
+    scheduleReconnect();
+  }
+});
+
 // Read-replica pool (#949). When DATABASE_READ_URL is set, read-only queries
 // issued from GET request handlers are routed here to keep write-heavy admin
 // and analytics traffic off the primary's connection pool. When it is unset,
@@ -32,6 +76,12 @@ export const readPool: pg.Pool = config.db.readUrl
       query_timeout: config.db.queryTimeoutMs,
     })
   : pool;
+
+if (config.db.readUrl && readPool !== pool) {
+  readPool.on("error", (err: Error) => {
+    logger.error({ err }, "Read replica pool error");
+  });
+}
 
 function setupPoolMetrics(p: pg.Pool, isRead: boolean): void {
   import("../services/metrics.js")
