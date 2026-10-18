@@ -42,6 +42,10 @@ import {
   streamVaultEvents,
   getVaultsBulkStatus,
   validateVaultMetadata,
+  getMaturityCountdown,
+  getRedemptionStats,
+  getRedemptionCancellationRate,
+  getHolderRetention,
 } from "../controllers/vaults.js";
 import {
   translateSimulationError,
@@ -350,4 +354,13 @@ vaultsRouter.get("/:contractId/similar", validateParams(vaultParamsSchema), getS
 vaultsRouter.get("/:contractId/transfer-fees", validateParams(vaultParamsSchema), getVaultTransferFees);
 // Transfer leaderboard: GET /api/v1/vaults/:contractId/transfer-leaderboard?limit=10 (#1075)
 vaultsRouter.get("/:contractId/transfer-leaderboard", validateParams(vaultParamsSchema), getVaultTransferLeaderboard);
+// Maturity countdown: GET /api/v1/vaults/:contractId/maturity-countdown (#1273)
+vaultsRouter.get("/:contractId/maturity-countdown", validateParams(vaultParamsSchema), getMaturityCountdown);
+// Redemption processing latency stats: GET /api/v1/vaults/:contractId/redemption-stats (#1271)
+vaultsRouter.get("/:contractId/redemption-stats", validateParams(vaultParamsSchema), getRedemptionStats);
+// Redemption cancellation rate: GET /api/v1/vaults/:contractId/redemption-stats/cancellation (#1272)
+vaultsRouter.get("/:contractId/redemption-stats/cancellation", validateParams(vaultParamsSchema), getRedemptionCancellationRate);
+// Holder retention across epochs: GET /api/v1/vaults/:contractId/retention?epochs=5 (#1263)
+const retentionQuerySchema = z.object({ epochs: z.coerce.number().int().min(1).max(100).default(5) });
+vaultsRouter.get("/:contractId/retention", validateParams(vaultParamsSchema), validateQuery(retentionQuerySchema), getHolderRetention);
 

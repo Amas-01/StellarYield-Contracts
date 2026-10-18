@@ -1893,3 +1893,177 @@ export async function getVaultTransferLeaderboard(
     next(err);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1273 — Add maturity countdown fields
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute `secondsToMaturity` and `maturityStatus` from a maturity date.
+ *
+ * Rules:
+ *   - null maturityDate → both fields are null
+ *   - past maturity     → secondsToMaturity = 0, status = "matured"
+ *   - within 24 h       → secondsToMaturity = remaining seconds, status = "due"
+ *   - further away      → secondsToMaturity = remaining seconds, status = "upcoming"
+ */
+function computeMaturityCountdown(maturityDate: Date | null | undefined): {
+  secondsToMaturity: number | null;
+  maturityStatus: "upcoming" | "due" | "matured" | null;
+} {
+  if (!maturityDate) return { secondsToMaturity: null, maturityStatus: null };
+
+  const nowMs = Date.now();
+  const matMs = new Date(maturityDate).getTime();
+  const diffMs = matMs - nowMs;
+
+  if (diffMs <= 0) return { secondsToMaturity: 0, maturityStatus: "matured" };
+
+  const seconds = Math.floor(diffMs / 1000);
+  const status = diffMs <= 24 * 60 * 60 * 1000 ? "due" : "upcoming";
+  return { secondsToMaturity: seconds, maturityStatus: status };
+}
+
+/**
+ * GET /api/v1/vaults/:contractId/maturity-countdown
+ *
+ * Returns `secondsToMaturity` and `maturityStatus` derived from the vault's
+ * `maturity_date`.  Closes #1273.
+ *
+ * Response shape:
+ *   { secondsToMaturity: number | null, maturityStatus: "upcoming"|"due"|"matured"|null }
+ */
+export async function getMaturityCountdown(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const contractId = String(req.params["contractId"]);
+    const rows = await query<{ maturity_date: Date | null }>(
+      `SELECT maturity_date FROM vaults WHERE contract_id = $1`,
+      [contractId],
+    );
+
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    const countdown = computeMaturityCountdown(rows[0].maturity_date);
+    setCacheHeaders(res);
+    res.json(countdown);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1271 — Add redemption processing latency stats
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/v1/vaults/:contractId/redemption-stats
+ *
+ * Returns processing latency statistics for all processed redemption requests:
+ *   { avgHours, medianHours, p95Hours, processedCount }
+ *
+ * Only requests with `processed = TRUE` and a non-null `processed_at` are
+ * included.  Empty history returns zero counts and null durations.  Closes #1271.
+ */
+export async function getRedemptionStats(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const contractId = String(req.params["contractId"]);
+
+    const vault = await vaultService.getVault(contractId);
+    if (!vault) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    const stats = await vaultService.getRedemptionStats(contractId);
+    setCacheHeaders(res);
+    res.json(stats);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1272 — Add redemption cancellation rate metric
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/v1/vaults/:contractId/redemption-stats/cancellation
+ *
+ * Returns `cancellationRate` (cancelled ÷ total requested), clamped to [0,1].
+ * Returns `null` when no requests exist.  Closes #1272.
+ *
+ * Response shape:
+ *   { cancellationRate: number | null, cancelledCount: number, totalRequested: number }
+ */
+export async function getRedemptionCancellationRate(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const contractId = String(req.params["contractId"]);
+
+    const vault = await vaultService.getVault(contractId);
+    if (!vault) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    const data = await vaultService.getRedemptionCancellationRate(contractId);
+    setCacheHeaders(res);
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1263 — Add holder retention across epochs
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /api/v1/vaults/:contractId/retention?epochs=5
+ *
+ * Returns per-epoch holder retention using `share_balance_snapshots`.
+ * For each epoch: { epochId, holders, retainedNextEpoch, retentionRate }.
+ * `retentionRate` is null for the latest epoch (no next epoch to compare).
+ * Holders with zero balance at epoch N are excluded.  Closes #1263.
+ */
+export async function getHolderRetention(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const contractId = String(req.params["contractId"]);
+
+    const epochsParam = req.query["epochs"];
+    const epochCount = Math.min(
+      100,
+      Math.max(1, parseInt(String(epochsParam ?? "5"), 10) || 5),
+    );
+
+    const vault = await vaultService.getVault(contractId);
+    if (!vault) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    const data = await vaultService.getHolderRetention(contractId, epochCount);
+    setCacheHeaders(res);
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+}
