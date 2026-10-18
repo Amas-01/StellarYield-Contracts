@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { once } from "node:events";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { Request, Response, NextFunction } from "express";
 import Cursor from "pg-cursor";
 import { stringify } from "csv-stringify";
@@ -1623,6 +1625,134 @@ export async function vacuumDatabase(req: Request, res: Response, next: NextFunc
     await logAdminAudit(req, "vacuum_database", "/api/v1/admin/db/vacuum");
 
     res.json({ ok: true, tables: targetTables, analyze, command });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export const MAX_EVENT_REPROCESS_BATCH_SIZE = 100;
+
+export async function reprocessEventBatch(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = z.object({
+      eventIds: z.array(z.number().int().positive()).min(1, "eventIds must not be empty").max(MAX_EVENT_REPROCESS_BATCH_SIZE, `eventIds cannot exceed ${MAX_EVENT_REPROCESS_BATCH_SIZE}`),
+    }).safeParse(req.body);
+
+    if (!parsed.success) {
+      res.status(400).json({ error: "ValidationError", issues: parsed.error.issues });
+      return;
+    }
+
+    const { eventIds } = parsed.data;
+    const rows = await query<{ id: number; contract_id: string; event_type: string; ledger: number; payload: Record<string, unknown> }>(
+      `SELECT id, contract_id, event_type, ledger, payload FROM indexed_events WHERE id = ANY($1) ORDER BY id ASC`,
+      [eventIds],
+    );
+
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const processedCount = { value: 0 };
+    const skippedCount = { value: 0 };
+
+    await Promise.all(eventIds.map(async (eventId) => {
+      const row = byId.get(eventId);
+      if (!row) {
+        throw new Error(`Invalid event ID: ${eventId}`);
+      }
+
+      const contractId = row.contract_id;
+      const eventType = row.event_type;
+      const ledgerSeq = row.ledger;
+      const idempotencyKey = createHash("sha256")
+        .update(contractId + eventType + String(ledgerSeq))
+        .digest("hex");
+
+      const existing = await query<{ id: number }>(
+        `SELECT id FROM indexed_events WHERE contract_id = $1 AND event_type = $2 AND ledger = $3 AND id = $4 LIMIT 1`,
+        [contractId, eventType, ledgerSeq, eventId],
+      );
+      if (existing.length === 0) {
+        skippedCount.value += 1;
+        return;
+      }
+
+      if (eventType === "yield_claimed" || eventType === "yield_claimed_partial") {
+        const user = String((row.payload as Record<string, unknown>)?.user ?? "");
+        const amount = row.payload && typeof row.payload === "object" && "amount" in row.payload
+          ? String((row.payload as Record<string, unknown>).amount ?? "0")
+          : String((row.payload as Record<string, unknown>).claimed ?? "0");
+
+        await query(
+          `UPDATE share_balance_snapshots
+           SET cumulative_yield_claimed = cumulative_yield_claimed + $1,
+               recorded_at = NOW()
+           WHERE user_address = $2 AND vault_id = (
+             SELECT v.id FROM vaults v WHERE v.contract_id = $3
+           )`,
+          [amount, user, contractId],
+        );
+      }
+
+      processedCount.value += 1;
+    }));
+
+    const auditInsert = await query<{ id: number }>(
+      `INSERT INTO admin_audit_log (api_key_label, action, target, ip_address, request_body_hash, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       RETURNING id`,
+      [req.apiKey?.label ?? null, "EVENT_REPROCESS", "/api/v1/admin/events/reprocess-batch", getClientIp(req), getRequestBodyHash(req.body)],
+    );
+
+    res.json({
+      processedCount: processedCount.value,
+      skippedCount: skippedCount.value,
+      auditLogId: auditInsert[0]?.id ?? null,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getApiDiff(req: Request, res: Response, next: NextFunction) {
+  try {
+    const { from, to } = req.query as { from?: string; to?: string };
+
+    if (!from || !to) {
+      res.status(400).json({
+        error: "BadRequest",
+        message: "Both 'from' and 'to' query parameters are required",
+      });
+      return;
+    }
+
+    if ((from !== "v1" && from !== "v2") || (to !== "v1" && to !== "v2")) {
+      res.status(400).json({
+        error: "BadRequest",
+        message: "Invalid version. Only 'v1' and 'v2' are supported",
+      });
+      return;
+    }
+
+    const openApiDir = resolve(process.cwd(), "src/openapi");
+    const readSpec = (version: string) => JSON.parse(
+      readFileSync(resolve(openApiDir, `${version}.json`), "utf8"),
+    );
+
+    const fromSpec = readSpec(from);
+    const toSpec = readSpec(to);
+    const fromPaths = fromSpec.paths ?? {};
+    const toPaths = toSpec.paths ?? {};
+
+    const added = Object.keys(toPaths)
+      .filter((path) => !(path in fromPaths))
+      .sort();
+    const removed = Object.keys(fromPaths)
+      .filter((path) => !(path in toPaths))
+      .sort();
+    const modified = Object.keys(toPaths)
+      .filter((path) => path in fromPaths && JSON.stringify(fromPaths[path]) !== JSON.stringify(toPaths[path]))
+      .sort();
+
+    res.json({ from, to, added, removed, modified });
   } catch (err) {
     next(err);
   }

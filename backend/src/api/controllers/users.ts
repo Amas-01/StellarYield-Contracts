@@ -481,3 +481,58 @@ export async function streamUserPositions(req: Request, res: Response, next: Nex
     next(err);
   }
 }
+
+export async function getUserLifetimeYield(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  try {
+    const address = String(req.params["address"]);
+    const contractId = String(req.params["contractId"]);
+
+    const rows = await query<{
+      cumulative_yield_claimed: string;
+    }>(
+      `SELECT sbs.cumulative_yield_claimed
+       FROM share_balance_snapshots sbs
+       JOIN vaults v ON v.id = sbs.vault_id
+       WHERE sbs.user_address = $1 AND v.contract_id = $2
+       ORDER BY sbs.recorded_at DESC, sbs.epoch DESC
+       LIMIT 1`,
+      [address, contractId],
+    );
+
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "No yield history found for this user/vault pair" });
+      return;
+    }
+
+    const claimStats = await query<{
+      claim_count: string;
+      last_claimed_at: Date | null;
+    }>(
+      `SELECT COUNT(DISTINCT ie.payload->>'epoch')::text AS claim_count,
+              MAX(ie.created_at) AS last_claimed_at
+       FROM indexed_events ie
+       WHERE ie.contract_id = $1
+         AND ie.event_type IN ('yield_claimed', 'yield_claimed_partial')
+         AND (ie.payload->>'user' = $2 OR ie.payload->>'address' = $2)`,
+      [contractId, address],
+    );
+
+    const cumulativeYield = rows[0].cumulative_yield_claimed ?? "0";
+    const claimCount = parseInt(claimStats[0]?.claim_count ?? "0", 10);
+    const averagePerClaim = claimCount > 0 ? (BigInt(cumulativeYield) / BigInt(claimCount)).toString() : "0";
+    const lastClaimedAt = claimStats[0]?.last_claimed_at?.toISOString() ?? null;
+
+    res.json({
+      cumulativeYield,
+      claimCount,
+      averagePerClaim,
+      lastClaimedAt,
+    });
+  } catch (err) {
+    next(err);
+  }
+}

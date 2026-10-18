@@ -38,6 +38,8 @@ import {
   refreshAdminSession,
   getSecurityHeadersAudit,
   resetSandboxData,
+  reprocessEventBatch,
+  getApiDiff,
 } from "../controllers/admin.js";
 import { requireApiKey } from "../middleware/auth.js";
 import { ipAllowlist } from "../middleware/ipAllowlist.js";
@@ -109,4 +111,6 @@ adminRouter.get("/security/headers-audit", requireApiKey({ role: "admin" }), get
 adminRouter.post("/sandbox/reset", requireApiKey({ role: "admin" }), resetSandboxData);
 
 adminRouter.post("/db/vacuum", requireApiKey({ role: "admin" }), vacuumDatabase);
+adminRouter.post("/events/reprocess", requireApiKey({ role: "admin" }), reprocessEventBatch);
+adminRouter.post("/events/reprocess-batch", requireApiKey({ role: "admin" }), reprocessEventBatch);
 

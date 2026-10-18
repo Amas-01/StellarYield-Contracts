@@ -9,6 +9,7 @@ import {
   getUserIncomeForecast,
   getUserKyc,
   getUserKycHistory,
+  getUserLifetimeYield,
   getUserPortfolio,
   getUserPortfolioAllocation,
   getUserPortfolioDiversification,
@@ -202,4 +203,19 @@ usersRouter.get(
   "/:address/stream",
   validateParams(addressParamSchema),
   streamUserPositions,
+);
+usersRouter.get(
+  "/:address/lifetime-yield",
+  validateParams(addressParamSchema),
+  getUserLifetimeYield,
+);
+const userVaultLifetimeYieldParamsSchema = z.object({
+  address: stellarAddressSchema,
+  contractId: z.string().length(56).regex(/^C[A-Z2-7]{55}$/, "Invalid vault contract ID"),
+});
+
+usersRouter.get(
+  "/:address/vaults/:contractId/lifetime-yield",
+  validateParams(userVaultLifetimeYieldParamsSchema),
+  getUserLifetimeYield,
 );
