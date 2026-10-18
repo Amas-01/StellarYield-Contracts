@@ -468,6 +468,7 @@ interface VaultRow {
   logo_uri: string | null;
   created_at: Date;
   updated_at: Date;
+  settlement_status: string | null;
 }
 
 function computeFundingProgress(totalAssets: string, fundingTarget: string | null): number | null {
@@ -518,6 +519,7 @@ function mapVaultRow(row: VaultRow): Vault {
     logoUri: row.logo_uri ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    settlementStatus: (row.settlement_status as Vault["settlementStatus"]) ?? null,
   };
 }
 
@@ -646,6 +648,7 @@ export class VaultService {
                v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
                v.description, v.logo_uri,
+               v.settlement_status,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -664,6 +667,7 @@ export class VaultService {
                v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
                v.description, v.logo_uri,
+               v.settlement_status,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -817,6 +821,7 @@ export class VaultService {
               v.zkme_verifier_address,
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
               v.description, v.logo_uri,
+              v.settlement_status,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp

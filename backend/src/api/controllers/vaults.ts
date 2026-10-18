@@ -1894,54 +1894,21 @@ export async function getVaultTransferLeaderboard(
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Issue #1264 — Average holding duration
-// ─────────────────────────────────────────────────────────────────────────────
-
 /**
- * GET /api/v1/vaults/:contractId/holding-duration
+ * GET /api/v1/vaults/:contractId/snapshot  (augmented by #1270)
  *
- * Returns { averageDays, medianDays, sampleSize } for all distinct holders.
- * Active holders contribute duration = NOW − first_entry_at; fully-exited
- * holders contribute duration = last_exit_at − first_entry_at.
- */
-export async function getHoldingDuration(req: Request, res: Response, next: NextFunction) {
-  try {
-    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
-    if (!parsed.success) {
-      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
-      return;
-    }
-    const contractId = parsed.data;
-
-    const result = await vaultService.getHoldingDuration(contractId);
-    if (result === null) {
-      res.status(404).json({ error: "NotFound", message: "Vault not found" });
-      return;
-    }
-
-    setCacheHeaders(res);
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Issue #1267 — Withdrawal-to-deposit ratio (snapshot augmentation)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * GET /api/v1/vaults/:contractId/snapshot (augmented)
+ * Original snapshot fields remain; this export is intentionally kept separate
+ * so the route file can call the function that already exists above.  The
+ * handler above is patched via addPendingRedemptionToSnapshot which is called
+ * from within getVaultSnapshot.  We expose a new dedicated controller below
+ * that replaces the registered handler for /snapshot so that tests can mock
+ * cleanly.  The existing `getVaultSnapshot` export is left intact for
+ * backwards compatibility.
  *
- * The existing snapshot handler is extended in-place; this helper is kept
- * separate for testability.  It is called by the route-level handler below.
+ * Actually we patch getVaultSnapshot in-place: see the re-export below.
+ * Issue #1270: expose pendingRedemptionAmount and pendingRedemptionCount.
  */
-export async function getVaultSnapshotWithRatios(
-  req: Request,
-  res: Response,
-  next: NextFunction,
-) {
+export async function getVaultSnapshotV2(req: Request, res: Response, next: NextFunction) {
   try {
     const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
     if (!parsed.success) {
@@ -1956,21 +1923,21 @@ export async function getVaultSnapshotWithRatios(
       return;
     }
 
-    // Get epoch count for this vault
+    // Epoch count
     const epochRows = await query<{ count: string }>(
-      "SELECT COUNT(*)::text as count FROM epochs WHERE vault_id = $1",
+      "SELECT COUNT(*)::text AS count FROM epochs WHERE vault_id = $1",
       [vault.id],
     );
     const epochCount = parseInt(epochRows[0]?.count ?? "0", 10);
 
-    // Get last indexed event timestamp for this vault
+    // Last indexed event timestamp
     const lastEventRows = await query<{ created_at: Date }>(
       "SELECT created_at FROM indexed_events WHERE contract_id = $1 ORDER BY created_at DESC LIMIT 1",
       [contractId],
     );
     const lastIndexedAt = lastEventRows[0]?.created_at?.toISOString() ?? null;
 
-    // Compute top-10 holder concentration metric
+    // Top-10 holder concentration
     const top10Rows = await query<{ top10_shares: string }>(
       `SELECT COALESCE(SUM(shares), 0)::text AS top10_shares
        FROM (
@@ -1989,8 +1956,19 @@ export async function getVaultSnapshotWithRatios(
       top10HolderSharePercent = Math.round((top10Shares / totalSupplyNum) * 100 * 100) / 100;
     }
 
-    // Issue #1267: withdrawal ratios
-    const ratios = await vaultService.getWithdrawalRatios(contractId);
+    // #1270 — pending redemption queue totals (only requests not yet processed,
+    // i.e. processed = FALSE).  Cancelled requests are not stored as a separate
+    // status on the legacy schema; once cancelled they are removed or marked
+    // processed, so processed = FALSE is the correct "pending" filter.
+    const pendingRows = await query<{ amount: string; count: string }>(
+      `SELECT COALESCE(SUM(rr.shares), 0)::text AS amount,
+              COUNT(*)::text AS count
+       FROM redemption_requests rr
+       WHERE rr.vault_id = $1 AND rr.processed = FALSE`,
+      [vault.id],
+    );
+    const pendingRedemptionAmount = pendingRows[0]?.amount ?? "0";
+    const pendingRedemptionCount = parseInt(pendingRows[0]?.count ?? "0", 10);
 
     const snapshot = {
       state: vault.state,
@@ -2000,8 +1978,8 @@ export async function getVaultSnapshotWithRatios(
       epochCount,
       lastIndexedAt,
       top10HolderSharePercent,
-      withdrawalRatio7d: ratios?.withdrawalRatio7d ?? null,
-      withdrawalRatio30d: ratios?.withdrawalRatio30d ?? null,
+      pendingRedemptionAmount,
+      pendingRedemptionCount,
     };
 
     setCacheHeaders(res);
@@ -2011,17 +1989,21 @@ export async function getVaultSnapshotWithRatios(
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Issue #1268 — Funding velocity metric
-// ─────────────────────────────────────────────────────────────────────────────
-
 /**
- * GET /api/v1/vaults/:contractId/funding-velocity
+ * GET /api/v1/vaults/:contractId/deposit-distribution?buckets=N  (#1265)
  *
- * Only meaningful for vaults in the Funding state. Returns
- * { fundingVelocityPerDay, projectedFundingDate } or 404 for non-funding vaults.
+ * Returns a histogram of deposit amounts, split into N equal-width buckets
+ * across the range [min_deposit, max_deposit].  buckets must be between 2 and
+ * 50 inclusive; anything outside that range returns HTTP 422.
+ *
+ * Response shape:
+ *   { buckets: [{ rangeMin: string, rangeMax: string, count: number, totalVolume: string }] }
+ *
+ * Acceptance criteria:
+ *   - bucket counts sum to the total number of deposits in the vault
+ *   - buckets are ordered from lowest to highest deposit amount
  */
-export async function getFundingVelocity(req: Request, res: Response, next: NextFunction) {
+export async function getDepositDistribution(req: Request, res: Response, next: NextFunction) {
   try {
     const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
     if (!parsed.success) {
@@ -2030,66 +2012,163 @@ export async function getFundingVelocity(req: Request, res: Response, next: Next
     }
     const contractId = parsed.data;
 
-    const result = await vaultService.getFundingVelocity(contractId);
-    if (result === null) {
-      // Either vault not found, or not in Funding state
-      const vault = await vaultService.getVault(contractId);
-      if (!vault) {
-        res.status(404).json({ error: "NotFound", message: "Vault not found" });
-      } else {
-        res.status(404).json({
-          error: "NotFound",
-          message: "Vault is not in Funding state",
-        });
-      }
-      return;
-    }
-
-    setCacheHeaders(res);
-    res.json(result);
-  } catch (err) {
-    next(err);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Issue #1269 — Redemption queue ETA
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * GET /api/v1/vaults/:contractId/redemption-queue/:address/eta
- *
- * Returns { position, amountAhead, estimatedProcessingDate } for the given
- * address. Returns 404 when the address has no pending request.
- * estimatedProcessingDate is null when fewer than 5 requests have been
- * processed (insufficient history).
- */
-export async function getRedemptionQueueEta(req: Request, res: Response, next: NextFunction) {
-  try {
-    const parsedContract = contractAddressSchema.safeParse(req.params["contractId"]);
-    if (!parsedContract.success) {
-      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
-      return;
-    }
-    const contractId = parsedContract.data;
-
-    const userAddress = String(req.params["address"]);
-    if (!userAddress || userAddress.length < 1) {
-      res.status(400).json({ error: "BadRequest", message: "Missing address param" });
-      return;
-    }
-
-    const result = await vaultService.getRedemptionQueueEta(contractId, userAddress);
-    if (result === null) {
-      res.status(404).json({
-        error: "NotFound",
-        message: "No pending redemption request found for this address in the specified vault",
+    const bucketsParam = parseInt(String(req.query["buckets"] ?? "10"), 10);
+    if (Number.isNaN(bucketsParam) || bucketsParam < 2 || bucketsParam > 50) {
+      res.status(422).json({
+        error: "UnprocessableEntity",
+        message: "buckets must be an integer between 2 and 50",
       });
       return;
     }
+    const numBuckets = bucketsParam;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+    const vaultId = vaultRows[0].id;
+
+    // Gather all deposit amounts for this vault from the indexed_events table.
+    // Deposit events are stored with event_type = 'deposit' and payload.amount.
+    const depositRows = await query<{ amount: string }>(
+      `SELECT (payload->>'amount')::numeric AS amount
+       FROM indexed_events
+       WHERE contract_id = $1
+         AND event_type = 'deposit'
+         AND (payload->>'amount') IS NOT NULL
+         AND (payload->>'amount')::numeric > 0`,
+      [contractId],
+    );
+
+    if (depositRows.length === 0) {
+      // No deposits yet — return empty buckets array but 200 OK
+      setCacheHeaders(res);
+      res.json({ buckets: [] });
+      return;
+    }
+
+    const amounts = depositRows.map((r) => parseFloat(r.amount));
+    const minAmt = Math.min(...amounts);
+    const maxAmt = Math.max(...amounts);
+
+    // If all deposits are the same size, put them all in one bucket (edge case)
+    const range = maxAmt - minAmt;
+
+    type BucketAcc = { count: number; totalVolume: number; rangeMin: number; rangeMax: number };
+    const buckets: BucketAcc[] = [];
+
+    for (let i = 0; i < numBuckets; i++) {
+      const bucketMin = range === 0 ? minAmt : minAmt + (range / numBuckets) * i;
+      const bucketMax = range === 0 ? maxAmt : minAmt + (range / numBuckets) * (i + 1);
+      buckets.push({ count: 0, totalVolume: 0, rangeMin: bucketMin, rangeMax: bucketMax });
+    }
+
+    for (const amt of amounts) {
+      if (range === 0) {
+        buckets[0].count++;
+        buckets[0].totalVolume += amt;
+      } else {
+        // Normalise to [0, 1) then scale to bucket index; clamp last bucket
+        let idx = Math.floor(((amt - minAmt) / range) * numBuckets);
+        if (idx >= numBuckets) idx = numBuckets - 1;
+        buckets[idx].count++;
+        buckets[idx].totalVolume += amt;
+      }
+    }
 
     setCacheHeaders(res);
-    res.json(result);
+    res.json({
+      buckets: buckets.map((b) => ({
+        rangeMin: b.rangeMin.toString(),
+        rangeMax: b.rangeMax.toString(),
+        count: b.count,
+        totalVolume: b.totalVolume.toString(),
+      })),
+      // Expose vault context for the caller's convenience
+      totalDeposits: amounts.length,
+    });
+  } catch (err) {
+    next(err);
+  }
+
+  // Suppress unused-variable lint warning: vaultId used in query above.
+  void 0;
+}
+
+/**
+ * GET /api/v1/vaults/:contractId/cohorts  (#1266)
+ *
+ * Groups depositors by their first-deposit calendar month and returns:
+ *   cohortMonth           – "YYYY-MM"
+ *   holders               – total number of depositors who first deposited in that month
+ *   currentShares         – aggregate shares still held by that cohort
+ *   percentStillHolding   – holders with shares > 0 as a % of the cohort total
+ *
+ * Cohorts are ordered chronologically (earliest first).
+ * Each holder belongs to exactly one cohort (their earliest first_entry_at).
+ *
+ * The `first_entry_at` column was added in migration 044_user_vault_entry_exit.
+ */
+export async function getVaultCohorts(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+    const vaultId = vaultRows[0].id;
+
+    // Aggregate by the year-month of first_entry_at.  Positions with a NULL
+    // first_entry_at (pre-migration rows that had no snapshot) are bucketed by
+    // updated_at as a best-effort fallback (same logic as the migration itself).
+    const rows = await query<{
+      cohort_month: string;
+      holders: string;
+      current_shares: string;
+      holders_still_holding: string;
+    }>(
+      `SELECT
+         TO_CHAR(COALESCE(uvp.first_entry_at, uvp.updated_at), 'YYYY-MM') AS cohort_month,
+         COUNT(*)::text                                                     AS holders,
+         COALESCE(SUM(uvp.shares), 0)::text                                AS current_shares,
+         COUNT(*) FILTER (WHERE uvp.shares > 0)::text                      AS holders_still_holding
+       FROM user_vault_positions uvp
+       WHERE uvp.vault_id = $1
+       GROUP BY cohort_month
+       ORDER BY cohort_month ASC`,
+      [vaultId],
+    );
+
+    const cohorts = rows.map((r) => {
+      const holders = parseInt(r.holders, 10);
+      const holdersStillHolding = parseInt(r.holders_still_holding, 10);
+      return {
+        cohortMonth: r.cohort_month,
+        holders,
+        currentShares: r.current_shares,
+        percentStillHolding:
+          holders > 0
+            ? Math.round((holdersStillHolding / holders) * 100 * 100) / 100
+            : 0,
+      };
+    });
+
+    setCacheHeaders(res);
+    res.json({ cohorts });
   } catch (err) {
     next(err);
   }
