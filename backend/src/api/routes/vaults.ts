@@ -167,7 +167,11 @@ const vaultHoldersQuerySchema = z.object({
 });
 
 const searchVaultsQuerySchema = z.object({
-  q: z.string().optional(),
+  q: z
+    .string()
+    .max(200, "Search query must be at most 200 characters")
+    .regex(/^[^\x00-\x1f\x7f]*$/, "Search query must not contain control characters")
+    .optional(),
   category: z.string().optional(),
   state: z.string().optional(),
   sort: z.enum(["created_at", "total_assets"]).default("created_at"),
