@@ -393,6 +393,8 @@ interface ListVaultsOptions {
   filter?: FilterTree;
   /** Sparse fieldset — camelCase field names to include (#860). */
   fields?: string[];
+  /** Limit the list to these contract IDs, for a key scoped to some vaults (#1243). */
+  contractIds?: string[];
 }
 
 /** Row-selection filters shared by the vault list query and its COUNT companion. */
@@ -403,6 +405,8 @@ interface VaultListFilters {
   createdTo?: string;
   minTotalAssets?: string;
   maxTotalAssets?: string;
+  /** Restrict to these contract IDs; an empty array matches nothing (#1243). */
+  contractIds?: string[];
 }
 
 /**
@@ -438,6 +442,12 @@ function buildVaultListFilters(
   // values beyond Number.MAX_SAFE_INTEGER keep full precision.
   if (filters.minTotalAssets) add((p) => `v.total_assets >= ${p}::numeric`, filters.minTotalAssets);
   if (filters.maxTotalAssets) add((p) => `v.total_assets <= ${p}::numeric`, filters.maxTotalAssets);
+
+  // Per-key vault scope (#1243). Checked by `!== undefined` so an empty list
+  // still adds a condition and matches no rows.
+  if (filters.contractIds !== undefined) {
+    add((p) => `v.contract_id = ANY(${p}::text[])`, filters.contractIds);
+  }
 
   return { conditions, params, nextIdx: idx };
 }
@@ -601,6 +611,7 @@ export class VaultService {
       createdTo: opts.createdTo,
       minTotalAssets: opts.minTotalAssets,
       maxTotalAssets: opts.maxTotalAssets,
+      contractIds: opts.contractIds,
     };
     const filtered = buildVaultListFilters(filters);
     const conditions = filtered.conditions;

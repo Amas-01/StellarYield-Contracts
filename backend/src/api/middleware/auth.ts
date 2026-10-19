@@ -17,6 +17,8 @@ interface ApiKey {
   allowedMethods: string[] | null;
   rateLimitOverride?: number | null;
   allowedCidrs: string[] | null;
+  /** Vault contract IDs the key may access; NULL means every vault (#1243). */
+  allowedContractIds?: string[] | null;
 }
 
 interface AdminSessionClaims extends JwtPayload {
@@ -65,16 +67,67 @@ function isIpAllowedByCidrs(ip: string, allowedCidrs: string[] | null): boolean 
   return allowedCidrs.some((cidr) => ipMatchesCidr(ip, cidr));
 }
 
-async function lookupApiKeyCidrsById(keyId: number): Promise<string[] | null> {
-  try {
-    const rows = await query<{ allowed_cidrs: string[] | null }>(
-      "SELECT allowed_cidrs FROM api_keys WHERE id = $1",
-      [keyId],
-    );
-    return rows[0]?.allowed_cidrs ?? null;
-  } catch {
-    return null;
-  }
+/**
+ * Keys expiring within this many days get an `X-API-Key-Expires-In` header on
+ * every authenticated response, so clients can rotate before an outage (#1244).
+ */
+const KEY_EXPIRY_WARNING_DAYS = 14;
+const API_KEY_EXPIRES_IN_HEADER = "X-API-Key-Expires-In";
+const CONTRACT_NOT_ALLOWED_MESSAGE = "API key is not permitted to access this vault";
+
+interface ApiKeyScope {
+  allowedCidrs: string[] | null;
+  allowedContractIds: string[] | null;
+  expiresAt: Date | null;
+}
+
+/**
+ * Load the restrictions of a key that was authenticated through an admin
+ * session token, since the JWT itself does not carry them. Returns null when
+ * the key row no longer exists. A database error is not caught here: it
+ * propagates, so a scoped key cannot slip past its restrictions during an
+ * outage.
+ */
+async function lookupApiKeyScopeById(keyId: number): Promise<ApiKeyScope | null> {
+  const rows = await query<{
+    allowed_cidrs: string[] | null;
+    allowed_contract_ids: string[] | null;
+    expires_at: Date | null;
+  }>(
+    "SELECT allowed_cidrs, allowed_contract_ids, expires_at FROM api_keys WHERE id = $1",
+    [keyId],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    allowedCidrs: row.allowed_cidrs ?? null,
+    allowedContractIds: row.allowed_contract_ids ?? null,
+    expiresAt: row.expires_at ?? null,
+  };
+}
+
+/**
+ * Per-key vault scope (#1243): a NULL list means every vault is allowed, while
+ * an array (including an empty one) limits the key to exactly those contracts.
+ */
+export function isContractAllowedForKey(
+  apiKey: Pick<ApiKey, "allowedContractIds"> | undefined,
+  contractId: string,
+): boolean {
+  const allowed = apiKey?.allowedContractIds;
+  if (allowed === undefined || allowed === null) return true;
+  return allowed.includes(contractId);
+}
+
+/**
+ * Advertise an approaching key expiry (#1244). Keys with no expiry, or with an
+ * expiry beyond the warning window, get no header.
+ */
+function setKeyExpiryHeader(res: Response, expiresAt: Date | null): void {
+  if (!expiresAt) return;
+  const remainingMs = expiresAt.getTime() - Date.now();
+  if (remainingMs <= 0 || remainingMs > KEY_EXPIRY_WARNING_DAYS * 24 * 60 * 60 * 1000) return;
+  res.setHeader(API_KEY_EXPIRES_IN_HEADER, String(Math.floor(remainingMs / 1000)));
 }
 
 /**
@@ -122,8 +175,8 @@ async function lookupApiKeyByPlaintext(plaintext: string): Promise<ApiKey | null
   try {
     const rows = (await query<ApiKey>(
       `SELECT id, role, label, expires_at AS "expiresAt", last_used_at AS "lastUsedAt", active,
-              allowed_methods AS "allowedMethods", rate_limit_override AS "rateLimitOverride"
-              allowed_cidrs AS "allowedCidrs"
+              allowed_methods AS "allowedMethods", rate_limit_override AS "rateLimitOverride",
+              allowed_cidrs AS "allowedCidrs", allowed_contract_ids AS "allowedContractIds"
        FROM api_keys WHERE key_hash = $1`,
       [keyHash],
     )) ?? [];
@@ -286,9 +339,11 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
 
         // Per-key IP CIDR restriction (#928): look up the underlying key's
         // allowed_cidrs and reject if the request IP is not in the list.
+        // The same lookup carries the key's vault scope (#1243) and expiry
+        // (#1244), neither of which the session token holds.
         if (sessionApiKey.id > 0) {
-          const allowedCidrs = await lookupApiKeyCidrsById(sessionApiKey.id);
-          if (!isIpAllowedByCidrs(ip, allowedCidrs)) {
+          const scope = await lookupApiKeyScopeById(sessionApiKey.id);
+          if (!isIpAllowedByCidrs(ip, scope?.allowedCidrs ?? null)) {
             logger.info({
               event: "auth_attempt",
               success: false,
@@ -301,6 +356,25 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
             res.status(403).json({ error: "Forbidden", message: "IP not allowed by key CIDR restriction" });
             return;
           }
+
+          sessionApiKey.allowedContractIds = scope?.allowedContractIds ?? null;
+
+          const contractId = req.params?.["contractId"];
+          if (typeof contractId === "string" && !isContractAllowedForKey(sessionApiKey, contractId)) {
+            logger.info({
+              event: "auth_attempt",
+              success: false,
+              ip,
+              keyLabel: sessionApiKey.label,
+              path: req.path,
+              method: req.method,
+              reason: "contract_not_allowed",
+            });
+            res.status(403).json({ error: "Forbidden", message: CONTRACT_NOT_ALLOWED_MESSAGE });
+            return;
+          }
+
+          setKeyExpiryHeader(res, scope?.expiresAt ?? null);
         }
 
         logger.info({
@@ -447,6 +521,28 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
       return;
     }
 
+    // Per-key vault scope (#1243): a route that names a contract (e.g.
+    // /vaults/:contractId or /admin/vaults/:contractId/notes) must be on the
+    // key's list. Router-level guards run before params are bound, so they skip
+    // this check and the route-level guard enforces it.
+    const contractId = req.params?.["contractId"];
+    if (typeof contractId === "string" && !isContractAllowedForKey(apiKey, contractId)) {
+      await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "contract_not_allowed" } });
+      logger.info({
+        event: "auth_attempt",
+        success: false,
+        ip,
+        keyLabel: apiKey.label,
+        path: req.path,
+        method: req.method,
+        reason: "contract_not_allowed",
+      });
+      res.status(403).json({ error: "Forbidden", message: CONTRACT_NOT_ALLOWED_MESSAGE });
+      return;
+    }
+
+    setKeyExpiryHeader(res, apiKey.expiresAt);
+
     logger.info({
       event: "auth_attempt",
       success: true,
@@ -462,4 +558,53 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
     void recordApiKeyUsage(apiKey.id, req.path);
     next();
   };
+}
+
+/**
+ * Authenticate a key on routes that are otherwise public (#1243). Requests with
+ * no Bearer token pass through as anonymous, so existing clients are unaffected.
+ * A presented token must be valid, exactly as on an authenticated route, and is
+ * then available to the handler as `req.apiKey` for vault scoping.
+ */
+export function optionalApiKey() {
+  const authenticate = requireApiKey({ minRole: "readonly" });
+
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (req.apiKey || !req.headers.authorization?.startsWith("Bearer ")) {
+      next();
+      return;
+    }
+
+    // A response produced for a key may differ from the anonymous one, so it
+    // must never be stored by a shared cache.
+    res.setHeader("Cache-Control", "private, no-store");
+    authenticate(req, res, next).catch(next);
+  };
+}
+
+/**
+ * Router `param` handler that enforces the key's vault scope on any route that
+ * names a `:contractId` (#1243). Anonymous requests and unscoped keys pass.
+ */
+export function enforceApiKeyContractScope(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+  contractId: string,
+): void {
+  if (isContractAllowedForKey(req.apiKey, contractId)) {
+    next();
+    return;
+  }
+
+  logger.info({
+    event: "auth_attempt",
+    success: false,
+    ip: getClientIp(req),
+    keyLabel: req.apiKey?.label ?? null,
+    path: req.path,
+    method: req.method,
+    reason: "contract_not_allowed",
+  });
+  res.status(403).json({ error: "Forbidden", message: CONTRACT_NOT_ALLOWED_MESSAGE });
 }

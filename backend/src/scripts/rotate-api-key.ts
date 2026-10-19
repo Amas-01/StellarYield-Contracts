@@ -1,111 +1,159 @@
 import "dotenv/config";
 import { randomBytes, createHash } from "crypto";
-import { query, pool } from "../db/index.js";
+import { pool } from "../db/index.js";
 import { logger } from "../logger.js";
-import readline from "readline";
 
-interface ApiKey {
-  id: number;
-  key_hash: string;
-  role: string;
-  label: string;
-  expires_at: string | null;
-  created_at: string;
+/** How long the rotated-out key keeps working when --grace-days is not given (#1246). */
+const DEFAULT_GRACE_DAYS = 7;
+
+/** A label may hold at most this many usable keys at once, so a rotation can overlap (#1246). */
+const MAX_ACTIVE_KEYS_PER_LABEL = 2;
+
+interface RotationArgs {
+  label?: string;
+  graceDays: number;
 }
 
-function parseArgs(argv: string[]): { label?: string } {
+interface ActiveKeyRow {
+  id: number;
+  expires_at: Date | null;
+}
+
+function parseArgs(argv: string[]): RotationArgs {
   let label: string | undefined;
+  let graceDays = DEFAULT_GRACE_DAYS;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--label") {
       label = argv[++i];
+    } else if (arg === "--grace-days") {
+      const value = Number(argv[++i]);
+      if (!Number.isInteger(value) || value < 0) {
+        throw new Error("--grace-days must be a non-negative whole number of days");
+      }
+      graceDays = value;
     }
   }
 
-  return { label };
+  return { label, graceDays };
 }
 
-async function prompt(question: string): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+/**
+ * Rotate the newest active key for a label (#1246).
+ *
+ * A new key is created under the same label with the old key's role, expiry,
+ * description and scope, so a rotation never widens or drops restrictions. The
+ * old key is not deleted: its expiry is set `graceDays` from now, so clients
+ * that have not deployed the new key keep working until it lapses. The label
+ * may hold at most two usable keys, so a second rotation waits for the first
+ * grace period to end.
+ */
+async function rotateApiKey(label: string, graceDays: number): Promise<void> {
+  const client = await pool.connect();
 
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      resolve(answer.toLowerCase());
-    });
-  });
-}
-
-async function rotateApiKey(label: string): Promise<void> {
   try {
-    logger.info({ label }, "Starting API key rotation");
+    await client.query("BEGIN");
 
-    // Find existing key
-    const keys = await query<ApiKey>(
-      "SELECT * FROM api_keys WHERE label = $1",
-      [label]
+    // Serialise rotations for one label, so two concurrent runs cannot both
+    // pass the key-count check below.
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`api-key-label:${label}`]);
+
+    const { rows: activeKeys } = await client.query<ActiveKeyRow>(
+      `SELECT id, expires_at
+         FROM api_keys
+        WHERE label = $1
+          AND active
+          AND (expires_at IS NULL OR expires_at > NOW())
+        ORDER BY created_at DESC, id DESC
+        FOR UPDATE`,
+      [label],
     );
 
-    if (keys.length === 0) {
-      logger.error({ label }, "API key not found");
-      await pool.end();
-      process.exit(1);
+    if (activeKeys.length === 0) {
+      throw new Error(`No active API key with label "${label}"`);
+    }
+    if (activeKeys.length >= MAX_ACTIVE_KEYS_PER_LABEL) {
+      throw new Error(
+        `Label "${label}" already has ${activeKeys.length} active keys. ` +
+          "Wait for the grace period to end, or delete one, before rotating again.",
+      );
     }
 
-    const oldKey = keys[0];
-    const role = oldKey.role;
-
-    logger.info({ label, role, keyId: oldKey.id }, "Found existing API key");
-
-    // Generate new key
+    const oldKey = activeKeys[0];
     const plaintext = randomBytes(32).toString("hex");
     const keyHash = createHash("sha256").update(plaintext).digest("hex");
-    const newLabel = `${label}-rotated-${Date.now()}`;
-    const expiresAt = oldKey.expires_at;
 
-    // Insert new key
-    await query(
-      "INSERT INTO api_keys (key_hash, role, label, expires_at) VALUES ($1, $2, $3, $4)",
-      [keyHash, role, newLabel, expiresAt]
+    const { rows: insertedRows } = await client.query<{ id: number; role: string }>(
+      `INSERT INTO api_keys (key_hash, role, label, expires_at, description,
+                             allowed_methods, allowed_cidrs, allowed_contract_ids, rate_limit_override)
+       SELECT $1, role, label, expires_at, description,
+              allowed_methods, allowed_cidrs, allowed_contract_ids, rate_limit_override
+         FROM api_keys
+        WHERE id = $2
+       RETURNING id, role`,
+      [keyHash, oldKey.id],
     );
+    const newKey = insertedRows[0];
 
-    logger.info({ label: newLabel }, "New API key generated");
+    // LEAST keeps an expiry that was already sooner than the grace period.
+    const { rows: updatedRows } = await client.query<{ expires_at: Date }>(
+      `UPDATE api_keys
+          SET expires_at = LEAST(COALESCE(expires_at, 'infinity'::timestamptz),
+                                 NOW() + make_interval(days => $2::int))
+        WHERE id = $1
+        RETURNING expires_at`,
+      [oldKey.id, graceDays],
+    );
+    const oldKeyExpiresAt = updatedRows[0].expires_at;
+
+    await client.query("COMMIT");
+
+    logger.info(
+      { label, keyId: newKey.id, oldKeyId: oldKey.id, graceDays, oldKeyExpiresAt },
+      "API key rotated",
+    );
     console.log(`\nNew API Key (save this - it won't be shown again):`);
     console.log(plaintext);
-    console.log(`\nLabel: ${newLabel}`);
-    console.log(`Role: ${role}\n`);
+    console.log(`\nLabel: ${label}`);
+    console.log(`Role: ${newKey.role}`);
+    console.log(
+      `Old key ${oldKey.id} keeps working until ${oldKeyExpiresAt.toISOString()} ` +
+        `(grace period: ${graceDays} days). Deploy the new key before then.\n`,
+    );
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
-    // Prompt for deletion
-    const answer = await prompt("Delete old key? [y/N] ");
+async function main(): Promise<void> {
+  let label: string | undefined;
+  let graceDays: number;
+  try {
+    ({ label, graceDays } = parseArgs(process.argv.slice(2)));
+  } catch (err) {
+    console.error((err as Error).message);
+    process.exit(1);
+  }
 
-    if (answer === "y" || answer === "yes") {
-      await query("DELETE FROM api_keys WHERE id = $1", [oldKey.id]);
-      logger.info({ oldKeyId: oldKey.id }, "Old API key deleted");
-      console.log("Old key deleted successfully.\n");
-    } else {
-      logger.info({ oldKeyId: oldKey.id }, "Old key was not deleted");
-      console.log("Old key was not deleted. Please delete it manually if needed.\n");
-    }
+  if (!label) {
+    console.error("Usage: rotate-api-key --label <label> [--grace-days <days>]");
+    console.error("Example: rotate-api-key --label my-admin-key --grace-days 14");
+    process.exit(1);
+  }
 
-    logger.info({ label }, "API key rotation completed");
+  try {
+    await rotateApiKey(label, graceDays);
     await pool.end();
+    process.exit(0);
   } catch (err) {
     logger.error(err, "Failed to rotate API key");
+    await pool.end();
     process.exit(1);
   }
 }
 
-const args = parseArgs(process.argv.slice(2));
-
-if (!args.label) {
-  console.error("Usage: rotate-api-key --label <label>");
-  console.error("Example: rotate-api-key --label my-admin-key");
-  process.exit(1);
-}
-
-await rotateApiKey(args.label);
-process.exit(0);
+await main();
