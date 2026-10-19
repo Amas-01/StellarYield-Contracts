@@ -89,6 +89,17 @@ export async function updateJobQueuePendingMetrics(): Promise<void> {
   }
 }
 
+// Event loop lag (#1252): p50 and p99 over a sliding 60 s window. Observations
+// are fed by the sampler in services/eventLoopLag.ts.
+export const eventLoopLagSeconds = new client.Summary({
+  name: "nodejs_event_loop_lag_seconds",
+  help: "Event loop lag in seconds (p50 and p99 over a sliding window)",
+  percentiles: [0.5, 0.99],
+  maxAgeSeconds: 60,
+  ageBuckets: 6,
+  registers: [register],
+});
+
 export const nodejsHeapUsedBytes = new client.Gauge({
   name: "nodejs_heap_used_bytes",
   help: "Process heap memory used in bytes",

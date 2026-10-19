@@ -267,6 +267,20 @@ export const envSchema = z.object({
     .default("3")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(0)),
+  // Per-request ceiling; a handler still running past it gets a 503 (#1250).
+  // SSE streams are exempt.
+  REQUEST_TIMEOUT_MS: z
+    .string()
+    .default("30000")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(1)),
+  // Event loop p99 lag, in ms, above which non-essential requests are shed
+  // with a 503 (#1251).
+  LOAD_SHED_LAG_MS: z
+    .string()
+    .default("250")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(1)),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -413,6 +427,8 @@ export const config = {
     maxRetries: parsed.data.API_CLIENT_MAX_RETRIES,
   },
   deployId: parsed.data.DEPLOY_ID ?? null,
+  requestTimeoutMs: parsed.data.REQUEST_TIMEOUT_MS,
+  loadShedLagMs: parsed.data.LOAD_SHED_LAG_MS,
 } as const;
 
 export const ROUTE_CACHE_CONTROL: Record<string, number> = {
