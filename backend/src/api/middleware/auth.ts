@@ -75,6 +75,18 @@ const KEY_EXPIRY_WARNING_DAYS = 14;
 const API_KEY_EXPIRES_IN_HEADER = "X-API-Key-Expires-In";
 const CONTRACT_NOT_ALLOWED_MESSAGE = "API key is not permitted to access this vault";
 
+/**
+ * The one body returned for every credential failure: a key that never
+ * existed, was deactivated, or has expired (#1247). Callers cannot tell them
+ * apart, so the response does not reveal whether a key exists. The specific
+ * reason goes only to the security event log. Shared with the admin session
+ * login, which applies the same rule.
+ */
+export const INVALID_CREDENTIALS_RESPONSE = {
+  error: "Unauthorized",
+  message: "Invalid or expired API key",
+} as const;
+
 interface ApiKeyScope {
   allowedCidrs: string[] | null;
   allowedContractIds: string[] | null;
@@ -277,6 +289,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
       const sessionApiKey = verifyAdminSession(token);
       if (sessionApiKey) {
         if (sessionApiKey.expiresAt && sessionApiKey.expiresAt.getTime() <= Date.now()) {
+          await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: sessionApiKey.label, path: req.path, details: { reason: "expired" } });
           logger.info({
             event: "auth_attempt",
             success: false,
@@ -286,7 +299,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
             method: req.method,
             reason: "expired",
           });
-          res.status(401).json({ error: "Unauthorized", message: "JWT expired" });
+          res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
           return;
         }
 
@@ -393,6 +406,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
       }
     } catch (error) {
       if (error instanceof TokenExpiredError) {
+        await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, path: req.path, details: { reason: "expired" } });
         logger.info({
           event: "auth_attempt",
           success: false,
@@ -402,7 +416,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
           method: req.method,
           reason: "expired",
         });
-        res.status(401).json({ error: "Unauthorized", message: "JWT expired" });
+        res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
         return;
       }
     }
@@ -420,11 +434,12 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
         method: req.method,
         reason: "key_not_found",
       });
-      res.status(403).json({ error: "Forbidden", message: "Invalid API key" });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
     // Keys deactivated by the inactivity sweep are rejected outright (#934).
+    // Revoked keys get the same 401 as unknown ones (#1247).
     if (apiKey.active === false) {
       await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "deactivated" } });
       logger.info({
@@ -436,7 +451,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
         method: req.method,
         reason: "deactivated",
       });
-      res.status(403).json({ error: "Forbidden", message: "API key has been deactivated" });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
@@ -451,7 +466,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
         method: req.method,
         reason: "expired",
       });
-      res.status(401).json({ error: "Unauthorized", message: "API key has expired" });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
