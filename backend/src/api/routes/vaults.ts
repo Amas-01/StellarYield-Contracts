@@ -53,7 +53,7 @@ import {
   simulateMultiOperation,
 } from "../controllers/simulate.js";
 import { validateParams, validateQuery, validateBody } from "../middleware/validate.js";
-import { requireApiKey } from "../middleware/auth.js";
+import { requireApiKey, enforceApiKeyContractScope } from "../middleware/auth.js";
 import { simulateLimiter } from "../middleware/rateLimit.js";
 import { parseVaultSort } from "../../services/vault.js";
 
@@ -216,6 +216,9 @@ const tvlHistoryQuerySchema = z.object({
 });
 
 export const vaultsRouter = Router();
+// Vault scope for keys that carry an `allowed_contract_ids` list (#1243). Runs
+// for every route that names a contract, before its handler.
+vaultsRouter.param("contractId", enforceApiKeyContractScope);
 
 vaultsRouter.get("/categories", listCategories);
 vaultsRouter.get("/", validateQuery(listVaultsQuerySchema), listVaults);

@@ -14,6 +14,7 @@ import { indexer } from "../../services/indexerSingleton.js";
 import { KNOWN_EVENT_TYPES } from "../../services/indexerEventTypes.js";
 import { EpochAnomalyService } from "../../services/epochAnomaly.js";
 import { jobQueue } from "../../services/jobQueue.js";
+import { findApiKeysExpiringWithin, type ApiKeyListRow } from "../../services/apiKeyExpiryReminder.js";
 import { sseManager } from "../../services/sseManager.js";
 import { logger } from "../../logger.js";
 import { createAdminSessionToken, refreshAdminSessionToken } from "../middleware/auth.js";
@@ -580,25 +581,32 @@ export async function deleteApiKey(req: Request, res: Response, next: NextFuncti
   }
 }
 
-export async function getApiKeys(_req: Request, res: Response, next: NextFunction) {
+// Optional window for the expiring-keys listing (#1245). Bounded so a caller
+// cannot ask for an unbounded scan; the daily reminder uses 7 days.
+const expiringWithinDaysSchema = z.coerce.number().int().min(1).max(365);
+
+export async function getApiKeys(req: Request, res: Response, next: NextFunction) {
   try {
-    const rows = await query<{
-      id: number;
-      label: string | null;
-      role: string;
-      created_at: Date;
-      expires_at: Date | null;
-      last_used_at: Date | null;
-      active: boolean;
-      deactivated_at: Date | null;
-      allowed_methods: string[] | null;
-      allowed_cidrs: string[] | null;
-            description: string | null;
-    }>(
-            `SELECT id, label, role, description, created_at, expires_at, last_used_at, active, deactivated_at,
-              allowed_methods, allowed_cidrs
-       FROM api_keys ORDER BY created_at DESC`,
-    );
+    const rawWindow = req.query?.["expiringWithinDays"];
+
+    let rows: ApiKeyListRow[];
+    if (rawWindow === undefined) {
+      rows = await query<ApiKeyListRow>(
+        `SELECT id, label, role, description, created_at, expires_at, last_used_at, active, deactivated_at,
+                allowed_methods, allowed_cidrs, allowed_contract_ids
+         FROM api_keys ORDER BY created_at DESC`,
+      );
+    } else {
+      const parsed = expiringWithinDaysSchema.safeParse(rawWindow);
+      if (!parsed.success) {
+        res.status(400).json({
+          error: "BadRequest",
+          message: "expiringWithinDays must be an integer between 1 and 365",
+        });
+        return;
+      }
+      rows = await findApiKeysExpiringWithin(parsed.data);
+    }
 
     res.json(
       rows.map((row) => ({
@@ -617,6 +625,8 @@ export async function getApiKeys(_req: Request, res: Response, next: NextFunctio
         ...(row.allowed_methods !== undefined ? { allowedMethods: row.allowed_methods ?? null } : {}),
         // null means the key may be used from any IP (#928)
         ...(row.allowed_cidrs !== undefined ? { allowedCidrs: row.allowed_cidrs ?? null } : {}),
+        // null means the key may access every vault (#1243)
+        ...(row.allowed_contract_ids !== undefined ? { allowedContractIds: row.allowed_contract_ids ?? null } : {}),
       })),
     );
   } catch (err) {

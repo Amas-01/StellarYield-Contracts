@@ -102,8 +102,14 @@ export async function listVaults(req: Request, res: Response, next: NextFunction
       q,
       filter: parsedFilter,
       fields: fieldsArray,
+      // A key restricted to some vaults only lists those (#1243).
+      contractIds: req.apiKey?.allowedContractIds ?? undefined,
     });
-    setCacheHeaders(res);
+    if (req.apiKey) {
+      res.set("Cache-Control", "private, no-store");
+    } else {
+      setCacheHeaders(res);
+    }
     res.json(result);
   } catch (err) {
     next(err);
@@ -143,11 +149,20 @@ export async function getVaultAggregates(req: Request, res: Response, next: Next
 
 export async function listVaultsByFactory(req: Request, res: Response, next: NextFunction) {
   try {
-    const vaults = await vaultService.listVaultsByFactory(
+    const allVaults = await vaultService.listVaultsByFactory(
       String(req.params["factoryId"]),
       req.queryTimeoutMs,
     );
-    setCacheHeaders(res);
+    // A key restricted to some vaults only sees those in the factory (#1243).
+    const allowedContractIds = req.apiKey?.allowedContractIds;
+    const vaults = allowedContractIds
+      ? allVaults.filter((vault) => allowedContractIds.includes(vault.contractId))
+      : allVaults;
+    if (req.apiKey) {
+      res.set("Cache-Control", "private, no-store");
+    } else {
+      setCacheHeaders(res);
+    }
     res.json(vaults);
   } catch (err) {
     next(err);
