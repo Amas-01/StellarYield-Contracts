@@ -43,6 +43,9 @@ import { responseSla } from "./api/middleware/routeSla.js";
 import { requestArchive } from "./api/middleware/requestArchive.js";
 import { changelogRouter } from "./api/routes/changelog.js";
 import { announcementsRouter } from "./api/routes/announcements.js";
+import { jsonNestingDepthLimit } from "./api/middleware/jsonNestingDepthLimit.js";
+import { queryArraySizeLimit } from "./api/middleware/queryArraySizeLimit.js";
+import { webhookHttpsEnforcement } from "./api/middleware/webhookHttpsEnforcement.js";
 
 // Cache static responses at startup
 function initStaticCache(): void {
@@ -90,6 +93,8 @@ export function createApp(): Express {
   );
 
   app.use(express.json({ limit: config.requestBodyLimit }));
+  app.use(jsonNestingDepthLimit());
+  app.use(queryArraySizeLimit());
 
   const origins = config.allowedOrigins;
   if (origins.length > 0) {
