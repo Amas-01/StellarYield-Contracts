@@ -44,6 +44,7 @@ import { announcementsRouter } from "./api/routes/announcements.js";
 import { jsonNestingDepthLimit } from "./api/middleware/jsonNestingDepthLimit.js";
 import { queryArraySizeLimit } from "./api/middleware/queryArraySizeLimit.js";
 import { webhookHttpsEnforcement } from "./api/middleware/webhookHttpsEnforcement.js";
+import { enforceJsonContentType } from "./api/middleware/enforceJsonContentType.js";
 
 // Cache static responses at startup
 function initStaticCache(): void {
@@ -91,6 +92,7 @@ export function createApp(): Express {
   );
 
   app.use(express.json({ limit: config.requestBodyLimit }));
+  app.use(enforceJsonContentType());
   app.use(jsonNestingDepthLimit());
   app.use(queryArraySizeLimit());
 

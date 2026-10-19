@@ -52,7 +52,7 @@ import {
   simulateFundingProgress,
   simulateMultiOperation,
 } from "../controllers/simulate.js";
-import { validateParams, validateQuery, validateBody } from "../middleware/validate.js";
+import { validateParams, validateQuery, validateBody, nfcStringSchema } from "../middleware/validate.js";
 import { requireApiKey, enforceApiKeyContractScope } from "../middleware/auth.js";
 import { simulateLimiter } from "../middleware/rateLimit.js";
 import { parseVaultSort } from "../../services/vault.js";
@@ -249,10 +249,10 @@ vaultsRouter.post(
 );
 // Issue #976: Vault metadata validation
 export const metadataValidationSchema = z.object({
-  name: z.string().optional(),
+  name: nfcStringSchema.optional(),
   documentUri: z.string().optional(),
   logoUri: z.string().optional(),
-  description: z.string().optional(),
+  description: nfcStringSchema.optional(),
 });
 vaultsRouter.post("/metadata/validate", validateBody(metadataValidationSchema), validateVaultMetadata);
 vaultsRouter.get("/factory/:factoryId", validateParams(vaultFactoryParamsSchema), listVaultsByFactory);

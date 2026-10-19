@@ -19,7 +19,7 @@ import {
   getYieldVolatility,
 } from "../controllers/yields.js";
 import { getYieldsStream } from "../controllers/yields-stream.js";
-import { validateQuery, validateParams } from "../middleware/validate.js";
+import { validateQuery, validateParams, MAX_DATE_RANGE_DAYS } from "../middleware/validate.js";
 import { sseLimitPerIp } from "../middleware/sseLimitPerIp.js";
 
 // Yield amounts exceed Number.MAX_SAFE_INTEGER, so BigInt-safe strings are kept
@@ -75,12 +75,25 @@ const epochQuerySchema = z
       });
     }
 
-    if (value.from !== undefined && value.to !== undefined && value.from > value.to) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["from"],
-        message: "from must not be greater than to",
-      });
+    if (value.from !== undefined && value.to !== undefined) {
+      if (value.from > value.to) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["from"],
+          message: "from must not be greater than to",
+        });
+      } else {
+        // Epoch numbers are sequence numbers, not Unix timestamps, but apply
+        // the same maximum span guard to prevent runaway pagination (#1235).
+        const span = value.to - value.from;
+        if (span > MAX_DATE_RANGE_DAYS) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["to"],
+            message: `Epoch range must not exceed ${MAX_DATE_RANGE_DAYS} (requested ${span})`,
+          });
+        }
+      }
     }
   });
 
