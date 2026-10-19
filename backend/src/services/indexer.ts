@@ -16,6 +16,7 @@ import { YieldService } from "./yield.js";
 import { NotificationService } from "./notifications.js";
 import {
   indexerEventsProcessedTotal,
+  indexerLagSeconds,
   indexerLastLedger,
   indexerProcessingDurationSeconds,
 } from "./metrics.js";
@@ -352,6 +353,9 @@ export class Indexer {
     if (lag > threshold) {
       logger.error(`Indexer lag: ${lag} ledgers behind chain tip`);
     }
+    // #1217 — expose lag as a Prometheus gauge (ledgers × 5 s/ledger).
+    // Resets to 0 when caught up so alert rules can fire on any nonzero value.
+    indexerLagSeconds.set(Math.max(0, lag) * 5);
 
     if (latestLedger <= this.lastLedger) {
       finishSpan(tickSpan, { ledgerRange: 0, eventCount: 0 });
