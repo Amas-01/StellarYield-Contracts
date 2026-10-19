@@ -8,6 +8,7 @@ import { sendEmail } from "./email.js";
 import { resolveUserEvent } from "./notificationEvents.js";
 import { isDeliveryEnabled } from "./notificationPreferences.js";
 import { buildSignatureHeaders, secretRotationWindowHours } from "./webhookSignature.js";
+import { validateWebhookUrlSsrf } from "../api/middleware/ssrfProtection.js";
 
 /**
  * Circuit breaker threshold (#1061). After this many consecutive failed
@@ -453,6 +454,9 @@ export class NotificationService {
 
     const start = Date.now();
     try {
+      await validateWebhookUrl(webhook.url);
+      await validateWebhookUrlSsrf(webhook.url);
+
       const response = await fetch(webhook.url, {
         method: "POST",
         headers,
@@ -462,7 +466,7 @@ export class NotificationService {
       });
       const durationMs = Date.now() - start;
       return { delivered: response.ok, statusCode: response.status, durationMs };
-    } catch {
+    } catch (err) {
       const durationMs = Date.now() - start;
       return { delivered: false, statusCode: null, durationMs };
     }
@@ -494,6 +498,7 @@ export class NotificationService {
 
     try {
       await validateWebhookUrl(webhook.url);
+      await validateWebhookUrlSsrf(webhook.url);
     } catch (err) {
       logger.warn(
         { webhookId: webhook.id, url: webhook.url, err },
