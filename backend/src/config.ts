@@ -148,6 +148,13 @@ export const envSchema = z.object({
     .default("50")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1)),
+  // How long a successful public vault list/detail response is kept after it
+  // goes stale, so it can be served while the database is unavailable (#1254).
+  STALE_TTL_SECONDS: z
+    .string()
+    .default("600")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(0)),
   EVENTS_RETENTION_DAYS: z
     .string()
     .default("90")
@@ -346,6 +353,7 @@ export const config = {
     poolWarmupConnections: parsed.data.POOL_WARMUP_CONNECTIONS,
   },
   maxResponseSizeMb: parsed.data.MAX_RESPONSE_SIZE_MB,
+  staleTtlSeconds: parsed.data.STALE_TTL_SECONDS,
 
   indexer: {
     startLedger: parsed.data.INDEXER_START_LEDGER,
