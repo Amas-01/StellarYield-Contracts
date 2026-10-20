@@ -4,6 +4,7 @@ import { pool, getDbStatus } from "../../db/index.js";
 import { config } from "../../config.js";
 import { readTotalVaults, getLatestLedger, getSorobanRpc } from "../../services/stellar.js";
 import { sseManager } from "../../services/sseManager.js";
+import { UNAVAILABLE_RETRY_AFTER_SECONDS, setRetryAfter } from "../middleware/retryAfter.js";
 
 const { version } = JSON.parse(
   readFileSync(new URL("../../../package.json", import.meta.url), "utf-8"),
@@ -102,11 +103,13 @@ healthRouter.get("/", async (_req, res) => {
     await pool.query("SELECT 1");
     const db = getDbStatus();
     if (db === "reconnecting") {
+      setRetryAfter(res, UNAVAILABLE_RETRY_AFTER_SECONDS);
       res.status(503).json({ version, status: "reconnecting", db, uptimeSeconds, dbPool, factory, rpc, memory, sseConnections });
     } else {
       res.json({ version, status: "ok", uptimeSeconds, dbPool, factory, rpc, memory, sseConnections });
     }
   } catch {
+    setRetryAfter(res, UNAVAILABLE_RETRY_AFTER_SECONDS);
     res.status(503).json({ version, status: "error", db: getDbStatus(), uptimeSeconds, dbPool, factory, rpc, memory, sseConnections });
   }
 });

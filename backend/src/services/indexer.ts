@@ -1635,7 +1635,14 @@ export class Indexer {
           ? "complete"
           : null;
 
-    if (settlementStatus !== null) {
+    if (stateChange.newState === "Matured") {
+      // #1275 – freeze the supply at the moment of maturity so redeemedPct has
+      // a fixed baseline to divide against as shares are redeemed afterwards.
+      await query(
+        `UPDATE vaults SET state = $1, settlement_status = $2, supply_at_maturity = total_supply, updated_at = NOW() WHERE contract_id = $3`,
+        [stateChange.newState, settlementStatus, contractId],
+      );
+    } else if (settlementStatus !== null) {
       await query(
         `UPDATE vaults SET state = $1, settlement_status = $2, updated_at = NOW() WHERE contract_id = $3`,
         [stateChange.newState, settlementStatus, contractId],

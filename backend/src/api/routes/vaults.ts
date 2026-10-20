@@ -62,6 +62,7 @@ import {
 import { validateParams, validateQuery, validateBody } from "../middleware/validate.js";
 import { requireApiKey, enforceApiKeyContractScope } from "../middleware/auth.js";
 import { simulateLimiter } from "../middleware/rateLimit.js";
+import { captureForStaleFallback } from "../middleware/staleResponse.js";
 import { parseVaultSort } from "../../services/vault.js";
 
 const contractAddressSchema = z.string().length(56).regex(/^C[A-Z2-7]{55}$/);
@@ -228,7 +229,8 @@ export const vaultsRouter = Router();
 vaultsRouter.param("contractId", enforceApiKeyContractScope);
 
 vaultsRouter.get("/categories", listCategories);
-vaultsRouter.get("/", validateQuery(listVaultsQuerySchema), listVaults);
+// Public list and detail reads keep a stale copy for outage fallback (#1254).
+vaultsRouter.get("/", validateQuery(listVaultsQuerySchema), captureForStaleFallback, listVaults);
 vaultsRouter.get("/count", getVaultCount);
 // Aggregates endpoint (placed before dynamic :contractId routes)
 const aggregatesQuerySchema = z.object({ state: z.string().optional() });
@@ -277,7 +279,13 @@ vaultsRouter.post(
   validateParams(vaultParamsSchema),
   simulateMultiOperation,
 );
-vaultsRouter.get("/:contractId", validateParams(vaultParamsSchema), validateQuery(vaultDetailQuerySchema), getVault);
+vaultsRouter.get(
+  "/:contractId",
+  validateParams(vaultParamsSchema),
+  validateQuery(vaultDetailQuerySchema),
+  captureForStaleFallback,
+  getVault,
+);
 vaultsRouter.get("/:contractId/state/live", validateParams(vaultParamsSchema), getVaultLiveState);
 vaultsRouter.get("/:contractId/total-assets/live", validateParams(vaultParamsSchema), getVaultLiveTotalAssets);
 vaultsRouter.get("/:contractId/redemption-queue", validateParams(vaultParamsSchema), getRedemptionQueue);
