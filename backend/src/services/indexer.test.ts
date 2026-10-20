@@ -86,11 +86,31 @@ describe("Indexer", () => {
     expect(logger.warn).toHaveBeenCalled();
   });
 
-  it("updates lastLedger to the latest ledger from getLatestLedger", async () => {
+  it("advances lastLedger only by the adaptive batch size (#1213)", async () => {
     const events = [
       { ...makeMockEvent("deposit", VAULT_CONTRACT), ledger: 1001 },
       { ...makeMockEvent("deposit", VAULT_CONTRACT), ledger: 1005 },
     ];
+    // Default batch size is 200; start from 0 so the tick spans 1..200.
+    indexer.lastLedger = 0;
+    mockServer.getLatestLedger.mockResolvedValueOnce({ sequence: 1010 });
+    mockServer.getEvents.mockResolvedValueOnce({ events, latestLedger: 1010 });
+    vi.spyOn(indexer as any, "processEvent").mockResolvedValue(undefined);
+
+    await indexer.tick();
+
+    expect(indexer.lastLedger).toBe(200);
+    expect(mockServer.getEvents).toHaveBeenCalledWith(
+      expect.objectContaining({ startLedger: 1, endLedger: 200 }),
+    );
+  });
+
+  it("updates lastLedger to the latest ledger when it fits in one batch", async () => {
+    const events = [
+      { ...makeMockEvent("deposit", VAULT_CONTRACT), ledger: 1001 },
+      { ...makeMockEvent("deposit", VAULT_CONTRACT), ledger: 1005 },
+    ];
+    indexer.lastLedger = 1000;
     mockServer.getLatestLedger.mockResolvedValueOnce({ sequence: 1010 });
     mockServer.getEvents.mockResolvedValueOnce({ events, latestLedger: 1010 });
     vi.spyOn(indexer as any, "processEvent").mockResolvedValue(undefined);

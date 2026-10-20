@@ -1505,10 +1505,10 @@ export class VaultService {
       payload: Record<string, unknown>;
       created_at: Date;
     }>(
-      `SELECT ledger, event_type, payload, created_at
+       `SELECT ledger, event_type, payload, created_at
        FROM indexed_events
        WHERE contract_id = $1 AND event_type IN ('op_add', 'op_rem')
-       ORDER BY created_at DESC
+       ORDER BY ledger DESC, tx_index DESC NULLS LAST, event_index DESC NULLS LAST, id DESC
        LIMIT $2 OFFSET $3`,
       [contractId, pageSize, offset],
     );

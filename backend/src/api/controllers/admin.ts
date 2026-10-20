@@ -284,7 +284,43 @@ export async function getAdminIndexer(_req: Request, res: Response, next: NextFu
     const lastTickAt = lastTickAtDate ? lastTickAtDate.toISOString() : null;
     const eventsIndexed = await indexer.getEventsIndexedCount();
 
-    res.json({ running, lastLedger, lastTickAt, eventsIndexed });
+    res.json({
+      running,
+      lastLedger,
+      lastTickAt,
+      eventsIndexed,
+      // #1213: current adaptive ledger batch size.
+      batchSize: indexer.getBatchSize(),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getIndexerDeadLetters(req: Request, res: Response, next: NextFunction) {
+  try {
+    const rawLimit = parseInt(String(req.query["limit"] ?? "50"), 10);
+    const limit = Math.max(1, Math.min(200, Number.isNaN(rawLimit) ? 50 : rawLimit));
+    const rawOffset = parseInt(String(req.query["offset"] ?? "0"), 10);
+    const offset = Math.max(0, Number.isNaN(rawOffset) ? 0 : rawOffset);
+
+    const [rows, countRows] = await Promise.all([
+      query(
+        `SELECT id, contract_id, ledger, raw_event, error_message, created_at
+         FROM indexer_dead_letters
+         ORDER BY created_at DESC, id DESC
+         LIMIT $1 OFFSET $2`,
+        [limit, offset],
+      ),
+      query<{ count: string }>("SELECT COUNT(*)::text AS count FROM indexer_dead_letters"),
+    ]);
+
+    res.json({
+      data: rows,
+      total: parseInt(countRows[0]?.count ?? "0", 10),
+      limit,
+      offset,
+    });
   } catch (err) {
     next(err);
   }
@@ -983,7 +1019,7 @@ export async function getAdminEvents(req: Request, res: Response, next: NextFunc
       `SELECT id, ledger, tx_hash, contract_id, event_type, payload, created_at
        FROM indexed_events
        ${whereClause}
-       ORDER BY created_at DESC
+       ORDER BY ledger DESC, tx_index DESC NULLS LAST, event_index DESC NULLS LAST, id DESC
        LIMIT 50`,
       params,
     );
@@ -2913,7 +2949,7 @@ export async function acknowledgeTransferAlert(
   next: NextFunction,
 ): Promise<void> {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = parseInt(String(req.params.id), 10);
     if (Number.isNaN(id) || id <= 0) {
       res.status(400).json({ error: "Invalid alert id" });
       return;

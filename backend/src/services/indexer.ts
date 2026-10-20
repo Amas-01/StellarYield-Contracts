@@ -18,6 +18,7 @@ import {
   indexerEventsProcessedTotal,
   indexerLastLedger,
   indexerProcessingDurationSeconds,
+  indexerUnknownEventsTotal,
 } from "./metrics.js";
 import { cacheDel } from "../cache/redis.js";
 import { sseService } from "./sse.js";
@@ -167,6 +168,50 @@ export function decodeValue(ev: any): unknown {
   }
 }
 
+/**
+ * Position of an event within its ledger (#1214): `[txIndex, eventIndex]`.
+ *
+ * The RPC event `id` is `<19-char TOID>-<10-char event index>`; the TOID packs
+ * the ledger sequence, transaction index and operation index. The trailing
+ * number is the index of the event within its transaction. Falls back to the
+ * RPC's explicit `transactionIndex` when the `id` cannot be parsed, and to
+ * `null` when nothing is available (e.g. older fixtures) so reads can fall back
+ * to insertion order.
+ */
+export function eventPosition(ev: any): [number | null, number | null] {
+  const fromField = (v: unknown): number | null => {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v.trim() !== "" && !Number.isNaN(Number(v))) return Number(v);
+    return null;
+  };
+
+  const explicitTx = fromField(ev?.transactionIndex);
+  let txIndex: number | null = null;
+  let eventIndex: number | null = null;
+
+  const id = typeof ev?.id === "string" ? ev.id : typeof ev?.pagingToken === "string" ? ev.pagingToken : "";
+  const parts = id.split("-");
+  const toidPart = parts[0] ?? "";
+  const eventPart = parts[1] ?? "";
+  if (/^\d+$/.test(toidPart)) {
+    try {
+      const toid = Number(BigInt(toidPart));
+      if (Number.isFinite(toid)) {
+        txIndex = Math.floor(toid / 4096) % 1048576;
+      }
+    } catch {
+      txIndex = null;
+    }
+  }
+  if (/^\d+$/.test(eventPart)) eventIndex = parseInt(eventPart, 10);
+  else if (parts.length === 1 && /^\d+$/.test(id)) eventIndex = parseInt(id, 10);
+
+  if (txIndex === null) txIndex = explicitTx;
+  if (eventIndex === null) eventIndex = 0;
+
+  return [txIndex, eventIndex];
+}
+
 export async function storeIndexedEvent(
   contractId: string,
   eventType: string,
@@ -174,10 +219,11 @@ export async function storeIndexedEvent(
   payload: Record<string, unknown>,
   parsedData?: Record<string, unknown>,
 ): Promise<void> {
+  const [txIndex, eventIndex] = eventPosition(ev);
   await query(
-    `INSERT INTO indexed_events (ledger, tx_hash, contract_id, event_type, payload, parsed_data)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [ev.ledger, ev.txHash, contractId, eventType, JSON.stringify(payload), parsedData ? JSON.stringify(parsedData) : null],
+    `INSERT INTO indexed_events (ledger, tx_hash, contract_id, event_type, payload, parsed_data, tx_index, event_index)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [ev.ledger, ev.txHash, contractId, eventType, JSON.stringify(payload), parsedData ? JSON.stringify(parsedData) : null, txIndex, eventIndex],
   );
 }
 
@@ -238,6 +284,12 @@ export class Indexer {
   private notificationService?: NotificationService;
   /** Per-contract pause / event-filter settings, refreshed every cycle. */
   private contractControls = new Map<string, ContractIndexerControl>();
+  /** Topics already warned about during this process lifetime. */
+  private readonly warnedUnknownTopics = new Set<string>();
+  private currentBatchSize: number;
+  private consecutiveFastBatches = 0;
+  private readonly minBatchSize: number;
+  private readonly maxBatchSize: number;
 
   constructor(notificationService?: NotificationService) {
     this.lastLedger = config.indexer.startLedger;
@@ -249,6 +301,11 @@ export class Indexer {
     this.vaultService = new VaultService();
     this.userService = new UserService();
     this.notificationService = notificationService;
+    const minBatchSize = config.indexer.minBatchSize ?? 1;
+    const maxBatchSize = Math.max(minBatchSize, config.indexer.maxBatchSize ?? config.indexer.batchSize);
+    this.minBatchSize = minBatchSize;
+    this.maxBatchSize = maxBatchSize;
+    this.currentBatchSize = Math.max(minBatchSize, Math.min(maxBatchSize, config.indexer.batchSize));
 
     if (!this.vaultFactoryContractId) {
       logger.warn(
@@ -289,7 +346,7 @@ export class Indexer {
       const { sequence: tipLedger } = await withBackoff(() => server.getLatestLedger());
       const gap = tipLedger - this.lastLedger;
 
-      if (gap > config.indexer.batchSize) {
+      if (gap > this.currentBatchSize) {
         await this.backfill(tipLedger);
       }
 
@@ -306,6 +363,46 @@ export class Indexer {
 
   stop(): void {
     this.running = false;
+  }
+
+  /** Current adaptive ledger batch size (#1213). Exposed for the admin API. */
+  getBatchSize(): number {
+    return this.currentBatchSize;
+  }
+
+  /**
+   * Adapt the batch size to observed throughput (#1213).
+   *
+   * While catching up the RPC is the bottleneck, so a fast batch (under one
+   * second) signals headroom: after three in a row the batch doubles, capped at
+   * `maxBatchSize`. A slow batch — or a failed/timed-out fetch, which is the
+   * usual symptom of asking for too much at the chain tip — resets the fast
+   * streak and halves the batch, floored at `minBatchSize`.
+   */
+  private tuneBatchSize(durationMs: number, failed = false): void {
+    if (failed || durationMs >= 1000) {
+      this.consecutiveFastBatches = 0;
+      const shrunk = Math.max(this.minBatchSize, Math.floor(this.currentBatchSize / 2));
+      if (shrunk !== this.currentBatchSize) {
+        logger.info(
+          { from: this.currentBatchSize, to: shrunk, durationMs, failed },
+          "Indexer batch size reduced",
+        );
+      }
+      this.currentBatchSize = shrunk;
+      return;
+    }
+
+    this.consecutiveFastBatches += 1;
+    if (this.consecutiveFastBatches >= 3 && this.currentBatchSize < this.maxBatchSize) {
+      const grown = Math.min(this.maxBatchSize, this.currentBatchSize * 2);
+      logger.info(
+        { from: this.currentBatchSize, to: grown, durationMs },
+        "Indexer batch size increased",
+      );
+      this.currentBatchSize = grown;
+      this.consecutiveFastBatches = 0;
+    }
   }
 
   private async tickStateOnly(): Promise<void> {
@@ -359,7 +456,11 @@ export class Indexer {
     }
 
     const from = this.lastLedger + 1;
-    tickSpan.attrs["ledgerRange"] = `${from}-${latestLedger}`;
+    // Cap the fetched range to the adaptive batch size (#1213) so a large
+    // backlog is worked through in bounded chunks whose duration feeds the
+    // tuner. `batchTo` is the last ledger this tick will process.
+    const batchTo = Math.min(latestLedger, this.lastLedger + this.currentBatchSize);
+    tickSpan.attrs["ledgerRange"] = `${from}-${batchTo}`;
 
     await this.loadContractControls();
     await this.replayResumedContracts();
@@ -374,12 +475,13 @@ export class Indexer {
       const filters = contractIds.map((id) => ({ contractIds: [id] }));
       try {
         const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: from, filters }),
+          server.getEvents({ startLedger: from, endLedger: batchTo, filters }),
         );
         events = resp.events;
       } catch (err) {
-        logger.warn({ err, from, to: latestLedger }, "RPC error fetching events during tick");
+        logger.warn({ err, from, to: batchTo }, "RPC error fetching events during tick");
         endBatchTimer();
+        this.tuneBatchSize(0, true);
         finishSpan(tickSpan, { error: true });
         return;
       }
@@ -388,18 +490,25 @@ export class Indexer {
     tickSpan.attrs["eventCount"] = events.length;
 
     logger.info(
-      { from, to: latestLedger, eventCount: events.length },
+      { from, to: batchTo, eventCount: events.length },
       "Indexer tick complete",
     );
+
+    const batchDurationMs = endBatchTimer() * 1000;
 
     for (const event of events) {
       await this.processEvent(event, tickSpan);
     }
-    endBatchTimer();
+
+    // Only tune on a tick that actually advanced the cursor: an idle poll that
+    // found no new ledgers would otherwise inflate the fast-batch streak.
+    if (batchTo > this.lastLedger) {
+      this.tuneBatchSize(batchDurationMs);
+    }
 
     await this.notificationService?.processRetries();
 
-    this.lastLedger = latestLedger;
+    this.lastLedger = batchTo;
     await this.persistLastLedger();
     this.lastTickAt = new Date();
     finishSpan(tickSpan);
@@ -410,7 +519,6 @@ export class Indexer {
     startLedger?: number,
     onProgress?: (progress: number) => Promise<void>,
   ): Promise<void> {
-    const batchSize = config.indexer.batchSize;
     const server = getSorobanRpc();
     let cursor = startLedger !== undefined ? startLedger : this.lastLedger;
     const initialLedger = cursor;
@@ -426,6 +534,9 @@ export class Indexer {
     const filters = contractIds.map((id) => ({ contractIds: [id] }));
 
     while (cursor < tipLedger) {
+      // Read the adaptive batch size each iteration (#1213) so growth/shrink
+      // within a catch-up run takes effect on the next batch.
+      const batchSize = this.currentBatchSize;
       const batchTo = Math.min(cursor + batchSize, tipLedger);
       const remaining = tipLedger - batchTo;
 
@@ -437,7 +548,7 @@ export class Indexer {
       const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
         const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: cursor + 1, filters }),
+          server.getEvents({ startLedger: cursor + 1, endLedger: batchTo, filters }),
         );
 
         for (const event of resp.events) {
@@ -447,7 +558,8 @@ export class Indexer {
           );
           await this.processEvent(event);
         }
-        endBatchTimer();
+        const batchDurationMs = endBatchTimer() * 1000;
+        this.tuneBatchSize(batchDurationMs);
 
         cursor = batchTo;
         this.lastLedger = cursor;
@@ -461,6 +573,7 @@ export class Indexer {
         }
       } catch (err) {
         endBatchTimer();
+        this.tuneBatchSize(0, true);
         logger.warn({ err, from: cursor + 1, to: batchTo }, "RPC error during backfill batch");
         break;
       }
@@ -490,6 +603,19 @@ export class Indexer {
       if (await this._processEventInner(event)) {
         indexerEventsProcessedTotal.inc();
       }
+    } catch (err) {
+      // #1211: a malformed event must not abort the batch. Set it aside for
+      // inspection and let the caller continue with the remaining events.
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      try {
+        await this.storeDeadLetter(event, errorMessage);
+      } catch (deadLetterErr) {
+        logger.error(
+          { err: deadLetterErr, contractId: event?.contractId ?? "", ledger: event?.ledger ?? 0 },
+          "Failed to store indexer dead letter",
+        );
+      }
+      eventSpan.attrs["error"] = true;
     } finally {
       finishSpan(eventSpan);
     }
@@ -646,8 +772,8 @@ export class Indexer {
       const feeResult = await this.handleYieldDistributed(event.contractId ?? "", yieldDist);
       // Store payload with netYield so GET /epochs can read it via lateral join (#792)
       await query(
-        `INSERT INTO indexed_events (ledger, tx_hash, contract_id, event_type, payload)
-         VALUES ($1, $2, $3, 'yield_distributed', $4)
+        `INSERT INTO indexed_events (ledger, tx_hash, contract_id, event_type, payload, tx_index, event_index)
+         VALUES ($1, $2, $3, 'yield_distributed', $4, $5, $6)
          ON CONFLICT DO NOTHING`,
         [
           event.ledger ?? 0,
@@ -659,6 +785,7 @@ export class Indexer {
             netYield: feeResult.netYield,
             operatorFee: feeResult.operatorFee,
           }),
+          ...eventPosition(event),
         ],
       );
       const parsedData = await this.handleYieldDistributed(event.contractId ?? "", yieldDist);
@@ -1098,7 +1225,37 @@ export class Indexer {
       return true;
     }
 
+    const topic = eventTopicName(event);
+    if (topic === null || Object.hasOwn(TOPIC_EVENT_TYPES, topic)) {
+      const errorMessage = topic === null
+        ? "Unable to decode event topic"
+        : `Unable to parse recognized event topic: ${topic}`;
+      await this.storeDeadLetter(event, errorMessage);
+    } else {
+      const contractId = event?.contractId ?? "";
+      indexerUnknownEventsTotal.inc({ contract_id: contractId, topic });
+      if (!this.warnedUnknownTopics.has(topic)) {
+        this.warnedUnknownTopics.add(topic);
+        logger.warn({ contractId, topic }, "Unknown indexer event topic");
+      }
+    }
+
     return false;
+  }
+
+  private async storeDeadLetter(event: any, errorMessage: string): Promise<void> {
+    const rawEvent = JSON.stringify(event, (_key, value) =>
+      typeof value === "bigint" ? value.toString() : value,
+    );
+    await query(
+      `INSERT INTO indexer_dead_letters (contract_id, ledger, raw_event, error_message)
+       VALUES ($1, $2, $3, $4)`,
+      [event?.contractId ?? "", event?.ledger ?? 0, rawEvent, errorMessage],
+    );
+    logger.warn(
+      { contractId: event?.contractId ?? "", ledger: event?.ledger ?? 0, errorMessage },
+      "Indexer event moved to dead-letter table",
+    );
   }
 
   private async handleMetadataUpdated(
@@ -2127,9 +2284,10 @@ export class Indexer {
     eventType: string,
     parsedData?: Record<string, unknown>,
   ): Promise<void> {
+    const [txIndex, eventIndex] = eventPosition(event);
     await query(
-      `INSERT INTO indexed_events (ledger, tx_hash, contract_id, event_type, payload, parsed_data)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO indexed_events (ledger, tx_hash, contract_id, event_type, payload, parsed_data, tx_index, event_index)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT DO NOTHING`,
       [
         event.ledger ?? 0,
@@ -2138,6 +2296,8 @@ export class Indexer {
         eventType,
         JSON.stringify(event),
         parsedData ? JSON.stringify(parsedData) : null,
+        txIndex,
+        eventIndex,
       ],
     );
   }
