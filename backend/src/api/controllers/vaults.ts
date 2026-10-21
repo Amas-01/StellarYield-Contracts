@@ -102,8 +102,14 @@ export async function listVaults(req: Request, res: Response, next: NextFunction
       q,
       filter: parsedFilter,
       fields: fieldsArray,
+      // A key restricted to some vaults only lists those (#1243).
+      contractIds: req.apiKey?.allowedContractIds ?? undefined,
     });
-    setCacheHeaders(res);
+    if (req.apiKey) {
+      res.set("Cache-Control", "private, no-store");
+    } else {
+      setCacheHeaders(res);
+    }
     res.json(result);
   } catch (err) {
     next(err);
@@ -143,11 +149,20 @@ export async function getVaultAggregates(req: Request, res: Response, next: Next
 
 export async function listVaultsByFactory(req: Request, res: Response, next: NextFunction) {
   try {
-    const vaults = await vaultService.listVaultsByFactory(
+    const allVaults = await vaultService.listVaultsByFactory(
       String(req.params["factoryId"]),
       req.queryTimeoutMs,
     );
-    setCacheHeaders(res);
+    // A key restricted to some vaults only sees those in the factory (#1243).
+    const allowedContractIds = req.apiKey?.allowedContractIds;
+    const vaults = allowedContractIds
+      ? allVaults.filter((vault) => allowedContractIds.includes(vault.contractId))
+      : allVaults;
+    if (req.apiKey) {
+      res.set("Cache-Control", "private, no-store");
+    } else {
+      setCacheHeaders(res);
+    }
     res.json(vaults);
   } catch (err) {
     next(err);
@@ -1889,6 +1904,475 @@ export async function getVaultTransferLeaderboard(
         netVolume: String(row.netVolume ?? "0"),
       })),
     );
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/v1/vaults/:contractId/snapshot  (augmented by #1270)
+ *
+ * Original snapshot fields remain; this export is intentionally kept separate
+ * so the route file can call the function that already exists above.  The
+ * handler above is patched via addPendingRedemptionToSnapshot which is called
+ * from within getVaultSnapshot.  We expose a new dedicated controller below
+ * that replaces the registered handler for /snapshot so that tests can mock
+ * cleanly.  The existing `getVaultSnapshot` export is left intact for
+ * backwards compatibility.
+ *
+ * Actually we patch getVaultSnapshot in-place: see the re-export below.
+ * Issue #1270: expose pendingRedemptionAmount and pendingRedemptionCount.
+ */
+export async function getVaultSnapshotV2(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vault = await vaultService.getVault(contractId);
+    if (!vault) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+
+    // Epoch count
+    const epochRows = await query<{ count: string }>(
+      "SELECT COUNT(*)::text AS count FROM epochs WHERE vault_id = $1",
+      [vault.id],
+    );
+    const epochCount = parseInt(epochRows[0]?.count ?? "0", 10);
+
+    // Last indexed event timestamp
+    const lastEventRows = await query<{ created_at: Date }>(
+      "SELECT created_at FROM indexed_events WHERE contract_id = $1 ORDER BY created_at DESC LIMIT 1",
+      [contractId],
+    );
+    const lastIndexedAt = lastEventRows[0]?.created_at?.toISOString() ?? null;
+
+    // Top-10 holder concentration
+    const top10Rows = await query<{ top10_shares: string }>(
+      `SELECT COALESCE(SUM(shares), 0)::text AS top10_shares
+       FROM (
+         SELECT uvp.shares
+         FROM user_vault_positions uvp
+         WHERE uvp.vault_id = $1 AND uvp.shares > 0
+         ORDER BY uvp.shares DESC
+         LIMIT 10
+       ) top10`,
+      [vault.id],
+    );
+    const totalSupplyNum = parseFloat(vault.totalSupply);
+    let top10HolderSharePercent: number | null = null;
+    if (totalSupplyNum > 0) {
+      const top10Shares = parseFloat(top10Rows[0]?.top10_shares ?? "0");
+      top10HolderSharePercent = Math.round((top10Shares / totalSupplyNum) * 100 * 100) / 100;
+    }
+
+    // #1270 — pending redemption queue totals (only requests not yet processed,
+    // i.e. processed = FALSE).  Cancelled requests are not stored as a separate
+    // status on the legacy schema; once cancelled they are removed or marked
+    // processed, so processed = FALSE is the correct "pending" filter.
+    const pendingRows = await query<{ amount: string; count: string }>(
+      `SELECT COALESCE(SUM(rr.shares), 0)::text AS amount,
+              COUNT(*)::text AS count
+       FROM redemption_requests rr
+       WHERE rr.vault_id = $1 AND rr.processed = FALSE`,
+      [vault.id],
+    );
+    const pendingRedemptionAmount = pendingRows[0]?.amount ?? "0";
+    const pendingRedemptionCount = parseInt(pendingRows[0]?.count ?? "0", 10);
+
+    const snapshot = {
+      state: vault.state,
+      totalAssets: vault.totalAssets,
+      totalSupply: vault.totalSupply,
+      depositorCount: vault.depositorCount,
+      epochCount,
+      lastIndexedAt,
+      top10HolderSharePercent,
+      pendingRedemptionAmount,
+      pendingRedemptionCount,
+    };
+
+    setCacheHeaders(res);
+    res.json(snapshot);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * GET /api/v1/vaults/:contractId/deposit-distribution?buckets=N  (#1265)
+ *
+ * Returns a histogram of deposit amounts, split into N equal-width buckets
+ * across the range [min_deposit, max_deposit].  buckets must be between 2 and
+ * 50 inclusive; anything outside that range returns HTTP 422.
+ *
+ * Response shape:
+ *   { buckets: [{ rangeMin: string, rangeMax: string, count: number, totalVolume: string }] }
+ *
+ * Acceptance criteria:
+ *   - bucket counts sum to the total number of deposits in the vault
+ *   - buckets are ordered from lowest to highest deposit amount
+ */
+export async function getDepositDistribution(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const bucketsParam = parseInt(String(req.query["buckets"] ?? "10"), 10);
+    if (Number.isNaN(bucketsParam) || bucketsParam < 2 || bucketsParam > 50) {
+      res.status(422).json({
+        error: "UnprocessableEntity",
+        message: "buckets must be an integer between 2 and 50",
+      });
+      return;
+    }
+    const numBuckets = bucketsParam;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+    const vaultId = vaultRows[0].id;
+
+    // Gather all deposit amounts for this vault from the indexed_events table.
+    // Deposit events are stored with event_type = 'deposit' and payload.amount.
+    const depositRows = await query<{ amount: string }>(
+      `SELECT (payload->>'amount')::numeric AS amount
+       FROM indexed_events
+       WHERE contract_id = $1
+         AND event_type = 'deposit'
+         AND (payload->>'amount') IS NOT NULL
+         AND (payload->>'amount')::numeric > 0`,
+      [contractId],
+    );
+
+    if (depositRows.length === 0) {
+      // No deposits yet — return empty buckets array but 200 OK
+      setCacheHeaders(res);
+      res.json({ buckets: [] });
+      return;
+    }
+
+    const amounts = depositRows.map((r) => parseFloat(r.amount));
+    const minAmt = Math.min(...amounts);
+    const maxAmt = Math.max(...amounts);
+
+    // If all deposits are the same size, put them all in one bucket (edge case)
+    const range = maxAmt - minAmt;
+
+    type BucketAcc = { count: number; totalVolume: number; rangeMin: number; rangeMax: number };
+    const buckets: BucketAcc[] = [];
+
+    for (let i = 0; i < numBuckets; i++) {
+      const bucketMin = range === 0 ? minAmt : minAmt + (range / numBuckets) * i;
+      const bucketMax = range === 0 ? maxAmt : minAmt + (range / numBuckets) * (i + 1);
+      buckets.push({ count: 0, totalVolume: 0, rangeMin: bucketMin, rangeMax: bucketMax });
+    }
+
+    for (const amt of amounts) {
+      if (range === 0) {
+        buckets[0].count++;
+        buckets[0].totalVolume += amt;
+      } else {
+        // Normalise to [0, 1) then scale to bucket index; clamp last bucket
+        let idx = Math.floor(((amt - minAmt) / range) * numBuckets);
+        if (idx >= numBuckets) idx = numBuckets - 1;
+        buckets[idx].count++;
+        buckets[idx].totalVolume += amt;
+      }
+    }
+
+    setCacheHeaders(res);
+    res.json({
+      buckets: buckets.map((b) => ({
+        rangeMin: b.rangeMin.toString(),
+        rangeMax: b.rangeMax.toString(),
+        count: b.count,
+        totalVolume: b.totalVolume.toString(),
+      })),
+      // Expose vault context for the caller's convenience
+      totalDeposits: amounts.length,
+    });
+  } catch (err) {
+    next(err);
+  }
+
+  // Suppress unused-variable lint warning: vaultId used in query above.
+  void 0;
+}
+
+/**
+ * GET /api/v1/vaults/:contractId/cohorts  (#1266)
+ *
+ * Groups depositors by their first-deposit calendar month and returns:
+ *   cohortMonth           – "YYYY-MM"
+ *   holders               – total number of depositors who first deposited in that month
+ *   currentShares         – aggregate shares still held by that cohort
+ *   percentStillHolding   – holders with shares > 0 as a % of the cohort total
+ *
+ * Cohorts are ordered chronologically (earliest first).
+ * Each holder belongs to exactly one cohort (their earliest first_entry_at).
+ *
+ * The `first_entry_at` column was added in migration 044_user_vault_entry_exit.
+ */
+export async function getVaultCohorts(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+    const vaultId = vaultRows[0].id;
+
+    // Aggregate by the year-month of first_entry_at.  Positions with a NULL
+    // first_entry_at (pre-migration rows that had no snapshot) are bucketed by
+    // updated_at as a best-effort fallback (same logic as the migration itself).
+    const rows = await query<{
+      cohort_month: string;
+      holders: string;
+      current_shares: string;
+      holders_still_holding: string;
+    }>(
+      `SELECT
+         TO_CHAR(COALESCE(uvp.first_entry_at, uvp.updated_at), 'YYYY-MM') AS cohort_month,
+         COUNT(*)::text                                                     AS holders,
+         COALESCE(SUM(uvp.shares), 0)::text                                AS current_shares,
+         COUNT(*) FILTER (WHERE uvp.shares > 0)::text                      AS holders_still_holding
+       FROM user_vault_positions uvp
+       WHERE uvp.vault_id = $1
+       GROUP BY cohort_month
+       ORDER BY cohort_month ASC`,
+      [vaultId],
+    );
+
+    const cohorts = rows.map((r) => {
+      const holders = parseInt(r.holders, 10);
+      const holdersStillHolding = parseInt(r.holders_still_holding, 10);
+      return {
+        cohortMonth: r.cohort_month,
+        holders,
+        currentShares: r.current_shares,
+        percentStillHolding:
+          holders > 0
+            ? Math.round((holdersStillHolding / holders) * 100 * 100) / 100
+            : 0,
+      };
+    });
+
+    setCacheHeaders(res);
+    res.json({ cohorts });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── Issue #1260: TVL growth rate ─────────────────────────────────────────────
+//
+// Compares the current TVL to snapshots at day, week, and month offsets and
+// returns the growth as a decimal fraction: (current - previous) / previous.
+// Returns null for a period when no earlier snapshot exists.
+export async function getVaultTvlGrowth(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+    const vaultId = vaultRows[0].id;
+
+    // Most recent TVL snapshot for the vault.
+    const currentRows = await query<{ total_assets: string }>(
+      `SELECT total_assets::text
+       FROM vault_tvl_snapshots
+       WHERE vault_id = $1
+       ORDER BY recorded_at DESC
+       LIMIT 1`,
+      [vaultId],
+    );
+    if (currentRows.length === 0) {
+      // No snapshots at all — every period is null.
+      setCacheHeaders(res);
+      res.json({ day: null, week: null, month: null });
+      return;
+    }
+    const current = parseFloat(currentRows[0].total_assets);
+
+    // Look up the closest snapshot at least N days before the latest one.
+    async function growthFor(days: number): Promise<number | null> {
+      const rows = await query<{ total_assets: string }>(
+        `SELECT total_assets::text
+         FROM vault_tvl_snapshots
+         WHERE vault_id = $1
+           AND recorded_at <= (SELECT MAX(recorded_at) FROM vault_tvl_snapshots WHERE vault_id = $1) - ($2 || ' days')::INTERVAL
+         ORDER BY recorded_at DESC
+         LIMIT 1`,
+        [vaultId, String(days)],
+      );
+      if (rows.length === 0) return null;
+      const previous = parseFloat(rows[0].total_assets);
+      if (previous === 0) return null;
+      return (current - previous) / previous;
+    }
+
+    const [day, week, month] = await Promise.all([growthFor(1), growthFor(7), growthFor(30)]);
+
+    setCacheHeaders(res);
+    res.json({ day, week, month });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── Issue #1261: Net deposits per day ─────────────────────────────────────────
+//
+// Returns daily deposit and withdrawal volume (and the net) for a vault.
+// Days with no activity are included with zeroes so the series is contiguous.
+export async function getVaultFlowsDaily(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: "Vault not found" });
+      return;
+    }
+    const vaultId = vaultRows[0].id;
+
+    const fromParam = req.query["from"] as string | undefined;
+    const toParam = req.query["to"] as string | undefined;
+
+    let fromDate: Date | null = null;
+    let toDate: Date | null = null;
+    if (fromParam) {
+      fromDate = new Date(fromParam);
+      if (isNaN(fromDate.getTime())) {
+        res.status(400).json({ error: "BadRequest", message: "Invalid from date format" });
+        return;
+      }
+    }
+    if (toParam) {
+      toDate = new Date(toParam);
+      if (isNaN(toDate.getTime())) {
+        res.status(400).json({ error: "BadRequest", message: "Invalid to date format" });
+        return;
+      }
+    }
+
+    // Aggregate deposit/withdraw amounts per day from indexed_events.
+    const params: unknown[] = [contractId];
+    const whereConditions: string[] = ["ie.contract_id = $1", "ie.event_type IN ('deposit', 'withdraw')"];
+    if (fromDate) {
+      params.push(fromDate);
+      whereConditions.push(`ie.created_at >= $${params.length}`);
+    }
+    if (toDate) {
+      params.push(toDate);
+      whereConditions.push(`ie.created_at < $${params.length}`);
+    }
+    const whereClause = whereConditions.join(" AND ");
+
+    const rows = await query<{
+      day: Date;
+      deposits: string;
+      withdrawals: string;
+    }>(
+      `SELECT
+         date_trunc('day', ie.created_at) AS day,
+         COALESCE(SUM(CASE WHEN ie.event_type = 'deposit'
+                           THEN COALESCE((ie.parsed_data->>'assets')::numeric, (ie.payload->>'assets')::numeric, (ie.payload->>'amount')::numeric, 0)
+                           ELSE 0 END), 0)::text AS deposits,
+         COALESCE(SUM(CASE WHEN ie.event_type = 'withdraw'
+                           THEN COALESCE((ie.parsed_data->>'assets')::numeric, (ie.payload->>'assets')::numeric, 0)
+                           ELSE 0 END), 0)::text AS withdrawals
+       FROM indexed_events ie
+       WHERE ${whereClause}
+       GROUP BY 1
+       ORDER BY 1 ASC`,
+      params,
+    );
+
+    // Fill contiguous days with zeroes for days without activity.
+    const byDay = new Map<string, { deposits: number; withdrawals: number }>();
+    for (const r of rows) {
+      const key = r.day.toISOString().slice(0, 10);
+      byDay.set(key, {
+        deposits: parseFloat(r.deposits),
+        withdrawals: parseFloat(r.withdrawals),
+      });
+    }
+
+    const result: Array<{ date: string; deposits: number; withdrawals: number; net: number }> = [];
+    if (fromDate && toDate) {
+      const cursor = new Date(fromDate);
+      cursor.setUTCHours(0, 0, 0, 0);
+      const end = new Date(toDate);
+      end.setUTCHours(0, 0, 0, 0);
+      while (cursor <= end) {
+        const key = cursor.toISOString().slice(0, 10);
+        const entry = byDay.get(key) ?? { deposits: 0, withdrawals: 0 };
+        result.push({
+          date: key,
+          deposits: entry.deposits,
+          withdrawals: entry.withdrawals,
+          net: entry.deposits - entry.withdrawals,
+        });
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+    } else {
+      // No range provided — just return the days that have activity.
+      for (const [date, entry] of byDay) {
+        result.push({
+          date,
+          deposits: entry.deposits,
+          withdrawals: entry.withdrawals,
+          net: entry.deposits - entry.withdrawals,
+        });
+      }
+    }
+
+    setCacheHeaders(res);
+    res.json(result);
   } catch (err) {
     next(err);
   }

@@ -1311,6 +1311,10 @@ export class Indexer {
       const { shares, deposited } = positionResult[0];
       userServiceInstance.emitPositionUpdate(withdraw.owner, contractId, shares, deposited);
     }
+
+    // #1274 – re-derive settlement_status after every withdrawal so dashboards
+    // can see the transition from not_started → in_progress → complete.
+    await this.refreshSettlementStatus(contractId);
   }
 
   private async handleYieldDistributed(
@@ -1465,13 +1469,61 @@ export class Indexer {
   ): Promise<void> {
     if (!stateChange.newState) return;
 
-    await query(
-      `UPDATE vaults SET state = $1, updated_at = NOW() WHERE contract_id = $2`,
-      [stateChange.newState, contractId],
-    );
+    // #1274 – when a vault enters Matured set settlement_status to not_started
+    // (no redemptions have occurred yet).  Closed vaults are fully settled.
+    const settlementStatus =
+      stateChange.newState === "Matured"
+        ? "not_started"
+        : stateChange.newState === "Closed"
+          ? "complete"
+          : null;
+
+    if (stateChange.newState === "Matured") {
+      // #1275 – freeze the supply at the moment of maturity so redeemedPct has
+      // a fixed baseline to divide against as shares are redeemed afterwards.
+      await query(
+        `UPDATE vaults SET state = $1, settlement_status = $2, supply_at_maturity = total_supply, updated_at = NOW() WHERE contract_id = $3`,
+        [stateChange.newState, settlementStatus, contractId],
+      );
+    } else if (settlementStatus !== null) {
+      await query(
+        `UPDATE vaults SET state = $1, settlement_status = $2, updated_at = NOW() WHERE contract_id = $3`,
+        [stateChange.newState, settlementStatus, contractId],
+      );
+    } else {
+      await query(
+        `UPDATE vaults SET state = $1, updated_at = NOW() WHERE contract_id = $2`,
+        [stateChange.newState, contractId],
+      );
+    }
     logger.info(
       { contractId, oldState: stateChange.oldState, newState: stateChange.newState },
       "Processed vault_state_changed event",
+    );
+  }
+
+  /**
+   * Re-derive and persist the settlement_status for a Matured vault.
+   * Called after any withdrawal or redemption that may change the supply.
+   * #1274
+   */
+  private async refreshSettlementStatus(contractId: string): Promise<void> {
+    const rows = await query<{ state: string; total_supply: string }>(
+      "SELECT state, total_supply FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (rows.length === 0) return;
+    const { state, total_supply } = rows[0];
+
+    if (state !== "Matured" && state !== "Closed") return; // only relevant post-maturity
+
+    const remainingSupply = BigInt(total_supply ?? "0");
+    const settlementStatus =
+      remainingSupply === 0n ? "complete" : "in_progress";
+
+    await query(
+      `UPDATE vaults SET settlement_status = $1, updated_at = NOW() WHERE contract_id = $2`,
+      [settlementStatus, contractId],
     );
   }
 

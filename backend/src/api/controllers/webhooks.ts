@@ -1,6 +1,8 @@
 import type { Request, Response, NextFunction } from "express";
 import { query } from "../../db/index.js";
 import { validateWebhookUrl, NotificationService } from "../../services/notifications.js";
+import { validateWebhookUrlSsrf } from "../middleware/ssrfProtection.js";
+import { config } from "../../config.js";
 
 const notificationService = new NotificationService();
 
@@ -57,10 +59,37 @@ export async function createWebhook(req: Request, res: Response, next: NextFunct
     const webhookChannel = channel ?? "webhook";
 
     if (webhookChannel === "webhook" || webhookChannel === "slack") {
+      const isProduction = config.nodeEnv === "production";
+
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        res.status(422).json({ error: "InvalidWebhookUrl", message: "Invalid URL format" });
+        return;
+      }
+
+      if (isProduction && parsed.protocol === "http:") {
+        res.status(422).json({
+          error: "InvalidWebhookUrl",
+          message: "Webhook URLs must use HTTPS in production mode",
+        });
+        return;
+      }
+
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        res.status(422).json({
+          error: "InvalidWebhookUrl",
+          message: "Webhook URL must use HTTP or HTTPS protocol",
+        });
+        return;
+      }
+
       try {
         await validateWebhookUrl(url);
+        await validateWebhookUrlSsrf(url);
       } catch (err: any) {
-        res.status(400).json({ error: "InvalidWebhookUrl", message: err.message });
+        res.status(422).json({ error: "InvalidWebhookUrl", message: err.message });
         return;
       }
     } else if (webhookChannel === "email") {

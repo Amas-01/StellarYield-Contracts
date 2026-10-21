@@ -1,4 +1,5 @@
 import { serverTiming } from "./api/middleware/serverTiming.js";
+import { optionalApiKey } from "./api/middleware/auth.js";
 import compression from "compression";
 import cors from "cors";
 import express, { type Express } from "express";
@@ -40,6 +41,9 @@ import { responseSla } from "./api/middleware/routeSla.js";
 import { requestArchive } from "./api/middleware/requestArchive.js";
 import { changelogRouter } from "./api/routes/changelog.js";
 import { announcementsRouter } from "./api/routes/announcements.js";
+import { jsonNestingDepthLimit } from "./api/middleware/jsonNestingDepthLimit.js";
+import { queryArraySizeLimit } from "./api/middleware/queryArraySizeLimit.js";
+import { webhookHttpsEnforcement } from "./api/middleware/webhookHttpsEnforcement.js";
 
 // Cache static responses at startup
 function initStaticCache(): void {
@@ -87,6 +91,8 @@ export function createApp(): Express {
   );
 
   app.use(express.json({ limit: config.requestBodyLimit }));
+  app.use(jsonNestingDepthLimit());
+  app.use(queryArraySizeLimit());
 
   const origins = config.allowedOrigins;
   if (origins.length > 0) {
@@ -94,6 +100,8 @@ export function createApp(): Express {
     app.use(cors({
       origin,
       maxAge: config.cors.maxAge,
+      // Lets browser clients read the key-expiry warning header (#1244).
+      exposedHeaders: ["X-API-Key-Expires-In"],
     }));
   }
 
@@ -141,8 +149,10 @@ export function createApp(): Express {
   // Fee endpoints (#1099, #1101, #1102, #1103). Their paths all have a second
   // segment, so they are mounted first and never shadow a /:contractId route.
   app.use("/api/v1/platform", publicLimiter, platformFeesRouter);
-  app.use("/api/v1/vaults", publicLimiter, vaultFeesRouter);
-  app.use("/api/v1/vaults", publicLimiter, vaultsRouter);
+  // Vault routes stay public; a Bearer key, when presented, scopes what it can
+  // read (#1243). See optionalApiKey.
+  app.use("/api/v1/vaults", publicLimiter, optionalApiKey(), vaultFeesRouter);
+  app.use("/api/v1/vaults", publicLimiter, optionalApiKey(), vaultsRouter);
   app.use("/api/v2/vaults", publicLimiter, vaultsV2Router);
   app.use("/api/v1/users", publicLimiter, usersRouter);
   app.use("/api/v1/yields", publicLimiter, yieldsRouter);
