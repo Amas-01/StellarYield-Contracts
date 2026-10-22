@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Daily `api-key-expiry-reminder` job at 05:00 UTC logs a `warn` entry per active
   key expiring within 7 days (label and expiry date only, no key material).
   `GET /api/v1/admin/api-keys?expiringWithinDays=<1-365>` returns the same keys.
+- A read-only API key that sends a write method is logged as a
+  `READ_ONLY_KEY_DENIED` security event with the key's first 8 characters and the
+  method. The full key is never stored (#1248).
+- Public `GET /api/v1/vaults` and `GET /api/v1/vaults/:contractId` keep the last
+  successful anonymous response for `STALE_TTL_SECONDS` (default 600, new env var).
+  While the database is unreachable, that copy is served with `X-Cache: STALE`
+  and `Warning: 110`. Other requests get 503 `SERVICE_UNAVAILABLE` (#1254).
 
 ### Changed
 
@@ -54,5 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Raw API key authentication failed for every key because the key lookup query
   was missing a comma between `rate_limit_override` and `allowed_cidrs`. The query
   is fixed.
+- Rate-limit 429s, the IP lockout 429 and the SSE connection-limit 429 send
+  `Retry-After`. For window limits it counts down to the window reset. All 503s,
+  including health checks, send `Retry-After: 30` (#1253).
+- An unhandled promise rejection or uncaught exception is logged at `fatal` level
+  with its stack. Logs are flushed and the process exits with code 1 so the
+  supervisor restarts it (#1249).
 
 ### Security

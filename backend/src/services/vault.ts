@@ -479,6 +479,7 @@ interface VaultRow {
   created_at: Date;
   updated_at: Date;
   settlement_status: string | null;
+  supply_at_maturity?: string | null;
 }
 
 function computeFundingProgress(totalAssets: string, fundingTarget: string | null): number | null {
@@ -486,6 +487,27 @@ function computeFundingProgress(totalAssets: string, fundingTarget: string | nul
   const target = parseFloat(fundingTarget);
   if (!target) return 0;
   return Math.min(100, (parseFloat(totalAssets) / target) * 100);
+}
+
+/**
+ * Fraction of the supply redeemed since maturity (#1275): 1 - totalSupply /
+ * supplyAtMaturity, clamped to [0, 1]. Returns undefined for non-matured
+ * vaults so the field is omitted from the response entirely, and for a
+ * matured vault that has no supplyAtMaturity baseline recorded yet.
+ */
+function computeRedeemedPct(
+  state: string,
+  totalSupply: string,
+  supplyAtMaturity: string | null | undefined,
+): number | undefined {
+  if (state !== "Matured") return undefined;
+  if (!supplyAtMaturity) return undefined;
+
+  const maturitySupply = parseFloat(supplyAtMaturity);
+  if (!maturitySupply) return 0;
+
+  const currentSupply = parseFloat(totalSupply ?? "0");
+  return Math.max(0, Math.min(1, 1 - currentSupply / maturitySupply));
 }
 
 function extractAddressFromScVal(topic: unknown): string {
@@ -500,6 +522,8 @@ function extractAddressFromScVal(topic: unknown): string {
 }
 
 function mapVaultRow(row: VaultRow): Vault {
+  const redeemedPct = computeRedeemedPct(row.state, row.total_supply, row.supply_at_maturity);
+
   return {
     id: row.id,
     contractId: row.contract_id,
@@ -530,6 +554,7 @@ function mapVaultRow(row: VaultRow): Vault {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     settlementStatus: (row.settlement_status as Vault["settlementStatus"]) ?? null,
+    ...(redeemedPct !== undefined ? { redeemedPct } : {}),
   };
 }
 
@@ -660,6 +685,7 @@ export class VaultService {
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
                v.description, v.logo_uri,
                v.settlement_status,
+               v.supply_at_maturity,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -679,6 +705,7 @@ export class VaultService {
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
                v.description, v.logo_uri,
                v.settlement_status,
+               v.supply_at_maturity,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -833,6 +860,7 @@ export class VaultService {
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
               v.description, v.logo_uri,
               v.settlement_status,
+              v.supply_at_maturity,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp
