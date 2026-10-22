@@ -7,9 +7,7 @@ export const envSchema = z.object({
     .string()
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1).max(65535)),
-  NODE_ENV: z
-    .string()
-    .default("development"),
+  NODE_ENV: z.string().default("development"),
   STELLAR_NETWORK: z
     .enum(["testnet", "mainnet", "futurenet"])
     .default("testnet"),
@@ -19,9 +17,7 @@ export const envSchema = z.object({
     .refine((v) => v.startsWith("https://"), {
       message: "STELLAR_RPC_URL must use HTTPS",
     }),
-  STELLAR_RPC_FALLBACKS: z
-    .string()
-    .default(""),
+  STELLAR_RPC_FALLBACKS: z.string().default(""),
   STELLAR_RPC_TIMEOUT_MS: z
     .string()
     .default("10000")
@@ -47,7 +43,8 @@ export const envSchema = z.object({
     .string()
     .optional()
     .refine((v) => v === undefined || /^postgres(ql)?:\/\/.+/.test(v), {
-      message: "DATABASE_READ_URL must be a valid PostgreSQL connection string (postgresql://...)",
+      message:
+        "DATABASE_READ_URL must be a valid PostgreSQL connection string (postgresql://...)",
     }),
   INDEXER_START_LEDGER: z
     .string()
@@ -65,9 +62,7 @@ export const envSchema = z.object({
     .default("500")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1)),
-  LARGE_TRANSFER_THRESHOLD: z
-    .string()
-    .default("1000000"),
+  LARGE_TRANSFER_THRESHOLD: z.string().default("1000000"),
   INDEXER_BATCH_SIZE: z
     .string()
     .default("200")
@@ -78,9 +73,7 @@ export const envSchema = z.object({
     .default("100")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1)),
-  WEBHOOK_SECRET: z
-    .string()
-    .default(""),
+  WEBHOOK_SECRET: z.string().default(""),
   // Issue #1062: hours a rotated-out webhook secret stays valid alongside the
   // new one, so receivers can roll over without downtime.
   SECRET_ROTATION_WINDOW_HOURS: z
@@ -88,12 +81,8 @@ export const envSchema = z.object({
     .default("24")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(0)),
-  LOG_LEVEL: z
-    .string()
-    .default("info"),
-  ALLOWED_ORIGINS: z
-    .string()
-    .default(""),
+  LOG_LEVEL: z.string().default("info"),
+  ALLOWED_ORIGINS: z.string().default(""),
   RATE_LIMIT_PUBLIC: z
     .string()
     .default("60")
@@ -183,21 +172,11 @@ export const envSchema = z.object({
     .string()
     .default("false")
     .transform((v) => ["true", "1", "yes"].includes(v.toLowerCase())),
-  ADMIN_IP_ALLOWLIST: z
-    .string()
-    .default(""),
-  REQUEST_BODY_LIMIT: z
-    .string()
-    .default("100kb"),
-  DEBUG_ARCHIVE_ROUTES: z
-    .string()
-    .default(""),
-  INTERNAL_SECRET: z
-    .string()
-    .default(""),
-  ADMIN_JWT_SECRET: z
-    .string()
-    .default("change-me-in-production"),
+  ADMIN_IP_ALLOWLIST: z.string().default(""),
+  REQUEST_BODY_LIMIT: z.string().default("100kb"),
+  DEBUG_ARCHIVE_ROUTES: z.string().default(""),
+  INTERNAL_SECRET: z.string().default(""),
+  ADMIN_JWT_SECRET: z.string().default("change-me-in-production"),
   ADMIN_SESSION_EXPIRY_MINUTES: z
     .string()
     .default("60")
@@ -247,6 +226,11 @@ export const envSchema = z.object({
     .default("10")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1).max(100)),
+  RPC_MAX_CONCURRENT_REQUESTS: z
+    .string()
+    .default("50")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(1).max(1000)),
   SMTP_HOST: z.string().optional(),
   SMTP_PORT: z
     .string()
@@ -323,35 +307,57 @@ export const config = {
     return process.env.ADMIN_JWT_SECRET ?? parsed.data.ADMIN_JWT_SECRET;
   },
   get adminSessionExpiryMinutes() {
-    return Number(process.env.ADMIN_SESSION_EXPIRY_MINUTES ?? parsed.data.ADMIN_SESSION_EXPIRY_MINUTES);
+    return Number(
+      process.env.ADMIN_SESSION_EXPIRY_MINUTES ??
+        parsed.data.ADMIN_SESSION_EXPIRY_MINUTES,
+    );
   },
   get sanctionsListUrl(): string | undefined {
     return process.env.SANCTIONS_LIST_URL ?? parsed.data.SANCTIONS_LIST_URL;
   },
   get transferVelocityThreshold(): number {
-    return Number(process.env.TRANSFER_VELOCITY_THRESHOLD ?? parsed.data.TRANSFER_VELOCITY_THRESHOLD);
+    return Number(
+      process.env.TRANSFER_VELOCITY_THRESHOLD ??
+        parsed.data.TRANSFER_VELOCITY_THRESHOLD,
+    );
   },
   get largeTransferThreshold(): string {
-    return process.env.LARGE_TRANSFER_THRESHOLD ?? parsed.data.LARGE_TRANSFER_THRESHOLD;
+    return (
+      process.env.LARGE_TRANSFER_THRESHOLD ??
+      parsed.data.LARGE_TRANSFER_THRESHOLD
+    );
   },
   get sandboxMode() {
-    return (process.env.SANDBOX_MODE ?? String(parsed.data.SANDBOX_MODE)).toLowerCase() === "true" || process.env.SANDBOX_MODE === "1";
+    return (
+      (
+        process.env.SANDBOX_MODE ?? String(parsed.data.SANDBOX_MODE)
+      ).toLowerCase() === "true" || process.env.SANDBOX_MODE === "1"
+    );
   },
   get enableSandboxReset() {
-    return (process.env.ENABLE_SANDBOX_RESET ?? String(parsed.data.ENABLE_SANDBOX_RESET)).toLowerCase() === "true" || process.env.ENABLE_SANDBOX_RESET === "1";
+    return (
+      (
+        process.env.ENABLE_SANDBOX_RESET ??
+        String(parsed.data.ENABLE_SANDBOX_RESET)
+      ).toLowerCase() === "true" || process.env.ENABLE_SANDBOX_RESET === "1"
+    );
   },
   get archiveCron(): string {
     return process.env.ARCHIVE_CRON ?? parsed.data.ARCHIVE_CRON;
   },
   get dryRun(): boolean {
-    return ["true", "1", "yes"].includes((process.env.DRY_RUN ?? String(parsed.data.DRY_RUN)).toLowerCase());
+    return ["true", "1", "yes"].includes(
+      (process.env.DRY_RUN ?? String(parsed.data.DRY_RUN)).toLowerCase(),
+    );
   },
 
   stellar: {
     network: parsed.data.STELLAR_NETWORK,
     rpcUrl: parsed.data.STELLAR_RPC_URL,
     rpcFallbacks: parsed.data.STELLAR_RPC_FALLBACKS
-      ? parsed.data.STELLAR_RPC_FALLBACKS.split(",").map((s) => s.trim()).filter(Boolean)
+      ? parsed.data.STELLAR_RPC_FALLBACKS.split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
       : [],
     rpcTimeoutMs: parsed.data.STELLAR_RPC_TIMEOUT_MS,
     rpcDebugLog: ["true", "1", "yes"].includes(parsed.data.RPC_DEBUG_LOG.toLowerCase()),
@@ -367,7 +373,8 @@ export const config = {
     poolMax: parsed.data.DB_POOL_MAX,
     idleTimeoutMs: parsed.data.DB_IDLE_TIMEOUT_MS,
     queryTimeoutMs: parsed.data.DB_QUERY_TIMEOUT_MS,
-    slowQueryMs: parsed.data.SLOW_QUERY_THRESHOLD_MS ?? parsed.data.DB_SLOW_QUERY_MS,
+    slowQueryMs:
+      parsed.data.SLOW_QUERY_THRESHOLD_MS ?? parsed.data.DB_SLOW_QUERY_MS,
     poolWarmupConnections: parsed.data.POOL_WARMUP_CONNECTIONS,
   },
   maxResponseSizeMb: parsed.data.MAX_RESPONSE_SIZE_MB,
@@ -382,7 +389,11 @@ export const config = {
 
   allowedOrigins: (() => {
     const raw = parsed.data.ALLOWED_ORIGINS;
-    if (raw) return raw.split(",").map((s) => s.trim()).filter(Boolean);
+    if (raw)
+      return raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
     if (parsed.data.NODE_ENV === "development") return ["*"];
     return [];
   })(),
@@ -402,12 +413,13 @@ export const config = {
   tvlSnapshotRetentionDays: parsed.data.TVL_SNAPSHOT_RETENTION_DAYS,
 
   adminIpAllowlist: parsed.data.ADMIN_IP_ALLOWLIST
-    ? parsed.data.ADMIN_IP_ALLOWLIST.split(",").map((s) => s.trim()).filter(Boolean)
+    ? parsed.data.ADMIN_IP_ALLOWLIST.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
     : [],
 
   requestBodyLimit: parsed.data.REQUEST_BODY_LIMIT,
-  debugArchiveRoutes: parsed.data.DEBUG_ARCHIVE_ROUTES
-    .split(",")
+  debugArchiveRoutes: parsed.data.DEBUG_ARCHIVE_ROUTES.split(",")
     .map((route) => route.trim())
     .filter(Boolean),
   internalSecret: parsed.data.INTERNAL_SECRET,
@@ -424,6 +436,7 @@ export const config = {
   sseReplayBufferSize: parsed.data.SSE_REPLAY_BUFFER,
   dbPoolAlertWaiting: parsed.data.DB_POOL_ALERT_WAITING,
   rpcErrorRateAlertPct: parsed.data.RPC_ERROR_RATE_ALERT_PCT,
+  rpcMaxConcurrentRequests: parsed.data.RPC_MAX_CONCURRENT_REQUESTS,
 
   smtp: {
     host: parsed.data.SMTP_HOST,
@@ -433,7 +446,8 @@ export const config = {
     from: parsed.data.SMTP_FROM,
   },
   apiClient: {
-    baseUrl: parsed.data.API_CLIENT_BASE_URL || `http://localhost:${parsed.data.PORT}`,
+    baseUrl:
+      parsed.data.API_CLIENT_BASE_URL || `http://localhost:${parsed.data.PORT}`,
     apiKey: parsed.data.API_CLIENT_API_KEY,
     timeoutMs: parsed.data.API_CLIENT_TIMEOUT_MS,
     maxRetries: parsed.data.API_CLIENT_MAX_RETRIES,
@@ -454,5 +468,3 @@ export const ROUTE_SLA_MS: Record<string, number> = {
   "/api/v1/vaults": 200,
   "/api/v1/yields/:contractId/epochs": 500,
 };
-
-

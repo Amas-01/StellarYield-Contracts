@@ -139,7 +139,9 @@ export async function rpcFetch(body: object): Promise<Response> {
     );
 
     if (!response.ok && isRetryableHttpStatus(response.status)) {
-      throw new Error(`RPC request failed: ${response.status} ${response.statusText}`);
+      throw new Error(
+        `RPC request failed: ${response.status} ${response.statusText}`,
+      );
     }
 
     return response;
