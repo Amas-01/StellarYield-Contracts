@@ -23,12 +23,20 @@ export const envSchema = z.object({
     .default("10000")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1000)),
-  STELLAR_NETWORK_PASSPHRASE: z.string().optional(),
-  VAULT_FACTORY_CONTRACT_ID: z.string().default(""),
-  DATABASE_URL: z.string().refine((v) => /^postgres(ql)?:\/\/.+/.test(v), {
-    message:
-      "DATABASE_URL must be a valid PostgreSQL connection string (postgresql://...)",
-  }),
+  RPC_DEBUG_LOG: z
+    .string()
+    .default("false"),
+  STELLAR_NETWORK_PASSPHRASE: z
+    .string()
+    .optional(),
+  VAULT_FACTORY_CONTRACT_ID: z
+    .string()
+    .default(""),
+  DATABASE_URL: z
+    .string()
+    .refine((v) => /^postgres(ql)?:\/\/.+/.test(v), {
+      message: "DATABASE_URL must be a valid PostgreSQL connection string (postgresql://...)",
+    }),
   // Optional read replica. SELECT-only (GET handler) queries are routed here to
   // offload the primary. Falls back to DATABASE_URL when unset (#949).
   DATABASE_READ_URL: z
@@ -352,9 +360,9 @@ export const config = {
           .filter(Boolean)
       : [],
     rpcTimeoutMs: parsed.data.STELLAR_RPC_TIMEOUT_MS,
-    networkPassphrase:
-      parsed.data.STELLAR_NETWORK_PASSPHRASE ??
-      getDefaultPassphrase(parsed.data.STELLAR_NETWORK),
+    rpcDebugLog: ["true", "1", "yes"].includes(parsed.data.RPC_DEBUG_LOG.toLowerCase()),
+    networkPassphrase: parsed.data.STELLAR_NETWORK_PASSPHRASE
+      ?? getDefaultPassphrase(parsed.data.STELLAR_NETWORK),
     vaultFactoryContractId: parsed.data.VAULT_FACTORY_CONTRACT_ID,
   },
 

@@ -1,7 +1,7 @@
 import { Account, Contract, TransactionBuilder, BASE_FEE } from "@stellar/stellar-sdk";
 import { rpc, scValToNative, xdr, Address } from "@stellar/stellar-sdk";
 import { config } from "../config.js";
-import { tryRpcEndpoints } from "./rpcClient.js";
+import { timedRpcCall, tryRpcEndpoints } from "./rpcClient.js";
 import type { VaultState } from "../types/index.js";
 
 export function getSorobanRpc(): rpc.Server {
@@ -14,7 +14,7 @@ export function getSorobanRpc(): rpc.Server {
  */
 export async function getLatestLedger(): Promise<rpc.Api.GetLatestLedgerResponse> {
   const server = getSorobanRpc();
-  return server.getLatestLedger();
+  return timedRpcCall("getLatestLedger", () => server.getLatestLedger());
 }
 
 
@@ -55,7 +55,7 @@ async function simulateRead<T>(
 
     try {
       const result = await Promise.race([
-        server.simulateTransaction(tx),
+        timedRpcCall("simulateTransaction", () => server.simulateTransaction(tx)),
         timeoutPromise,
       ]);
       return result;
