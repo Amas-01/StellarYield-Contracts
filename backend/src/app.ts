@@ -183,7 +183,7 @@ export function createApp(): Express {
   // avoid the admin auth middleware consuming /api/v1/admin/feature-flags (#916)
   app.use("/api/v1/admin/feature-flags", authLimiter, featureFlagsRouter);
   app.use("/api/v1/admin", authLimiter, adminRouter);
-  app.use("/api/v1/webhooks", authLimiter, webhooksRouter);
+  app.use("/api/v1/webhooks", authLimiter, webhookHttpsEnforcement(), webhooksRouter);
   // Request body dry run — validation only, never a side effect (#941)
   app.use("/api/v1/validate", publicLimiter, validateRouter);
   // Display-formatting utilities (#1132)

@@ -25,6 +25,13 @@ export const indexerEventsProcessedTotal = new client.Counter({
   registers: [register],
 });
 
+export const indexerUnknownEventsTotal = new client.Counter({
+  name: "indexer_unknown_events_total",
+  help: "Total number of on-chain events with an unrecognized topic",
+  labelNames: ["contract_id", "topic"] as const,
+  registers: [register],
+});
+
 // Per-batch processing time (#1109): one observation per polling tick or
 // backfill batch, covering the event fetch and processing of every event in it.
 export const indexerProcessingDurationSeconds = new client.Histogram({

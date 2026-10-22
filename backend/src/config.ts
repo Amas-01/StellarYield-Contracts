@@ -101,7 +101,22 @@ export const envSchema = z.object({
   LARGE_TRANSFER_THRESHOLD: z.string().default("1000000"),
   INDEXER_BATCH_SIZE: z
     .string()
+    .optional()
+    .transform((v) => v === undefined ? undefined : parseInt(v, 10))
+    .pipe(z.number().int().min(1).optional()),
+  INDEXER_BATCH_LEDGERS: z
+    .string()
     .default("200")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(1)),
+  INDEXER_BATCH_LEDGERS_MIN: z
+    .string()
+    .default("25")
+    .transform((v) => parseInt(v, 10))
+    .pipe(z.number().int().min(1)),
+  INDEXER_BATCH_LEDGERS_MAX: z
+    .string()
+    .default("3200")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1)),
   INDEXER_LAG_ALERT_LEDGERS: z
@@ -420,7 +435,9 @@ export const config = {
   indexer: {
     startLedger: parsed.data.INDEXER_START_LEDGER,
     pollIntervalMs: parsed.data.INDEXER_POLL_INTERVAL_MS,
-    batchSize: parsed.data.INDEXER_BATCH_SIZE,
+    batchSize: parsed.data.INDEXER_BATCH_SIZE ?? parsed.data.INDEXER_BATCH_LEDGERS,
+    minBatchSize: parsed.data.INDEXER_BATCH_LEDGERS_MIN,
+    maxBatchSize: parsed.data.INDEXER_BATCH_LEDGERS_MAX,
     lagAlertLedgers: parsed.data.INDEXER_LAG_ALERT_LEDGERS,
   },
 

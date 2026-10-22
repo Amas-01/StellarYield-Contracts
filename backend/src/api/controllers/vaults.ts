@@ -2045,7 +2045,6 @@ export async function getDepositDistribution(req: Request, res: Response, next: 
       res.status(404).json({ error: "NotFound", message: "Vault not found" });
       return;
     }
-    const vaultId = vaultRows[0].id;
 
     // Gather all deposit amounts for this vault from the indexed_events table.
     // Deposit events are stored with event_type = 'deposit' and payload.amount.
@@ -2277,7 +2276,6 @@ export async function getVaultFlowsDaily(req: Request, res: Response, next: Next
       res.status(404).json({ error: "NotFound", message: "Vault not found" });
       return;
     }
-    const vaultId = vaultRows[0].id;
 
     const fromParam = req.query["from"] as string | undefined;
     const toParam = req.query["to"] as string | undefined;
