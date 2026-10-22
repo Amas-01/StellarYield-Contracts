@@ -2,6 +2,29 @@ import "dotenv/config";
 import { z } from "zod";
 import cron from "node-cron";
 
+// Parse RPC_TIMEOUTS_MS: a JSON object of method name -> positive integer ms.
+// Throws on malformed JSON or a value that is not a whole number of at least 1000ms,
+// matching the STELLAR_RPC_TIMEOUT_MS floor.
+export function parseRpcTimeoutOverrides(raw: string): Record<string, number> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("RPC_TIMEOUTS_MS must be a JSON object");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("RPC_TIMEOUTS_MS must be a JSON object");
+  }
+  const overrides: Record<string, number> = {};
+  for (const [method, value] of Object.entries(parsed)) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1000) {
+      throw new Error(`RPC_TIMEOUTS_MS.${method} must be an integer of at least 1000`);
+    }
+    overrides[method] = value;
+  }
+  return overrides;
+}
+
 export const envSchema = z.object({
   PORT: z
     .string()
@@ -27,6 +50,19 @@ export const envSchema = z.object({
     .default("10000")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1000)),
+  // JSON object mapping RPC method names to a timeout in ms (#1207), e.g.
+  // {"getEvents":30000}. Methods not listed fall back to STELLAR_RPC_TIMEOUT_MS.
+  RPC_TIMEOUTS_MS: z
+    .string()
+    .default("{}")
+    .transform((v, ctx) => {
+      try {
+        return parseRpcTimeoutOverrides(v);
+      } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: (err as Error).message });
+        return z.NEVER;
+      }
+    }),
   STELLAR_NETWORK_PASSPHRASE: z
     .string()
     .optional(),
@@ -351,6 +387,7 @@ export const config = {
       ? parsed.data.STELLAR_RPC_FALLBACKS.split(",").map((s) => s.trim()).filter(Boolean)
       : [],
     rpcTimeoutMs: parsed.data.STELLAR_RPC_TIMEOUT_MS,
+    rpcTimeoutsMs: parsed.data.RPC_TIMEOUTS_MS,
     networkPassphrase: parsed.data.STELLAR_NETWORK_PASSPHRASE
       ?? getDefaultPassphrase(parsed.data.STELLAR_NETWORK),
     vaultFactoryContractId: parsed.data.VAULT_FACTORY_CONTRACT_ID,

@@ -23,6 +23,7 @@ import {
 import { cacheDel } from "../cache/redis.js";
 import { sseService } from "./sse.js";
 import { recordRpcSuccess, recordRpcError } from "./rpcMonitor.js";
+import { withRpcTimeout } from "./rpcClient.js";
 import { TOPIC_EVENT_TYPES } from "./indexerEventTypes.js";
 import { logSystemAudit } from "./adminAuditLog.js";
 
@@ -287,7 +288,7 @@ export class Indexer {
       }
 
       const server = getSorobanRpc();
-      const { sequence: tipLedger } = await withBackoff(() => server.getLatestLedger());
+      const { sequence: tipLedger } = await withBackoff(() => withRpcTimeout("getLatestLedger", () => server.getLatestLedger()));
       const gap = tipLedger - this.lastLedger;
 
       if (gap > config.indexer.batchSize) {
@@ -314,7 +315,7 @@ export class Indexer {
 
     let latestLedger: number;
     try {
-      const resp = await withBackoff(() => server.getLatestLedger());
+      const resp = await withBackoff(() => withRpcTimeout("getLatestLedger", () => server.getLatestLedger()));
       latestLedger = resp.sequence;
     } catch (err) {
       logger.warn({ err }, "RPC error fetching latest ledger during state-only tick");
@@ -339,7 +340,7 @@ export class Indexer {
 
     let latestLedger: number;
     try {
-      const resp = await withBackoff(() => server.getLatestLedger());
+      const resp = await withBackoff(() => withRpcTimeout("getLatestLedger", () => server.getLatestLedger()));
       latestLedger = resp.sequence;
     } catch (err) {
       logger.warn({ err }, "RPC error fetching latest ledger during tick");
@@ -378,7 +379,7 @@ export class Indexer {
       const filters = contractIds.map((id) => ({ contractIds: [id] }));
       try {
         const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: from, filters }),
+          withRpcTimeout("getEvents", () => server.getEvents({ startLedger: from, filters })),
         );
         events = resp.events;
       } catch (err) {
@@ -441,7 +442,7 @@ export class Indexer {
       const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
         const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: cursor + 1, filters }),
+          withRpcTimeout("getEvents", () => server.getEvents({ startLedger: cursor + 1, filters })),
         );
 
         for (const event of resp.events) {
@@ -575,7 +576,7 @@ export class Indexer {
       const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
         const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: cursor + 1, filters }),
+          withRpcTimeout("getEvents", () => server.getEvents({ startLedger: cursor + 1, filters })),
         );
         for (const event of resp.events) {
           // Events past the global cursor are picked up by the regular tick.

@@ -14,6 +14,31 @@ export function buildTimeoutError(timeoutMs: number): Error {
   return new Error(`RPC call timed out after ${timeoutMs}ms`);
 }
 
+/**
+ * Timeout for one RPC method (#1207). A method listed in RPC_TIMEOUTS_MS uses
+ * its own value; any other method uses the global STELLAR_RPC_TIMEOUT_MS.
+ */
+export function rpcTimeoutFor(method: string): number {
+  return config.stellar.rpcTimeoutsMs[method] ?? config.stellar.rpcTimeoutMs;
+}
+
+/**
+ * Run an SDK RPC call and reject if it has not settled within the method's
+ * timeout. The underlying request is not cancelled; its result is discarded.
+ */
+export async function withRpcTimeout<T>(method: string, call: () => Promise<T>): Promise<T> {
+  const timeoutMs = rpcTimeoutFor(method);
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(buildTimeoutError(timeoutMs)), timeoutMs);
+  });
+  try {
+    return await Promise.race([call(), timeout]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 export async function fetchWithTimeout(
   url: string,
   init: RequestInit,
