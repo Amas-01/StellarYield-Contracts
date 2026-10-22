@@ -2,6 +2,7 @@ import { Router } from "express";
 import {
   getAdminStats,
   getAdminIndexer,
+  getIndexerDeadLetters,
   getIndexerEventCounts,
   getQuarterlyYieldReport,
   getTransferAlerts,
@@ -83,6 +84,7 @@ adminRouter.use(requireApiKey({ minRole: "readonly" }));
 adminRouter.get("/stats", getAdminStats);
 adminRouter.get("/reports/vaults.csv", exportVaultsCsv);
 adminRouter.get("/indexer", getAdminIndexer);
+adminRouter.get("/indexer/dead-letters", getIndexerDeadLetters);
 // Issue #1108: event counts per contract
 adminRouter.get("/indexer/event-counts", getIndexerEventCounts);
 adminRouter.get("/indexer/stream", streamIndexerProgress);

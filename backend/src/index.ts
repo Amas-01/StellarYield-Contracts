@@ -9,6 +9,7 @@ import { EventsPruner } from "./services/eventsPruner.js";
 import { JobQueueDepthPoller } from "./services/jobQueueDepthPoller.js";
 import { runDeploymentBenchmarksIfNeeded } from "./services/queryBenchmarks.js";
 import { registerProcessErrorHandlers } from "./services/processErrors.js";
+import { startRpcHealthProbes, stopRpcHealthProbes } from "./services/rpcHealth.js";
 
 // Registered before any startup work, so a rejection in warmUpPool or the listen callback is logged at fatal level (#1249).
 registerProcessErrorHandlers();
@@ -38,6 +39,7 @@ const server = app.listen(config.port, async () => {
   void indexer.start();
   pruner.start();
   jobQueueDepthPoller.start();
+  startRpcHealthProbes();
 });
 
 async function shutdown(): Promise<void> {
@@ -45,6 +47,7 @@ async function shutdown(): Promise<void> {
   indexer.stop();
   pruner.stop();
   jobQueueDepthPoller.stop();
+  stopRpcHealthProbes();
   await jobQueue.stop();
   server.close(() => {
     logger.info("StellarYield backend stopped");

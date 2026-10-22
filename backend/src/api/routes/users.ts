@@ -59,7 +59,11 @@ export const batchPortfoliosBodySchema = z.object({
 });
 
 const searchQuerySchema = z.object({
-  search: z.string().min(4, "Search query must be at least 4 characters long"),
+  search: z
+    .string()
+    .min(4, "Search query must be at least 4 characters long")
+    .max(200, "Search query must be at most 200 characters")
+    .regex(/^[^\x00-\x1f\x7f]*$/, "Search query must not contain control characters"),
 });
 
 const kycQuerySchema = z.object({

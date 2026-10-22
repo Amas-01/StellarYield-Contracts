@@ -80,25 +80,25 @@ describe("requireApiKey middleware (#693)", () => {
 
       await requireApiKey()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({
-        error: "Forbidden",
-        message: "Invalid API key",
+        error: "Unauthorized",
+        message: "Invalid or expired API key",
       });
       expect(next).not.toHaveBeenCalled();
     });
 
-    it("treats a database error as an invalid key (fails closed with 403)", async () => {
+    it("treats a database error as an invalid key (fails closed with 401)", async () => {
       const { query, requireApiKey } = await getTestContext();
       query.mockRejectedValue(new Error("connection refused"));
       const { req, res, next } = makeReqRes("Bearer some-key");
 
       await requireApiKey()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({
-        error: "Forbidden",
-        message: "Invalid API key",
+        error: "Unauthorized",
+        message: "Invalid or expired API key",
       });
       expect(next).not.toHaveBeenCalled();
     });
@@ -233,7 +233,7 @@ describe("requireApiKey middleware (#693)", () => {
       expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({
         error: "Unauthorized",
-        message: "API key has expired",
+        message: "Invalid or expired API key",
       });
       expect(next).not.toHaveBeenCalled();
     });
@@ -312,7 +312,7 @@ describe("requireApiKey middleware (#693)", () => {
       expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({
         error: "Unauthorized",
-        message: "JWT expired",
+        message: "Invalid or expired API key",
       });
       expect(next).not.toHaveBeenCalled();
     });
