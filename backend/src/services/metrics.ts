@@ -41,6 +41,17 @@ export const indexerLastLedger = new client.Gauge({
   registers: [register],
 });
 
+// #1217 — how far the indexer lags behind the chain tip, in seconds.
+// Stellar ledgers close roughly every 5 s, so lag_ledgers * 5 ≈ lag_seconds,
+// but using real close times would require an extra RPC call. The gauge is
+// reset to 0 when there is no lag (lastLedger == latestLedger) so alerts
+// can fire on any non-zero value.
+export const indexerLagSeconds = new client.Gauge({
+  name: "indexer_lag_seconds",
+  help: "Estimated indexer lag behind chain tip in seconds (ledger_lag * 5 s/ledger)",
+  registers: [register],
+});
+
 export const dbQueryDurationSeconds = new client.Histogram({
   name: "db_query_duration_seconds",
   help: "Database query duration in seconds",
