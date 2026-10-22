@@ -19,6 +19,18 @@ export const pool = new Pool({
   query_timeout: config.db.queryTimeoutMs,
 });
 
+// Set lock_timeout and statement_timeout on every new connection so that
+// runaway queries and lock-wait storms never silently stall the API. (#1227)
+pool.on("connect", (client) => {
+  const lockTimeoutMs = config.db.queryTimeoutMs ?? 30_000;
+  const stmtTimeoutMs = config.db.queryTimeoutMs ?? 30_000;
+  client.query(
+    `SET lock_timeout = '${lockTimeoutMs}ms'; SET statement_timeout = '${stmtTimeoutMs}ms';`,
+  ).catch((err: unknown) => {
+    logger.warn({ err }, "Failed to set DB session timeouts on new connection");
+  });
+});
+
 // ── Reconnect state (#1255) ───────────────────────────────────────────────────
 // When the database connection is lost (restart, network partition), the pool
 // emits 'error'. We retry `SELECT 1` with exponential backoff (max 30 s) until
