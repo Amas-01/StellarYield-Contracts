@@ -8,13 +8,40 @@ export function getSorobanRpc(): rpc.Server {
   return new rpc.Server(config.stellar.rpcUrl);
 }
 
+let cachedLatestLedger: { response: rpc.Api.GetLatestLedgerResponse; expiresAt: number } | null = null;
+let inFlightLatestLedger: Promise<rpc.Api.GetLatestLedgerResponse> | null = null;
+const LATEST_LEDGER_TTL_MS = 5000;
+
 /**
  * Query the latest ledger sequence from the Soroban RPC server.
  * Lightweight call used by the indexer and /health latency check.
+ * Cached in-memory with a 5s TTL, coalescing concurrent calls.
  */
 export async function getLatestLedger(): Promise<rpc.Api.GetLatestLedgerResponse> {
-  const server = getSorobanRpc();
-  return timedRpcCall("getLatestLedger", () => server.getLatestLedger());
+  const now = Date.now();
+  if (cachedLatestLedger && cachedLatestLedger.expiresAt > now) {
+    return cachedLatestLedger.response;
+  }
+
+  if (inFlightLatestLedger) {
+    return inFlightLatestLedger;
+  }
+
+  inFlightLatestLedger = (async () => {
+    try {
+      const server = getSorobanRpc();
+      const resp = await timedRpcCall("getLatestLedger", () => server.getLatestLedger());
+      cachedLatestLedger = {
+        response: resp,
+        expiresAt: Date.now() + LATEST_LEDGER_TTL_MS,
+      };
+      return resp;
+    } finally {
+      inFlightLatestLedger = null;
+    }
+  })();
+
+  return inFlightLatestLedger;
 }
 
 

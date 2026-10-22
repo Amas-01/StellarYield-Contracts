@@ -251,15 +251,15 @@ export const httpErrorsTotal = new client.Counter({
 
 // ── RPC metrics (#new) ────────────────────────────────────────────────────────
 
-export const rpcCallsTotal = new client.Counter({
-  name: "rpc_calls_total",
+export const rpcMonitorCallsTotal = new client.Counter({
+  name: "rpc_monitor_calls_total",
   help: "Total number of RPC calls made",
   labelNames: ["method", "status"] as const,
   registers: [register],
 });
 
-export const rpcCallDurationSeconds = new client.Histogram({
-  name: "rpc_call_duration_seconds",
+export const rpcMonitorCallDurationSeconds = new client.Histogram({
+  name: "rpc_monitor_call_duration_seconds",
   help: "RPC call duration in seconds by method",
   labelNames: ["method"] as const,
   buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 30],

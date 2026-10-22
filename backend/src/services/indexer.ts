@@ -26,6 +26,7 @@ import { recordRpcSuccess, recordRpcError } from "./rpcMonitor.js";
 import { timedRpcCall } from "./rpcClient.js";
 import { TOPIC_EVENT_TYPES } from "./indexerEventTypes.js";
 import { logSystemAudit } from "./adminAuditLog.js";
+import { recordLedgerAnchor, ledgerToTimestamp } from "./ledgerEstimator.js";
 
 // ── Lightweight trace spans (#827) ────────────────────────────────────────────
 // No external tracing dependency — spans are emitted as structured pino log
@@ -337,6 +338,7 @@ export class Indexer {
 
     this.lastLedger = latestLedger;
     await this.saveLastIndexedLedger(latestLedger);
+    await this.recordAnchorsIfNeeded(this.lastLedger, latestLedger, []);
     logger.info({ ledger: latestLedger }, "state-only tick complete");
     this.lastTickAt = new Date();
   }
@@ -411,6 +413,7 @@ export class Indexer {
           await this.processEvent(event, tickSpan);
         }
         await this.saveLastIndexedLedger(latestLedger);
+        await this.recordAnchorsIfNeeded(from, latestLedger, events);
       });
     } catch (err) {
       endBatchTimer();
@@ -472,6 +475,7 @@ export class Indexer {
             await this.processEvent(event);
           }
           await this.saveLastIndexedLedger(batchTo);
+          await this.recordAnchorsIfNeeded(cursor + 1, batchTo, resp.events);
         });
         endBatchTimer();
 
@@ -2214,6 +2218,27 @@ export class Indexer {
        ON CONFLICT (id) DO UPDATE SET start_ledger = EXCLUDED.start_ledger, updated_at = NOW()`,
       [startBlock],
     );
+  }
+
+  /**
+   * Populate ledger_anchors every 1000 ledgers.
+   */
+  async recordAnchorsIfNeeded(fromLedger: number, toLedger: number, events: any[]): Promise<void> {
+    const startThousand = Math.ceil(fromLedger / 1000) * 1000;
+    for (let seq = startThousand; seq <= toLedger; seq += 1000) {
+      if (seq <= 0) continue;
+      let closedAt: Date | null = null;
+      for (const ev of events) {
+        if (ev.ledger === seq && typeof ev.ledgerClosedAt === "string") {
+          closedAt = new Date(ev.ledgerClosedAt);
+          break;
+        }
+      }
+      if (!closedAt) {
+        closedAt = new Date();
+      }
+      await recordLedgerAnchor(seq, closedAt);
+    }
   }
 
   private async sleepWhileRunning(ms: number): Promise<void> {
