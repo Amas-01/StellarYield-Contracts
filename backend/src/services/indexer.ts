@@ -23,7 +23,7 @@ import {
 import { cacheDel } from "../cache/redis.js";
 import { sseService } from "./sse.js";
 import { recordRpcSuccess, recordRpcError } from "./rpcMonitor.js";
-import { withRpcTimeout } from "./rpcClient.js";
+import { timedRpcCall } from "./rpcClient.js";
 import { TOPIC_EVENT_TYPES } from "./indexerEventTypes.js";
 import { logSystemAudit } from "./adminAuditLog.js";
 
@@ -101,10 +101,17 @@ function parseRawEventName(rawEvent: any): { topics: unknown[]; data: unknown } 
   return { topics, data };
 }
 
-async function withBackoff<T>(
+// Upper bound on any single retry wait (#1204).
+export const RPC_BACKOFF_MAX_DELAY_MS = 30_000;
+
+// Full jitter (#1204): each retry waits a random time between 0 and the
+// exponential ceiling, so instances rate-limited together do not retry in
+// lockstep. `random` is injectable so tests can pass a seeded source.
+export async function withBackoff<T>(
   fn: () => Promise<T>,
   retries = 5,
   startDelayMs = 1000,
+  random: () => number = Math.random,
 ): Promise<T> {
   let attempt = 0;
   while (true) {
@@ -119,7 +126,7 @@ async function withBackoff<T>(
         err?.status === 429 ||
         String(err?.message ?? "").includes("429");
       if (!is429 || attempt >= retries) throw err;
-      const delayMs = Math.min(startDelayMs * Math.pow(2, attempt), 60_000);
+      const delayMs = Math.min(random() * startDelayMs * Math.pow(2, attempt), RPC_BACKOFF_MAX_DELAY_MS);
       logger.warn(
         { attempt: attempt + 1, delayMs },
         "RPC 429 rate-limit; retrying with backoff",
@@ -288,7 +295,7 @@ export class Indexer {
       }
 
       const server = getSorobanRpc();
-      const { sequence: tipLedger } = await withBackoff(() => withRpcTimeout("getLatestLedger", () => server.getLatestLedger()));
+      const { sequence: tipLedger } = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       const gap = tipLedger - this.lastLedger;
 
       if (gap > config.indexer.batchSize) {
@@ -315,7 +322,7 @@ export class Indexer {
 
     let latestLedger: number;
     try {
-      const resp = await withBackoff(() => withRpcTimeout("getLatestLedger", () => server.getLatestLedger()));
+      const resp = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       latestLedger = resp.sequence;
     } catch (err) {
       logger.warn({ err }, "RPC error fetching latest ledger during state-only tick");
@@ -340,7 +347,7 @@ export class Indexer {
 
     let latestLedger: number;
     try {
-      const resp = await withBackoff(() => withRpcTimeout("getLatestLedger", () => server.getLatestLedger()));
+      const resp = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       latestLedger = resp.sequence;
     } catch (err) {
       logger.warn({ err }, "RPC error fetching latest ledger during tick");
@@ -378,9 +385,8 @@ export class Indexer {
     if (contractIds.length > 0 || this.watchedContractIds.size === 0) {
       const filters = contractIds.map((id) => ({ contractIds: [id] }));
       try {
-        const resp = await withBackoff(() =>
-          withRpcTimeout("getEvents", () => server.getEvents({ startLedger: from, filters })),
-        );
+        const params = { startLedger: from, filters };
+        const resp = await withBackoff(() => timedRpcCall("getEvents", () => server.getEvents(params), params));
         events = resp.events;
       } catch (err) {
         logger.warn({ err, from, to: latestLedger }, "RPC error fetching events during tick");
@@ -453,9 +459,8 @@ export class Indexer {
 
       const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
-        const resp = await withBackoff(() =>
-          withRpcTimeout("getEvents", () => server.getEvents({ startLedger: cursor + 1, filters })),
-        );
+        const params = { startLedger: cursor + 1, filters };
+        const resp = await withBackoff(() => timedRpcCall("getEvents", () => server.getEvents(params), params));
 
         // Each backfill batch commits its events and cursor atomically (#1210).
         await withTransaction(async () => {
@@ -591,9 +596,8 @@ export class Indexer {
       const batchTo = Math.min(cursor + config.indexer.batchSize, toLedger);
       const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
-        const resp = await withBackoff(() =>
-          withRpcTimeout("getEvents", () => server.getEvents({ startLedger: cursor + 1, filters })),
-        );
+        const params = { startLedger: cursor + 1, filters };
+        const resp = await withBackoff(() => timedRpcCall("getEvents", () => server.getEvents(params), params));
         for (const event of resp.events) {
           // Events past the global cursor are picked up by the regular tick.
           if ((event.ledger ?? 0) > toLedger) continue;
