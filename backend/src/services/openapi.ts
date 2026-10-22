@@ -32,6 +32,8 @@ const vaultSchema = z.object({
   logoUri: z.string().nullable().optional().openapi({ example: "https://example.com/logo.png" }),
   createdAt: z.string().openapi({ example: "2026-01-15T00:00:00.000Z" }),
   updatedAt: z.string().openapi({ example: "2026-09-20T00:00:00.000Z" }),
+  // #1275 – 1 - totalSupply / supplyAtMaturity. Present only for Matured vaults.
+  redeemedPct: z.number().optional().openapi({ example: 0.35 }),
 });
 
 const paginatedVaultsSchema = z.object({

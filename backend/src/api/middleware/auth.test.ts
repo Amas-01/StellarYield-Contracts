@@ -175,6 +175,38 @@ describe("requireApiKey middleware (#693)", () => {
       expect(next).not.toHaveBeenCalled();
     });
 
+    it("logs READ_ONLY_KEY_DENIED with only the key prefix when a readonly key writes (#1248)", async () => {
+      const { query, requireApiKey } = await getTestContext();
+      query.mockResolvedValue([{ id: 1, role: "readonly", label: "dashboard" }]);
+      const plaintext = `a1b2c3d4${"e".repeat(56)}`;
+      const { req, res, next } = makeReqRes(`Bearer ${plaintext}`);
+      req.method = "POST";
+      req.path = "/api/v1/vaults/bulk/status";
+
+      await requireApiKey({ minRole: "readonly" })(req, res, next);
+
+      const insert = query.mock.calls.find(([sql]) => String(sql).includes("INSERT INTO security_events"));
+      expect(insert).toBeDefined();
+      const params = insert![1] as unknown[];
+      expect(params[0]).toBe("READ_ONLY_KEY_DENIED");
+      expect(params[2]).toBe("dashboard");
+      expect(params[3]).toBe("/api/v1/vaults/bulk/status");
+      expect(JSON.parse(params[4] as string)).toEqual({ keyPrefix: "a1b2c3d4", method: "POST" });
+      expect(JSON.stringify(query.mock.calls)).not.toContain(plaintext);
+    });
+
+    it("does not log READ_ONLY_KEY_DENIED for a readonly key on a GET route (#1248)", async () => {
+      const { query, requireApiKey } = await getTestContext();
+      query.mockResolvedValue([{ id: 1, role: "readonly", label: null }]);
+      const { req, res, next } = makeReqRes("Bearer readonly-key");
+      req.method = "GET";
+
+      await requireApiKey({ minRole: "readonly" })(req, res, next);
+
+      const denied = query.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO security_events"));
+      expect(denied).toBe(false);
+    });
+
     it("allows an admin key to call a POST route under minRole: readonly", async () => {
       const { query, requireApiKey } = await getTestContext();
       query.mockResolvedValue([{ id: 1, role: "admin", label: null }]);

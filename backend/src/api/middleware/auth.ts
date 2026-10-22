@@ -6,6 +6,7 @@ import { logger } from "../../logger.js";
 import { config } from "../../config.js";
 import { incrementCounter, recordApiKeyUsage } from "../../cache/redis.js";
 import { logSecurityEvent } from "../../services/securityLogger.js";
+import { setRetryAfter } from "./retryAfter.js";
 
 interface ApiKey {
   id: number;
@@ -35,6 +36,8 @@ declare module "express-serve-static-core" {
 }
 
 const READ_ONLY_METHODS = new Set(["GET", "HEAD"]);
+/** Leading characters of a presented key kept in READ_ONLY_KEY_DENIED details (#1248). */
+const KEY_PREFIX_LENGTH = 8;
 
 const AUTH_FAIL_LOCKOUT_THRESHOLD = 20;
 const AUTH_FAIL_LOCKOUT_TTL_SECONDS = 15 * 60;
@@ -170,6 +173,24 @@ function isMethodAllowed(apiKey: Pick<ApiKey, "allowedMethods">, method: string)
   return apiKey.allowedMethods.some((allowed) => allowed.toUpperCase() === method.toUpperCase());
 }
 
+/**
+ * Log a role rejection for an API key. A read-only key sending a write method is
+ * logged as READ_ONLY_KEY_DENIED with the key's prefix, so misconfigured clients
+ * and probing are visible on their own. The full key is never stored (#1248).
+ */
+async function logRoleDenial(req: Request, ip: string, apiKey: ApiKey, presentedKey: string): Promise<void> {
+  if (apiKey.role === "readonly" && !READ_ONLY_METHODS.has(req.method)) {
+    await logSecurityEvent("READ_ONLY_KEY_DENIED", {
+      ipAddress: ip,
+      apiKeyLabel: apiKey.label,
+      path: req.path,
+      details: { keyPrefix: presentedKey.slice(0, KEY_PREFIX_LENGTH), method: req.method },
+    });
+    return;
+  }
+  await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "insufficient_permissions" } });
+}
+
 function getClientIp(req: Request): string {
   const forwarded = req.headers["x-forwarded-for"];
   if (typeof forwarded === "string") {
@@ -273,6 +294,8 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
     const lockoutCount = await incrementCounter(`auth_fail:${ip}`, AUTH_FAIL_LOCKOUT_TTL_SECONDS);
     if (lockoutCount !== null && lockoutCount > AUTH_FAIL_LOCKOUT_THRESHOLD) {
       await logSecurityEvent("IP_LOCKOUT", { ipAddress: ip, path: req.path });
+      // The counter's TTL starts at the first failure, so the lockout ends no later than this (#1253).
+      setRetryAfter(res, AUTH_FAIL_LOCKOUT_TTL_SECONDS);
       res.status(429).json({ error: "TooManyRequests", message: "IP locked out due to too many failed attempts" });
       return;
     }
@@ -489,7 +512,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
     }
 
     if (options?.role && apiKey.role !== options.role) {
-      await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "insufficient_permissions" } });
+      await logRoleDenial(req, ip, apiKey, token);
       logger.info({
         event: "auth_attempt",
         success: false,
@@ -505,7 +528,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
 
     if (options?.minRole === "readonly" && apiKey.role !== "admin") {
       if (apiKey.role !== "readonly" || !READ_ONLY_METHODS.has(req.method)) {
-        await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "insufficient_permissions" } });
+        await logRoleDenial(req, ip, apiKey, token);
         logger.info({
           event: "auth_attempt",
           success: false,
