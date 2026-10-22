@@ -2,7 +2,7 @@ import { tvlPubSub } from "./tvlPubSub.js";
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import { query } from "../db/index.js";
+import { query, withTransaction } from "../db/index.js";
 import { userServiceInstance } from "./userSingleton.js";
 import {
   getSorobanRpc,
@@ -397,15 +397,27 @@ export class Indexer {
       "Indexer tick complete",
     );
 
-    for (const event of events) {
-      await this.processEvent(event, tickSpan);
+    // Events and the cursor commit together (#1210): a failure part-way through
+    // rolls the whole batch back, so the next tick re-fetches the same range.
+    try {
+      await withTransaction(async () => {
+        for (const event of events) {
+          await this.processEvent(event, tickSpan);
+        }
+        await this.saveLastIndexedLedger(latestLedger);
+      });
+    } catch (err) {
+      endBatchTimer();
+      logger.error({ err, from, to: latestLedger }, "Indexer batch failed; rolled back, cursor not advanced");
+      finishSpan(tickSpan, { error: true });
+      return;
     }
     endBatchTimer();
 
     await this.notificationService?.processRetries();
 
     this.lastLedger = latestLedger;
-    await this.persistLastLedger();
+    indexerLastLedger.set(latestLedger);
     this.lastTickAt = new Date();
     finishSpan(tickSpan);
   }
@@ -445,18 +457,22 @@ export class Indexer {
           withRpcTimeout("getEvents", () => server.getEvents({ startLedger: cursor + 1, filters })),
         );
 
-        for (const event of resp.events) {
-          logger.debug(
-            { contractId: event.contractId, type: event.type, ledger: event.ledger },
-            "Backfill event",
-          );
-          await this.processEvent(event);
-        }
+        // Each backfill batch commits its events and cursor atomically (#1210).
+        await withTransaction(async () => {
+          for (const event of resp.events) {
+            logger.debug(
+              { contractId: event.contractId, type: event.type, ledger: event.ledger },
+              "Backfill event",
+            );
+            await this.processEvent(event);
+          }
+          await this.saveLastIndexedLedger(batchTo);
+        });
         endBatchTimer();
 
         cursor = batchTo;
         this.lastLedger = cursor;
-        await this.persistLastLedger();
+        indexerLastLedger.set(cursor);
         this.lastTickAt = new Date();
 
         batchCount++;
@@ -2152,11 +2168,6 @@ export class Indexer {
         parsedData ? JSON.stringify(parsedData) : null,
       ],
     );
-  }
-
-  private async persistLastLedger(): Promise<void> {
-    await this.saveLastIndexedLedger(this.lastLedger);
-    indexerLastLedger.set(this.lastLedger);
   }
 
   async getLastIndexedLedger(): Promise<number> {
