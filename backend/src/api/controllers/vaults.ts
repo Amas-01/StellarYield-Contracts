@@ -2376,6 +2376,11 @@ export async function getVaultFlowsDaily(req: Request, res: Response, next: Next
   }
 }
 
+
+// Restored endpoints
+// Issue #1264 — Average holding duration
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
  * GET /api/v1/vaults/:contractId/holding-duration
  *
@@ -2572,7 +2577,6 @@ export async function getRedemptionQueueEta(req: Request, res: Response, next: N
     next(err);
   }
 }
-// ---------------------------------------------------------------------------
 // Issue #1273 — Add maturity countdown fields
 // ---------------------------------------------------------------------------
 

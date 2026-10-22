@@ -1,5 +1,10 @@
 import { config } from "../config.js";
 import { logger } from "../logger.js";
+import {
+  rpcMonitorCallsTotal,
+  rpcMonitorCallDurationSeconds,
+  rpcActiveRequests,
+} from "./metrics.js";
 
 // ── RPC error-rate alerting (#829) ────────────────────────────────────────────
 //
@@ -11,12 +16,33 @@ import { logger } from "../logger.js";
 let windowErrors = 0;
 let windowSuccesses = 0;
 
-export function recordRpcSuccess(): void {
+export function recordRpcSuccess(method?: string): void {
   windowSuccesses++;
+  if (method) {
+    rpcMonitorCallsTotal.inc({ method, status: "success" });
+  }
 }
 
-export function recordRpcError(): void {
+export function recordRpcError(method?: string): void {
   windowErrors++;
+  if (method) {
+    rpcMonitorCallsTotal.inc({ method, status: "error" });
+  }
+}
+
+/**
+ * Record the start of an RPC call, returning a function to call when complete.
+ * Tracks duration and active request count.
+ */
+export function startRpcCall(method: string): () => void {
+  const start = Date.now();
+  rpcActiveRequests.inc();
+
+  return () => {
+    const durationSeconds = (Date.now() - start) / 1000;
+    rpcMonitorCallDurationSeconds.observe({ method }, durationSeconds);
+    rpcActiveRequests.dec();
+  };
 }
 
 function flushWindow(): void {

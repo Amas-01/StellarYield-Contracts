@@ -33,6 +33,8 @@ import { requestId } from "./api/middleware/requestId.js";
 import { requestContext } from "./api/middleware/requestContext.js";
 import { responseSizeLimit } from "./api/middleware/responseSizeLimit.js";
 import { cacheControl } from "./api/middleware/cacheControl.js";
+import { requestTimeout } from "./api/middleware/requestTimeout.js";
+import { loadShedder } from "./api/middleware/loadShed.js";
 import { internalAuth } from "./api/middleware/internalAuth.js";
 import { internalRouter } from "./api/routes/internal.js";
 import { publicLimiter, authLimiter } from "./api/middleware/rateLimit.js";
@@ -44,6 +46,9 @@ import { announcementsRouter } from "./api/routes/announcements.js";
 import { jsonNestingDepthLimit } from "./api/middleware/jsonNestingDepthLimit.js";
 import { queryArraySizeLimit } from "./api/middleware/queryArraySizeLimit.js";
 import { webhookHttpsEnforcement } from "./api/middleware/webhookHttpsEnforcement.js";
+import { enforceJsonContentType } from "./api/middleware/enforceJsonContentType.js";
+import { serializeAmounts } from "./utils/serializeAmounts.js";
+import { normalizeTrailingSlash } from "./api/middleware/trailingSlash.js";
 
 // Cache static responses at startup
 function initStaticCache(): void {
@@ -91,8 +96,11 @@ export function createApp(): Express {
   );
 
   app.use(express.json({ limit: config.requestBodyLimit }));
+  app.set("json replacer", serializeAmounts);
+  app.use(enforceJsonContentType());
   app.use(jsonNestingDepthLimit());
   app.use(queryArraySizeLimit());
+  app.use(normalizeTrailingSlash());
 
   const origins = config.allowedOrigins;
   if (origins.length > 0) {
@@ -138,6 +146,11 @@ export function createApp(): Express {
     next();
   });
 
+
+  // Overload protection (#1251) and the per-request timeout (#1250). Both sit
+  // after the metrics hook above, so their 503s still reach http_requests_total.
+  app.use(loadShedder());
+  app.use(requestTimeout());
 
   app.use("/health", publicLimiter, healthRouter);
   // Versioned alias for SDK clients and integration tests (#874).

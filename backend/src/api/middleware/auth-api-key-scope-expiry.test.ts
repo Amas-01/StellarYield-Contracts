@@ -186,7 +186,7 @@ describe("per-key vault scope (#1243)", () => {
       const { req, res, next } = makeReqRes({ authHeader: "Bearer bogus-key" });
 
       optionalApiKey()(req, res, next);
-      await vi.waitFor(() => expect(res.status).toHaveBeenCalledWith(403));
+      await vi.waitFor(() => expect(res.status).toHaveBeenCalledWith(401));
 
       expect(next).not.toHaveBeenCalled();
     });

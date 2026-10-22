@@ -2,7 +2,7 @@ import { tvlPubSub } from "./tvlPubSub.js";
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
-import { query } from "../db/index.js";
+import { query, withTransaction } from "../db/index.js";
 import { userServiceInstance } from "./userSingleton.js";
 import {
   getSorobanRpc,
@@ -16,6 +16,7 @@ import { YieldService } from "./yield.js";
 import { NotificationService } from "./notifications.js";
 import {
   indexerEventsProcessedTotal,
+  indexerLagSeconds,
   indexerLastLedger,
   indexerProcessingDurationSeconds,
   indexerUnknownEventsTotal,
@@ -23,8 +24,10 @@ import {
 import { cacheDel } from "../cache/redis.js";
 import { sseService } from "./sse.js";
 import { recordRpcSuccess, recordRpcError } from "./rpcMonitor.js";
+import { timedRpcCall } from "./rpcClient.js";
 import { TOPIC_EVENT_TYPES } from "./indexerEventTypes.js";
 import { logSystemAudit } from "./adminAuditLog.js";
+import { recordLedgerAnchor, ledgerToTimestamp } from "./ledgerEstimator.js";
 
 // ── Lightweight trace spans (#827) ────────────────────────────────────────────
 // No external tracing dependency — spans are emitted as structured pino log
@@ -100,10 +103,17 @@ function parseRawEventName(rawEvent: any): { topics: unknown[]; data: unknown } 
   return { topics, data };
 }
 
-async function withBackoff<T>(
+// Upper bound on any single retry wait (#1204).
+export const RPC_BACKOFF_MAX_DELAY_MS = 30_000;
+
+// Full jitter (#1204): each retry waits a random time between 0 and the
+// exponential ceiling, so instances rate-limited together do not retry in
+// lockstep. `random` is injectable so tests can pass a seeded source.
+export async function withBackoff<T>(
   fn: () => Promise<T>,
   retries = 5,
   startDelayMs = 1000,
+  random: () => number = Math.random,
 ): Promise<T> {
   let attempt = 0;
   while (true) {
@@ -118,7 +128,7 @@ async function withBackoff<T>(
         err?.status === 429 ||
         String(err?.message ?? "").includes("429");
       if (!is429 || attempt >= retries) throw err;
-      const delayMs = Math.min(startDelayMs * Math.pow(2, attempt), 60_000);
+      const delayMs = Math.min(random() * startDelayMs * Math.pow(2, attempt), RPC_BACKOFF_MAX_DELAY_MS);
       logger.warn(
         { attempt: attempt + 1, delayMs },
         "RPC 429 rate-limit; retrying with backoff",
@@ -343,7 +353,7 @@ export class Indexer {
       }
 
       const server = getSorobanRpc();
-      const { sequence: tipLedger } = await withBackoff(() => server.getLatestLedger());
+      const { sequence: tipLedger } = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       const gap = tipLedger - this.lastLedger;
 
       if (gap > this.currentBatchSize) {
@@ -410,7 +420,7 @@ export class Indexer {
 
     let latestLedger: number;
     try {
-      const resp = await withBackoff(() => server.getLatestLedger());
+      const resp = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       latestLedger = resp.sequence;
     } catch (err) {
       logger.warn({ err }, "RPC error fetching latest ledger during state-only tick");
@@ -425,6 +435,7 @@ export class Indexer {
 
     this.lastLedger = latestLedger;
     await this.saveLastIndexedLedger(latestLedger);
+    await this.recordAnchorsIfNeeded(this.lastLedger, latestLedger, []);
     logger.info({ ledger: latestLedger }, "state-only tick complete");
     this.lastTickAt = new Date();
   }
@@ -435,7 +446,7 @@ export class Indexer {
 
     let latestLedger: number;
     try {
-      const resp = await withBackoff(() => server.getLatestLedger());
+      const resp = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       latestLedger = resp.sequence;
     } catch (err) {
       logger.warn({ err }, "RPC error fetching latest ledger during tick");
@@ -449,6 +460,9 @@ export class Indexer {
     if (lag > threshold) {
       logger.error(`Indexer lag: ${lag} ledgers behind chain tip`);
     }
+    // #1217 — expose lag as a Prometheus gauge (ledgers × 5 s/ledger).
+    // Resets to 0 when caught up so alert rules can fire on any nonzero value.
+    indexerLagSeconds.set(Math.max(0, lag) * 5);
 
     if (latestLedger <= this.lastLedger) {
       finishSpan(tickSpan, { ledgerRange: 0, eventCount: 0 });
@@ -474,9 +488,8 @@ export class Indexer {
     if (contractIds.length > 0 || this.watchedContractIds.size === 0) {
       const filters = contractIds.map((id) => ({ contractIds: [id] }));
       try {
-        const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: from, endLedger: batchTo, filters }),
-        );
+        const params = { startLedger: from, filters };
+        const resp = await withBackoff(() => timedRpcCall("getEvents", () => server.getEvents(params), params));
         events = resp.events;
       } catch (err) {
         logger.warn({ err, from, to: batchTo }, "RPC error fetching events during tick");
@@ -494,10 +507,21 @@ export class Indexer {
       "Indexer tick complete",
     );
 
-    const batchDurationMs = endBatchTimer() * 1000;
-
-    for (const event of events) {
-      await this.processEvent(event, tickSpan);
+    // Events and the cursor commit together (#1210): a failure part-way through
+    // rolls the whole batch back, so the next tick re-fetches the same range.
+    try {
+      await withTransaction(async () => {
+        for (const event of events) {
+          await this.processEvent(event, tickSpan);
+        }
+        await this.saveLastIndexedLedger(latestLedger);
+        await this.recordAnchorsIfNeeded(from, latestLedger, events);
+      });
+    } catch (err) {
+      endBatchTimer();
+      logger.error({ err, from, to: latestLedger }, "Indexer batch failed; rolled back, cursor not advanced");
+      finishSpan(tickSpan, { error: true });
+      return;
     }
 
     // Only tune on a tick that actually advanced the cursor: an idle poll that
@@ -508,8 +532,8 @@ export class Indexer {
 
     await this.notificationService?.processRetries();
 
-    this.lastLedger = batchTo;
-    await this.persistLastLedger();
+    this.lastLedger = latestLedger;
+    indexerLastLedger.set(latestLedger);
     this.lastTickAt = new Date();
     finishSpan(tickSpan);
   }
@@ -547,23 +571,26 @@ export class Indexer {
 
       const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
-        const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: cursor + 1, endLedger: batchTo, filters }),
-        );
+        const params = { startLedger: cursor + 1, filters };
+        const resp = await withBackoff(() => timedRpcCall("getEvents", () => server.getEvents(params), params));
 
-        for (const event of resp.events) {
-          logger.debug(
-            { contractId: event.contractId, type: event.type, ledger: event.ledger },
-            "Backfill event",
-          );
-          await this.processEvent(event);
-        }
-        const batchDurationMs = endBatchTimer() * 1000;
-        this.tuneBatchSize(batchDurationMs);
+        // Each backfill batch commits its events and cursor atomically (#1210).
+        await withTransaction(async () => {
+          for (const event of resp.events) {
+            logger.debug(
+              { contractId: event.contractId, type: event.type, ledger: event.ledger },
+              "Backfill event",
+            );
+            await this.processEvent(event);
+          }
+          await this.saveLastIndexedLedger(batchTo);
+          await this.recordAnchorsIfNeeded(cursor + 1, batchTo, resp.events);
+        });
+        endBatchTimer();
 
         cursor = batchTo;
         this.lastLedger = cursor;
-        await this.persistLastLedger();
+        indexerLastLedger.set(cursor);
         this.lastTickAt = new Date();
 
         batchCount++;
@@ -696,9 +723,8 @@ export class Indexer {
       const batchTo = Math.min(cursor + config.indexer.batchSize, toLedger);
       const endBatchTimer = indexerProcessingDurationSeconds.startTimer();
       try {
-        const resp = await withBackoff(() =>
-          server.getEvents({ startLedger: cursor + 1, filters }),
-        );
+        const params = { startLedger: cursor + 1, filters };
+        const resp = await withBackoff(() => timedRpcCall("getEvents", () => server.getEvents(params), params));
         for (const event of resp.events) {
           // Events past the global cursor are picked up by the regular tick.
           if ((event.ledger ?? 0) > toLedger) continue;
@@ -2309,11 +2335,6 @@ export class Indexer {
     );
   }
 
-  private async persistLastLedger(): Promise<void> {
-    await this.saveLastIndexedLedger(this.lastLedger);
-    indexerLastLedger.set(this.lastLedger);
-  }
-
   async getLastIndexedLedger(): Promise<number> {
     const rows = await query<{ last_ledger: number }>(
       "SELECT last_ledger FROM indexer_state LIMIT 1",
@@ -2354,6 +2375,27 @@ export class Indexer {
        ON CONFLICT (id) DO UPDATE SET start_ledger = EXCLUDED.start_ledger, updated_at = NOW()`,
       [startBlock],
     );
+  }
+
+  /**
+   * Populate ledger_anchors every 1000 ledgers.
+   */
+  async recordAnchorsIfNeeded(fromLedger: number, toLedger: number, events: any[]): Promise<void> {
+    const startThousand = Math.ceil(fromLedger / 1000) * 1000;
+    for (let seq = startThousand; seq <= toLedger; seq += 1000) {
+      if (seq <= 0) continue;
+      let closedAt: Date | null = null;
+      for (const ev of events) {
+        if (ev.ledger === seq && typeof ev.ledgerClosedAt === "string") {
+          closedAt = new Date(ev.ledgerClosedAt);
+          break;
+        }
+      }
+      if (!closedAt) {
+        closedAt = new Date();
+      }
+      await recordLedgerAnchor(seq, closedAt);
+    }
   }
 
   private async sleepWhileRunning(ms: number): Promise<void> {

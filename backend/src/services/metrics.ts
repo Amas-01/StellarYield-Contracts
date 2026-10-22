@@ -19,74 +19,6 @@ export const httpRequestDurationSeconds = new client.Histogram({
   registers: [register],
 });
 
-
-// Error-rate companion to http_requests_total (#831). Kept as a separate
-// counter so error ratios can be charted without a full label-set join in
-// PromQL. `statusClass` collapses 400-499 into "4xx" and 500-599 into "5xx" to
-// bound cardinality; everything else is ignored.
-export const httpErrorsTotal = new client.Counter({
-  name: "http_errors_total",
-  help: "Total number of HTTP error responses (4xx and 5xx) by status class",
-  labelNames: ["statusClass", "route"] as const,
-  registers: [register],
-});
-
-// 5xx-only companion to http_errors_total (#1091). Alerting on elevated 5xx
-// rates is a single PromQL expression against this counter, without having to
-// filter http_errors_total by statusClass. `method` and `route` are the only
-// labels, bounding cardinality to the number of registered routes.
-export const http5xxTotal = new client.Counter({
-  name: "http_5xx_total",
-  help: "Total number of HTTP responses with a 5xx status, by method and route",
-  labelNames: ["method", "route"] as const,
-  registers: [register],
-});
-
-// Number of SSE connections currently held open (#1092). Each stream pins a
-// socket and a file descriptor plus the response buffer, so a rising gauge is
-// the early signal that a deploy is running into memory or fd limits.
-export const sseActiveConnections = new client.Gauge({
-  name: "sse_active_connections",
-  help: "Number of currently open Server-Sent Events connections",
-  registers: [register],
-});
-
-// pg-boss queue depth (#1093). Gauges rather than counters because a job moving
-// from `created` to `active` to `failed` does not accumulate: the interesting
-// signal is the current number of jobs sitting in each state, sampled by
-// JobQueueDepthPoller (services/jobQueueDepthPoller.ts).
-export const pgbossJobsCreated = new client.Gauge({
-  name: "pgboss_jobs_created",
-  help: "Number of pg-boss jobs currently in the 'created' state",
-  registers: [register],
-});
-
-export const pgbossJobsActive = new client.Gauge({
-  name: "pgboss_jobs_active",
-  help: "Number of pg-boss jobs currently in the 'active' state",
-  registers: [register],
-});
-
-export const pgbossJobsFailed = new client.Gauge({
-  name: "pgboss_jobs_failed",
-  help: "Number of pg-boss jobs currently in the 'failed' state",
-  registers: [register],
-});
-
-// Prime the gauges so they are exposed by /metrics with a value of 0 from the
-// first scrape, before any SSE stream is opened or the queue poller completes
-// its first pass. Alerting rules like `pgboss_jobs_failed > 0` must not depend
-// on warm-up ordering.
-sseActiveConnections.set(0);
-pgbossJobsCreated.set(0);
-pgbossJobsActive.set(0);
-pgbossJobsFailed.set(0);
-
-// Backing count for sse_active_connections. Kept in module scope because the
-// prom-client Gauge API only exposes its value asynchronously, and the decrement
-// path needs the current count synchronously in order to clamp it at zero.
-let sseConnections = 0;
-
 export const indexerEventsProcessedTotal = new client.Counter({
   name: "indexer_events_processed_total",
   help: "Total number of on-chain events indexed (incremented once per event)",
@@ -112,6 +44,35 @@ export const indexerProcessingDurationSeconds = new client.Histogram({
 export const indexerLastLedger = new client.Gauge({
   name: "indexer_last_ledger",
   help: "Last indexed ledger sequence number",
+  registers: [register],
+});
+
+// #1217 — how far the indexer lags behind the chain tip, in seconds.
+// Stellar ledgers close roughly every 5 s, so lag_ledgers * 5 ≈ lag_seconds,
+// but using real close times would require an extra RPC call. The gauge is
+// reset to 0 when there is no lag (lastLedger == latestLedger) so alerts
+// can fire on any non-zero value.
+export const indexerLagSeconds = new client.Gauge({
+  name: "indexer_lag_seconds",
+  help: "Estimated indexer lag behind chain tip in seconds (ledger_lag * 5 s/ledger)",
+  registers: [register],
+});
+
+// #1203 — per-method Soroban RPC telemetry. `method` is the RPC method name
+// (getEvents, simulateTransaction, ...), so a failing or slow method can be
+// told apart from the overall error rate that #345 alerts on.
+export const rpcCallsTotal = new client.Counter({
+  name: "rpc_calls_total",
+  help: "Total number of Soroban RPC calls by method and outcome",
+  labelNames: ["method", "outcome"] as const,
+  registers: [register],
+});
+
+export const rpcCallDurationSeconds = new client.Histogram({
+  name: "rpc_call_duration_seconds",
+  help: "Soroban RPC call duration in seconds by method",
+  labelNames: ["method"] as const,
+  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
   registers: [register],
 });
 
@@ -162,6 +123,17 @@ export async function updateJobQueuePendingMetrics(): Promise<void> {
     // Ignore errors when database is unavailable in test environments
   }
 }
+
+// Event loop lag (#1252): p50 and p99 over a sliding 60 s window. Observations
+// are fed by the sampler in services/eventLoopLag.ts.
+export const eventLoopLagSeconds = new client.Summary({
+  name: "nodejs_event_loop_lag_seconds",
+  help: "Event loop lag in seconds (p50 and p99 over a sliding window)",
+  percentiles: [0.5, 0.99],
+  maxAgeSeconds: 60,
+  ageBuckets: 6,
+  registers: [register],
+});
 
 export const nodejsHeapUsedBytes = new client.Gauge({
   name: "nodejs_heap_used_bytes",
@@ -242,6 +214,76 @@ export function updatePgPoolMetrics(
     // Ignore error
   }
 }
+
+// Missing metric declarations that are referenced in functions below
+let sseConnections = 0;
+
+export const http5xxTotal = new client.Counter({
+  name: "http_5xx_total",
+  help: "Total number of 5xx HTTP responses",
+  labelNames: ["method", "route"] as const,
+  registers: [register],
+});
+
+export const sseActiveConnections = new client.Gauge({
+  name: "sse_active_connections",
+  help: "Number of active SSE connections",
+  registers: [register],
+});
+
+export const pgbossJobsCreated = new client.Gauge({
+  name: "pgboss_jobs_created",
+  help: "Number of pg-boss jobs in created state",
+  registers: [register],
+});
+
+export const pgbossJobsActive = new client.Gauge({
+  name: "pgboss_jobs_active",
+  help: "Number of pg-boss jobs in active state",
+  registers: [register],
+});
+
+export const pgbossJobsFailed = new client.Gauge({
+  name: "pgboss_jobs_failed",
+  help: "Number of pg-boss jobs in failed state",
+  registers: [register],
+});
+
+export const httpErrorsTotal = new client.Counter({
+  name: "http_errors_total",
+  help: "Total number of HTTP error responses",
+  labelNames: ["statusClass", "route"] as const,
+  registers: [register],
+});
+
+// ── RPC metrics (#new) ────────────────────────────────────────────────────────
+
+export const rpcMonitorCallsTotal = new client.Counter({
+  name: "rpc_monitor_calls_total",
+  help: "Total number of RPC calls made",
+  labelNames: ["method", "status"] as const,
+  registers: [register],
+});
+
+export const rpcMonitorCallDurationSeconds = new client.Histogram({
+  name: "rpc_monitor_call_duration_seconds",
+  help: "RPC call duration in seconds by method",
+  labelNames: ["method"] as const,
+  buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 30],
+  registers: [register],
+});
+
+export const rpcActiveRequests = new client.Gauge({
+  name: "rpc_active_requests",
+  help: "Number of active RPC requests",
+  registers: [register],
+});
+
+export const rpcConcurrentRequestsLimited = new client.Counter({
+  name: "rpc_concurrent_requests_limited",
+  help: "Number of times RPC requests were throttled due to concurrent limit",
+  registers: [register],
+});
 
 export async function getMetrics(): Promise<string> {
   updateProcessMemoryMetrics();
@@ -354,7 +396,10 @@ export function httpStatusClass(statusCode: number): "4xx" | "5xx" | null {
  * the request path. Never throws: metrics must not be able to turn a handled
  * error into a failed response.
  */
-export function recordHttpError(route: string | undefined, statusCode: number): void {
+export function recordHttpError(
+  route: string | undefined,
+  statusCode: number,
+): void {
   const statusClass = httpStatusClass(statusCode);
   if (statusClass === null) return;
 
@@ -364,5 +409,3 @@ export function recordHttpError(route: string | undefined, statusCode: number): 
     // Ignore: never let a metrics failure affect the response
   }
 }
-
-

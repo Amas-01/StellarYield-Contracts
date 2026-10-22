@@ -83,16 +83,27 @@ function parseArgs(argv: string[]) {
 
 const { role, expiresInDays, allowedMethods, allowedCidrs, allowedContractIds } = parseArgs(process.argv.slice(2));
 
-const plaintext = randomBytes(32).toString("hex");
-const keyHash = createHash("sha256").update(plaintext).digest("hex");
+// Prefix makes keys instantly recognisable in logs and leak-detection scanners.
+const KEY_PREFIX = "sky_";
+const rawToken = randomBytes(32).toString("hex");
+const plaintext = `${KEY_PREFIX}${rawToken}`;
+
+// Per-key random salt: HMAC-SHA-256(key=salt, data=plaintext) so two keys with
+// the same underlying token produce different stored hashes (#1239).
+const salt = randomBytes(16).toString("hex");
+const keyHash = createHash("sha256")
+  .update(salt)
+  .update(plaintext)
+  .digest("hex");
+
 const expiresAt = expiresInDays !== null
   ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000)
   : null;
 
 await query(
-  `INSERT INTO api_keys (key_hash, role, label, expires_at, allowed_methods, allowed_cidrs, allowed_contract_ids)
-   VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-  [keyHash, role, `generated-${Date.now()}`, expiresAt, allowedMethods, allowedCidrs, allowedContractIds],
+  `INSERT INTO api_keys (key_hash, key_salt, role, label, expires_at, allowed_methods, allowed_cidrs, allowed_contract_ids)
+   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+  [keyHash, salt, role, `generated-${Date.now()}`, expiresAt, allowedMethods, allowedCidrs, allowedContractIds],
 );
 
 console.log(plaintext);
