@@ -361,8 +361,7 @@ function registerPaths(): void {
     parameters: [{ name: "contractId", in: "path", required: true, schema: { type: "string" } }],
     responses: {
       200: { description: "CSV attachment with active holders", content: { "text/csv": { schema: z.string() } } },
-      401: { description: "Missing API key", content: { "application/json": { schema: errorResponseSchema } } },
-      403: { description: "Invalid API key", content: { "application/json": { schema: errorResponseSchema } } },
+      401: { description: "Missing, invalid or expired API key", content: { "application/json": { schema: errorResponseSchema } } },
       404: { description: "Vault not found", content: { "application/json": { schema: errorResponseSchema } } },
     },
   });

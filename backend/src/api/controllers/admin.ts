@@ -17,9 +17,10 @@ import { jobQueue } from "../../services/jobQueue.js";
 import { findApiKeysExpiringWithin, type ApiKeyListRow } from "../../services/apiKeyExpiryReminder.js";
 import { sseManager } from "../../services/sseManager.js";
 import { logger } from "../../logger.js";
-import { createAdminSessionToken, refreshAdminSessionToken } from "../middleware/auth.js";
+import { createAdminSessionToken, INVALID_CREDENTIALS_RESPONSE, refreshAdminSessionToken } from "../middleware/auth.js";
 import { getApiKeyUsage } from "../../cache/redis.js";
 import { logAdminAudit } from "../../services/adminAuditLog.js";
+import { logSecurityEvent } from "../../services/securityLogger.js";
 import { generateWebhookSecret, secretRotationWindowHours } from "../../services/webhookSignature.js";
 
 const OPENAPI_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../../openapi");
@@ -151,26 +152,33 @@ export async function createAdminSession(req: Request, res: Response, next: Next
       return;
     }
 
+    // Unknown, deactivated and expired keys all get the same 401 body and each
+    // records a security event, so the response and its timing do not reveal
+    // which case applied (#1247). The lifecycle checks run before the role
+    // check, so the 403 below only ever answers a key that is live.
     const apiKey = await findApiKeyByValue(parsed.data.apiKey);
     if (!apiKey) {
-      res.status(401).json({ error: "Unauthorized", message: "Invalid API key" });
+      await logSecurityEvent("AUTH_FAILURE", { ipAddress: req.ip ?? null, path: req.path, details: { reason: "key_not_found" } });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
     // A session must never outlive the key it is minted from, so the same
     // lifecycle checks the auth middleware applies run here too (#934).
     if (!apiKey.active) {
-      res.status(403).json({ error: "Forbidden", message: "API key has been deactivated" });
+      await logSecurityEvent("AUTH_FAILURE", { ipAddress: req.ip ?? null, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "deactivated" } });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
+      return;
+    }
+
+    if (apiKey.expiresAt && apiKey.expiresAt.getTime() <= Date.now()) {
+      await logSecurityEvent("AUTH_FAILURE", { ipAddress: req.ip ?? null, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "expired" } });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
     if (apiKey.role !== "admin") {
       res.status(403).json({ error: "Forbidden", message: "Admin API key required" });
-      return;
-    }
-
-    if (apiKey.expiresAt && apiKey.expiresAt.getTime() <= Date.now()) {
-      res.status(401).json({ error: "Unauthorized", message: "API key has expired" });
       return;
     }
 

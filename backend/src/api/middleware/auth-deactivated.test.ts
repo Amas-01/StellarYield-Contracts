@@ -19,7 +19,7 @@ describe("requireApiKey deactivated keys (#934)", () => {
     vi.clearAllMocks();
   });
 
-  it("returns 403 for a key that has been deactivated", async () => {
+  it("returns the uniform 401 for a key that has been deactivated (#1247)", async () => {
     const { query, requireApiKey } = await getTestContext();
     query.mockResolvedValue([
       { id: 1, role: "admin", label: "stale", expiresAt: null, lastUsedAt: null, active: false },
@@ -28,10 +28,10 @@ describe("requireApiKey deactivated keys (#934)", () => {
 
     await requireApiKey()(req, res, next);
 
-    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.status).toHaveBeenCalledWith(401);
     expect(res.json).toHaveBeenCalledWith({
-      error: "Forbidden",
-      message: "API key has been deactivated",
+      error: "Unauthorized",
+      message: "Invalid or expired API key",
     });
     expect(next).not.toHaveBeenCalled();
   });
