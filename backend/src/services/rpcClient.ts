@@ -1,5 +1,11 @@
 import { config } from "../config.js";
 import { logger } from "../logger.js";
+import { withRpcLimit } from "./rpcLimiter.js";
+import {
+  startRpcCall,
+  recordRpcSuccess,
+  recordRpcError,
+} from "./rpcMonitor.js";
 
 function getOrderedRpcUrls(): string[] {
   const urls = [config.stellar.rpcUrl, ...config.stellar.rpcFallbacks];
@@ -58,7 +64,10 @@ export async function tryRpcEndpoints<T>(
     const isFallback = i > 0;
 
     if (isFallback) {
-      logger.warn({ rpcUrl: url, primaryUrl: urls[0] }, "RPC fallback — primary endpoint failed, trying fallback");
+      logger.warn(
+        { rpcUrl: url, primaryUrl: urls[0] },
+        "RPC fallback — primary endpoint failed, trying fallback",
+      );
     }
 
     try {
@@ -93,7 +102,9 @@ export async function rpcFetch(body: object): Promise<Response> {
     );
 
     if (!response.ok && isRetryableHttpStatus(response.status)) {
-      throw new Error(`RPC request failed: ${response.status} ${response.statusText}`);
+      throw new Error(
+        `RPC request failed: ${response.status} ${response.statusText}`,
+      );
     }
 
     return response;
