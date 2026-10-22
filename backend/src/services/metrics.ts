@@ -19,7 +19,6 @@ export const httpRequestDurationSeconds = new client.Histogram({
   registers: [register],
 });
 
-
 export const indexerEventsProcessedTotal = new client.Counter({
   name: "indexer_events_processed_total",
   help: "Total number of on-chain events indexed (incremented once per event)",
@@ -191,6 +190,76 @@ export function updatePgPoolMetrics(
   }
 }
 
+// Missing metric declarations that are referenced in functions below
+let sseConnections = 0;
+
+export const http5xxTotal = new client.Counter({
+  name: "http_5xx_total",
+  help: "Total number of 5xx HTTP responses",
+  labelNames: ["method", "route"] as const,
+  registers: [register],
+});
+
+export const sseActiveConnections = new client.Gauge({
+  name: "sse_active_connections",
+  help: "Number of active SSE connections",
+  registers: [register],
+});
+
+export const pgbossJobsCreated = new client.Gauge({
+  name: "pgboss_jobs_created",
+  help: "Number of pg-boss jobs in created state",
+  registers: [register],
+});
+
+export const pgbossJobsActive = new client.Gauge({
+  name: "pgboss_jobs_active",
+  help: "Number of pg-boss jobs in active state",
+  registers: [register],
+});
+
+export const pgbossJobsFailed = new client.Gauge({
+  name: "pgboss_jobs_failed",
+  help: "Number of pg-boss jobs in failed state",
+  registers: [register],
+});
+
+export const httpErrorsTotal = new client.Counter({
+  name: "http_errors_total",
+  help: "Total number of HTTP error responses",
+  labelNames: ["statusClass", "route"] as const,
+  registers: [register],
+});
+
+// ── RPC metrics (#new) ────────────────────────────────────────────────────────
+
+export const rpcCallsTotal = new client.Counter({
+  name: "rpc_calls_total",
+  help: "Total number of RPC calls made",
+  labelNames: ["method", "status"] as const,
+  registers: [register],
+});
+
+export const rpcCallDurationSeconds = new client.Histogram({
+  name: "rpc_call_duration_seconds",
+  help: "RPC call duration in seconds by method",
+  labelNames: ["method"] as const,
+  buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 30],
+  registers: [register],
+});
+
+export const rpcActiveRequests = new client.Gauge({
+  name: "rpc_active_requests",
+  help: "Number of active RPC requests",
+  registers: [register],
+});
+
+export const rpcConcurrentRequestsLimited = new client.Counter({
+  name: "rpc_concurrent_requests_limited",
+  help: "Number of times RPC requests were throttled due to concurrent limit",
+  registers: [register],
+});
+
 export async function getMetrics(): Promise<string> {
   updateProcessMemoryMetrics();
   await updateJobQueuePendingMetrics();
@@ -302,7 +371,10 @@ export function httpStatusClass(statusCode: number): "4xx" | "5xx" | null {
  * the request path. Never throws: metrics must not be able to turn a handled
  * error into a failed response.
  */
-export function recordHttpError(route: string | undefined, statusCode: number): void {
+export function recordHttpError(
+  route: string | undefined,
+  statusCode: number,
+): void {
   const statusClass = httpStatusClass(statusCode);
   if (statusClass === null) return;
 
@@ -312,5 +384,3 @@ export function recordHttpError(route: string | undefined, statusCode: number): 
     // Ignore: never let a metrics failure affect the response
   }
 }
-
-
