@@ -27,6 +27,9 @@ export const envSchema = z.object({
     .default("10000")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1000)),
+  RPC_DEBUG_LOG: z
+    .string()
+    .default("false"),
   STELLAR_NETWORK_PASSPHRASE: z
     .string()
     .optional(),
@@ -351,6 +354,7 @@ export const config = {
       ? parsed.data.STELLAR_RPC_FALLBACKS.split(",").map((s) => s.trim()).filter(Boolean)
       : [],
     rpcTimeoutMs: parsed.data.STELLAR_RPC_TIMEOUT_MS,
+    rpcDebugLog: ["true", "1", "yes"].includes(parsed.data.RPC_DEBUG_LOG.toLowerCase()),
     networkPassphrase: parsed.data.STELLAR_NETWORK_PASSPHRASE
       ?? getDefaultPassphrase(parsed.data.STELLAR_NETWORK),
     vaultFactoryContractId: parsed.data.VAULT_FACTORY_CONTRACT_ID,

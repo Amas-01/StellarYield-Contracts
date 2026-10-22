@@ -52,6 +52,24 @@ export const indexerLagSeconds = new client.Gauge({
   registers: [register],
 });
 
+// #1203 — per-method Soroban RPC telemetry. `method` is the RPC method name
+// (getEvents, simulateTransaction, ...), so a failing or slow method can be
+// told apart from the overall error rate that #345 alerts on.
+export const rpcCallsTotal = new client.Counter({
+  name: "rpc_calls_total",
+  help: "Total number of Soroban RPC calls by method and outcome",
+  labelNames: ["method", "outcome"] as const,
+  registers: [register],
+});
+
+export const rpcCallDurationSeconds = new client.Histogram({
+  name: "rpc_call_duration_seconds",
+  help: "Soroban RPC call duration in seconds by method",
+  labelNames: ["method"] as const,
+  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  registers: [register],
+});
+
 export const dbQueryDurationSeconds = new client.Histogram({
   name: "db_query_duration_seconds",
   help: "Database query duration in seconds",
