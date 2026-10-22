@@ -22,6 +22,7 @@ import { getApiKeyUsage } from "../../cache/redis.js";
 import { logAdminAudit } from "../../services/adminAuditLog.js";
 import { logSecurityEvent } from "../../services/securityLogger.js";
 import { generateWebhookSecret, secretRotationWindowHours } from "../../services/webhookSignature.js";
+import { setPaginationLinks } from "../middleware/paginationLinks.js";
 
 const OPENAPI_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../../openapi");
 
@@ -1337,6 +1338,7 @@ export async function getAdminAuditLog(req: Request, res: Response, next: NextFu
       if (nextCursor) {
         res.set("X-Next-Cursor", nextCursor);
       }
+      setPaginationLinks(res, req, { nextCursor });
 
       res.json({
         data: rows.map((row) => ({
@@ -1396,6 +1398,7 @@ export async function getAdminAuditLog(req: Request, res: Response, next: NextFu
     if (nextCursor) {
       res.set("X-Next-Cursor", nextCursor);
     }
+    setPaginationLinks(res, req, { nextCursor });
 
     res.json({
       data: rows.map((row) => ({
