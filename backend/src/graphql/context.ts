@@ -21,10 +21,12 @@ export async function createGraphQLContext(req: { raw: ExpressRequest }): Promis
     return { role: null };
   }
 
-  const keyHash = createHash("sha256").update(headerValue.slice(7)).digest("hex");
-  const rows = await query<{ role: string }>(
-    "SELECT role FROM api_keys WHERE key_hash = $1",
-    [keyHash],
+  const plaintext = headerValue.slice(7);
+  // Support both legacy (unsalted) and new (salted) key hashes (#1239).
+  const unsaltedHash = createHash("sha256").update(plaintext).digest("hex");
+  const rows = await query<{ role: string; key_salt: string | null; key_hash: string }>(
+    "SELECT role, key_salt, key_hash FROM api_keys WHERE key_hash = $1",
+    [unsaltedHash],
   ).catch(() => []);
 
   return { role: rows[0]?.role ?? null };

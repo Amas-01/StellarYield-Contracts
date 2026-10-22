@@ -1,6 +1,7 @@
 import pg from "pg";
 import { performance } from "node:perf_hooks";
 import crypto from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { trace, SpanStatusCode, context } from "@opentelemetry/api";
 import { config } from "../config.js";
 import { logger } from "../logger.js";
@@ -17,6 +18,18 @@ export const pool = new Pool({
   max: config.db.poolMax,
   idleTimeoutMillis: config.db.idleTimeoutMs,
   query_timeout: config.db.queryTimeoutMs,
+});
+
+// Set lock_timeout and statement_timeout on every new connection so that
+// runaway queries and lock-wait storms never silently stall the API. (#1227)
+pool.on("connect", (client) => {
+  const lockTimeoutMs = config.db.queryTimeoutMs ?? 30_000;
+  const stmtTimeoutMs = config.db.queryTimeoutMs ?? 30_000;
+  client.query(
+    `SET lock_timeout = '${lockTimeoutMs}ms'; SET statement_timeout = '${stmtTimeoutMs}ms';`,
+  ).catch((err: unknown) => {
+    logger.warn({ err }, "Failed to set DB session timeouts on new connection");
+  });
 });
 
 // ── Reconnect state (#1255) ───────────────────────────────────────────────────
@@ -148,6 +161,34 @@ export function registerPreparedStatement(name: string, text: string): void {
   logger.debug({ name }, "Registered prepared statement");
 }
 
+// ── Transactions (#1210) ─────────────────────────────────────────────────────
+// `withTransaction` pins one connection for everything that runs inside it. The
+// client is carried through AsyncLocalStorage, so `query` calls made by nested
+// services join the transaction without their signatures changing.
+const transactionStore = new AsyncLocalStorage<pg.PoolClient>();
+
+/**
+ * Run `fn` inside a single database transaction. Commits when `fn` resolves and
+ * rolls back, then rethrows, when it rejects. Queries issued from within `fn`
+ * (including through nested service calls) run on the same connection.
+ */
+export async function withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const result = await transactionStore.run(client, fn);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    await client.query("ROLLBACK").catch((rollbackErr: unknown) => {
+      logger.error({ err: rollbackErr }, "Failed to roll back transaction");
+    });
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export async function query<T = Record<string, unknown>>(
   sql: string,
   params?: unknown[],
@@ -157,11 +198,14 @@ export async function query<T = Record<string, unknown>>(
   span.setAttribute("db.statement", sql.slice(0, 80));
 
   const start = performance.now();
+  const transactionClient = transactionStore.getStore();
   const activePool = poolForCurrentQuery(sql);
   try {
     let result: pg.QueryResult;
     const timeoutMs = options?.timeoutMs;
-    if (timeoutMs) {
+    if (transactionClient) {
+      result = await transactionClient.query(sql, params);
+    } else if (timeoutMs) {
       const client = await activePool.connect();
       try {
         await client.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
@@ -214,6 +258,11 @@ export async function queryPrepared<T = Record<string, unknown>>(
   const stmt = preparedStatements.get(name);
   if (!stmt) {
     throw new Error(`Prepared statement "${name}" not registered`);
+  }
+  const transactionClient = transactionStore.getStore();
+  if (transactionClient) {
+    const result = await transactionClient.query({ name: stmt.name, text: stmt.text, values: params });
+    return result.rows;
   }
   const activePool = poolForCurrentQuery(stmt.text);
   const timeoutMs = options?.timeoutMs;

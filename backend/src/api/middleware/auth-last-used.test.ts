@@ -63,7 +63,7 @@ describe("requireApiKey last-used tracking (#933)", () => {
 
     await requireApiKey()(req, res, next);
 
-    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.status).toHaveBeenCalledWith(401);
     expect(lastUsedUpdates(query)).toHaveLength(0);
   });
 

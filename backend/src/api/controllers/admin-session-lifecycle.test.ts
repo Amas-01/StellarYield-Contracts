@@ -40,10 +40,10 @@ describe("POST /api/v1/admin/session key lifecycle (#934)", () => {
 
     await createAdminSession(req, res, next);
 
-    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.status).toHaveBeenCalledWith(401);
     expect(res.json).toHaveBeenCalledWith({
-      error: "Forbidden",
-      message: "API key has been deactivated",
+      error: "Unauthorized",
+      message: "Invalid or expired API key",
     });
   });
 

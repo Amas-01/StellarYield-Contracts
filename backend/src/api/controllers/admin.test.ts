@@ -430,7 +430,7 @@ describe("Admin Controller", () => {
       expect(res.body).toMatchObject({ error: "Unauthorized" });
     });
 
-    it("returns 403 when the API key is invalid", async () => {
+    it("returns 401 when the API key is invalid", async () => {
       const { query } = await import("../../db/index.js");
       const mockQuery = query as ReturnType<typeof vi.fn>;
       // auth middleware queries api_keys — return empty = key not found
@@ -441,8 +441,8 @@ describe("Admin Controller", () => {
         .get("/api/v1/admin/stats")
         .set("Authorization", "Bearer not-a-real-key");
 
-      expect(res.status).toBe(403);
-      expect(res.body).toMatchObject({ error: "Forbidden" });
+      expect(res.status).toBe(401);
+      expect(res.body).toMatchObject({ error: "Unauthorized", message: "Invalid or expired API key" });
     });
 
     it("returns 200 with correct vaultCount, userCount, and archiveSizeBytes for a valid admin key and seeded DB", async () => {

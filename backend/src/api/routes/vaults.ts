@@ -9,7 +9,14 @@ import {
   getVaultLiveState,
   getVaultLiveTotalAssets,
   getRedemptionQueue,
-  getVaultSnapshotV2 as getVaultSnapshot,
+  getVaultSnapshotWithRatios,
+  getHoldingDuration,
+  getFundingVelocity,
+  getRedemptionQueueEta,
+  getMaturityCountdown,
+  getRedemptionStats,
+  getRedemptionCancellationRate,
+  getHolderRetention,
   getVaultMetadataHistory,
   getWhitelistHistory,
   getVaultStatusHistory,
@@ -46,6 +53,14 @@ import {
   validateVaultMetadata,
   getDepositDistribution,
   getVaultCohorts,
+  getHoldingDuration,
+  getVaultSnapshotWithRatios,
+  getFundingVelocity,
+  getRedemptionQueueEta,
+  getMaturityCountdown,
+  getRedemptionStats,
+  getRedemptionCancellationRate,
+  getHolderRetention,
 } from "../controllers/vaults.js";
 import {
   translateSimulationError,
@@ -54,11 +69,11 @@ import {
 } from "../controllers/simulate.js";
 import { validateParams, validateQuery, validateBody } from "../middleware/validate.js";
 import { requireApiKey, enforceApiKeyContractScope, optionalApiKey } from "../middleware/auth.js";
+import { validateParams, validateQuery, validateBody, nfcStringSchema, contractAddressSchema } from "../middleware/validate.js";
+import { requireApiKey, enforceApiKeyContractScope } from "../middleware/auth.js";
 import { simulateLimiter } from "../middleware/rateLimit.js";
 import { captureForStaleFallback } from "../middleware/staleResponse.js";
 import { parseVaultSort } from "../../services/vault.js";
-
-const contractAddressSchema = z.string().length(56).regex(/^C[A-Z2-7]{55}$/);
 
 // Accepts a calendar date (2025-01-31) or a full ISO 8601 date-time, with or
 // without an offset.
@@ -172,7 +187,11 @@ const vaultHoldersQuerySchema = z.object({
 });
 
 const searchVaultsQuerySchema = z.object({
-  q: z.string().optional(),
+  q: z
+    .string()
+    .max(200, "Search query must be at most 200 characters")
+    .regex(/^[^\x00-\x1f\x7f]*$/, "Search query must not contain control characters")
+    .optional(),
   category: z.string().optional(),
   state: z.string().optional(),
   sort: z.enum(["created_at", "total_assets"]).default("created_at"),
@@ -255,10 +274,10 @@ vaultsRouter.post(
 );
 // Issue #976: Vault metadata validation
 export const metadataValidationSchema = z.object({
-  name: z.string().optional(),
+  name: nfcStringSchema.optional(),
   documentUri: z.string().optional(),
   logoUri: z.string().optional(),
-  description: z.string().optional(),
+  description: nfcStringSchema.optional(),
 });
 vaultsRouter.post("/metadata/validate", validateBody(metadataValidationSchema), validateVaultMetadata);
 vaultsRouter.get("/factory/:factoryId", validateParams(vaultFactoryParamsSchema), listVaultsByFactory);
