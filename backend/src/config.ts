@@ -46,6 +46,19 @@ export const envSchema = z.object({
     .default("10000")
     .transform((v) => parseInt(v, 10))
     .pipe(z.number().int().min(1000)),
+  // JSON object mapping RPC method names to a timeout in ms (#1207), e.g.
+  // {"getEvents":30000}. Methods not listed fall back to STELLAR_RPC_TIMEOUT_MS.
+  RPC_TIMEOUTS_MS: z
+    .string()
+    .default("{}")
+    .transform((v, ctx) => {
+      try {
+        return parseRpcTimeoutOverrides(v);
+      } catch (err) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: (err as Error).message });
+        return z.NEVER;
+      }
+    }),
   RPC_DEBUG_LOG: z
     .string()
     .default("false"),
@@ -383,6 +396,7 @@ export const config = {
           .filter(Boolean)
       : [],
     rpcTimeoutMs: parsed.data.STELLAR_RPC_TIMEOUT_MS,
+    rpcTimeoutsMs: parsed.data.RPC_TIMEOUTS_MS,
     rpcDebugLog: ["true", "1", "yes"].includes(parsed.data.RPC_DEBUG_LOG.toLowerCase()),
     networkPassphrase: parsed.data.STELLAR_NETWORK_PASSPHRASE
       ?? getDefaultPassphrase(parsed.data.STELLAR_NETWORK),

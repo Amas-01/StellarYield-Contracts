@@ -46,19 +46,25 @@ import {
   validateVaultMetadata,
   getDepositDistribution,
   getVaultCohorts,
+  getHoldingDuration,
+  getVaultSnapshotWithRatios,
+  getFundingVelocity,
+  getRedemptionQueueEta,
+  getMaturityCountdown,
+  getRedemptionStats,
+  getRedemptionCancellationRate,
+  getHolderRetention,
 } from "../controllers/vaults.js";
 import {
   translateSimulationError,
   simulateFundingProgress,
   simulateMultiOperation,
 } from "../controllers/simulate.js";
-import { validateParams, validateQuery, validateBody, nfcStringSchema } from "../middleware/validate.js";
+import { validateParams, validateQuery, validateBody, nfcStringSchema, contractAddressSchema } from "../middleware/validate.js";
 import { requireApiKey, enforceApiKeyContractScope } from "../middleware/auth.js";
 import { simulateLimiter } from "../middleware/rateLimit.js";
 import { captureForStaleFallback } from "../middleware/staleResponse.js";
 import { parseVaultSort } from "../../services/vault.js";
-
-const contractAddressSchema = z.string().length(56).regex(/^C[A-Z2-7]{55}$/);
 
 // Accepts a calendar date (2025-01-31) or a full ISO 8601 date-time, with or
 // without an offset.

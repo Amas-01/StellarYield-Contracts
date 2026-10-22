@@ -1,12 +1,21 @@
 import type { Request, Response, NextFunction } from "express";
 import type { ZodSchema } from "zod";
 import { z } from "zod";
+import { classifyAddress } from "../../utils/address.js";
 
-// Stellar address validator: 56-character Strkey starting with 'G'
+// Stellar address validator: Valid account address (G...) checked via classifyAddress
 export const stellarAddressSchema = z
   .string()
-  .length(56)
-  .regex(/^G[A-Z2-7]{55}$/, "Invalid Stellar address format");
+  .refine((val) => classifyAddress(val) === "account", {
+    message: "Invalid Stellar address format",
+  });
+
+// Stellar contract address validator: Valid contract address (C...) checked via classifyAddress
+export const contractAddressSchema = z
+  .string()
+  .refine((val) => classifyAddress(val) === "contract", {
+    message: "Invalid Stellar contract address format",
+  });
 
 /**
  * Zod transform that normalises a free-text string to Unicode NFC (#1236).
