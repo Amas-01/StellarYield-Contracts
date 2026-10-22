@@ -2,6 +2,29 @@ import "dotenv/config";
 import { z } from "zod";
 import cron from "node-cron";
 
+// Parse RPC_TIMEOUTS_MS: a JSON object of method name -> positive integer ms.
+// Throws on malformed JSON or a value that is not a whole number of at least 1000ms,
+// matching the STELLAR_RPC_TIMEOUT_MS floor.
+export function parseRpcTimeoutOverrides(raw: string): Record<string, number> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("RPC_TIMEOUTS_MS must be a JSON object");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("RPC_TIMEOUTS_MS must be a JSON object");
+  }
+  const overrides: Record<string, number> = {};
+  for (const [method, value] of Object.entries(parsed)) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1000) {
+      throw new Error(`RPC_TIMEOUTS_MS.${method} must be an integer of at least 1000`);
+    }
+    overrides[method] = value;
+  }
+  return overrides;
+}
+
 export const envSchema = z.object({
   PORT: z
     .string()
