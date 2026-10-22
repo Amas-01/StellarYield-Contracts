@@ -47,6 +47,8 @@ import { jsonNestingDepthLimit } from "./api/middleware/jsonNestingDepthLimit.js
 import { queryArraySizeLimit } from "./api/middleware/queryArraySizeLimit.js";
 import { webhookHttpsEnforcement } from "./api/middleware/webhookHttpsEnforcement.js";
 import { enforceJsonContentType } from "./api/middleware/enforceJsonContentType.js";
+import { serializeAmounts } from "./utils/serializeAmounts.js";
+import { normalizeTrailingSlash } from "./api/middleware/trailingSlash.js";
 
 // Cache static responses at startup
 function initStaticCache(): void {
@@ -94,9 +96,11 @@ export function createApp(): Express {
   );
 
   app.use(express.json({ limit: config.requestBodyLimit }));
+  app.set("json replacer", serializeAmounts);
   app.use(enforceJsonContentType());
   app.use(jsonNestingDepthLimit());
   app.use(queryArraySizeLimit());
+  app.use(normalizeTrailingSlash());
 
   const origins = config.allowedOrigins;
   if (origins.length > 0) {
