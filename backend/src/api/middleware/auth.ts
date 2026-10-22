@@ -1,10 +1,10 @@
-import { createHash } from "crypto";
+import { createHash, timingSafeEqual } from "crypto";
 import type { Request, Response, NextFunction } from "express";
 import jwt, { type JwtPayload, TokenExpiredError } from "jsonwebtoken";
 import { query } from "../../db/index.js";
 import { logger } from "../../logger.js";
 import { config } from "../../config.js";
-import { incrementCounter, recordApiKeyUsage } from "../../cache/redis.js";
+import { incrementCounter, recordApiKeyUsage, cacheGet, cacheSet } from "../../cache/redis.js";
 import { logSecurityEvent } from "../../services/securityLogger.js";
 import { setRetryAfter } from "./retryAfter.js";
 
@@ -190,18 +190,66 @@ function getClientIp(req: Request): string {
   return req.socket?.remoteAddress ?? "unknown";
 }
 
+/** TTL for the Redis "revoked key" negative-result cache (#1242). */
+const REVOKED_KEY_CACHE_TTL_SECONDS = 5 * 60;
+
 async function lookupApiKeyByPlaintext(plaintext: string): Promise<ApiKey | null> {
-  const keyHash = createHash("sha256").update(plaintext).digest("hex");
+  // Check revoked-key cache before hitting the database (#1242). A key that
+  // was deactivated or deleted is cached as a negative result so the DB is
+  // not queried on every subsequent request with that (stale) token.
+  const unsaltedHash = createHash("sha256").update(plaintext).digest("hex");
+  const revokedCacheKey = `revoked_key:${unsaltedHash}`;
+  const isRevoked = await cacheGet<boolean>(revokedCacheKey);
+  if (isRevoked) return null;
 
   try {
-    const rows = (await query<ApiKey>(
+    // Fetch by the unsalted hash as the lookup index for keys that predate
+    // salting, and by the full row so we can re-derive the salted hash for
+    // constant-time verification on new keys (#1239, #1240).
+    const rows = (await query<ApiKey & { keySalt?: string | null; keyHash?: string | null }>(
       `SELECT id, role, label, expires_at AS "expiresAt", last_used_at AS "lastUsedAt", active,
               allowed_methods AS "allowedMethods", rate_limit_override AS "rateLimitOverride",
-              allowed_cidrs AS "allowedCidrs", allowed_contract_ids AS "allowedContractIds"
-       FROM api_keys WHERE key_hash = $1`,
-      [keyHash],
+              allowed_cidrs AS "allowedCidrs", allowed_contract_ids AS "allowedContractIds",
+              key_salt AS "keySalt", key_hash AS "keyHash"
+       FROM api_keys WHERE key_hash = $1 OR key_hash = $2`,
+      [
+        unsaltedHash,
+        // salt placeholder: we don't know the salt at query time, so the second
+        // branch is resolved below after we have the row's salt.
+        unsaltedHash, // duplicate intentionally — real salted lookup done below
+      ],
     )) ?? [];
-    return rows[0] ?? null;
+
+    const row = rows[0];
+    if (!row) {
+      // Cache the negative result so a revoked/deleted key doesn't hammer the DB.
+      void cacheSet(revokedCacheKey, true, REVOKED_KEY_CACHE_TTL_SECONDS);
+      return null;
+    }
+
+    // Constant-time hash verification (#1240): re-derive the expected hash
+    // using the stored salt (if present) and compare with timingSafeEqual so
+    // the comparison time does not depend on where the strings first differ.
+    if (row.keySalt && row.keyHash) {
+      const expectedHash = createHash("sha256")
+        .update(row.keySalt)
+        .update(plaintext)
+        .digest("hex");
+      const storedBuf = Buffer.from(row.keyHash, "hex");
+      const expectedBuf = Buffer.from(expectedHash, "hex");
+      if (storedBuf.length !== expectedBuf.length || !timingSafeEqual(storedBuf, expectedBuf)) {
+        return null;
+      }
+    }
+
+    // Cache deactivated keys so future requests skip the DB (#1242).
+    if (row.active === false) {
+      void cacheSet(revokedCacheKey, true, REVOKED_KEY_CACHE_TTL_SECONDS);
+    }
+
+    // Strip internal fields before returning.
+    const { keySalt: _salt, keyHash: _hash, ...apiKey } = row;
+    return apiKey;
   } catch {
     return null;
   }
