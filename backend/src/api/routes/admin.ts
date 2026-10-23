@@ -63,6 +63,11 @@ import {
   createVaultNote,
   getVaultTags,
   updateVaultTags,
+  getAdminWatchlist,
+  addToAdminWatchlist,
+  removeFromAdminWatchlist,
+  toggleVaultUnlisted,
+  setVaultFeaturedRank,
 } from "../controllers/admin.js";
 import { getRequestArchive } from "../controllers/debugArchive.js";
 import { createAnnouncement, deleteAnnouncement } from "../controllers/announcements.js";
@@ -197,5 +202,16 @@ adminRouter.patch("/transfer-alerts/:id/acknowledge", acknowledgeTransferAlert);
 // Issue #1287: operator announcements (publish / remove)
 adminRouter.post("/announcements", requireApiKey({ role: "admin" }), createAnnouncement);
 adminRouter.delete("/announcements/:id", requireApiKey({ role: "admin" }), deleteAnnouncement);
+
+// Issue #1284: Admin watchlist
+adminRouter.get("/watchlist", getAdminWatchlist);
+adminRouter.post("/watchlist/:contractId", addToAdminWatchlist);
+adminRouter.delete("/watchlist/:contractId", removeFromAdminWatchlist);
+
+// Issue #1285: Vault unlisted flag toggle
+adminRouter.patch("/vaults/:contractId/unlisted", requireApiKey({ role: "admin" }), toggleVaultUnlisted);
+
+// Issue #1286: Featured vault ordering
+adminRouter.patch("/vaults/:contractId/featured-rank", requireApiKey({ role: "admin" }), setVaultFeaturedRank);
 
 
