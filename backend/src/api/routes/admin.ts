@@ -76,6 +76,7 @@ import { getHolderConcentrationReport } from "../controllers/regulatoryReports.j
 import { requireApiKey } from "../middleware/auth.js";
 import { adminFeesRouter } from "./fees.js";
 import { ipAllowlist } from "../middleware/ipAllowlist.js";
+import { idempotency } from "../middleware/idempotency.js";
 import { config } from "../../config.js";
 import { jobQueue } from "../../services/jobQueue.js";
 
@@ -85,6 +86,8 @@ adminRouter.post("/session", createAdminSession);
 adminRouter.post("/session/refresh", refreshAdminSession);
 adminRouter.use(ipAllowlist());
 adminRouter.use(requireApiKey({ minRole: "readonly" }));
+// Replays stored responses for retried POSTs carrying an Idempotency-Key (#1186).
+adminRouter.use(idempotency());
 
 adminRouter.get("/stats", getAdminStats);
 adminRouter.get("/reports/vaults.csv", exportVaultsCsv);
