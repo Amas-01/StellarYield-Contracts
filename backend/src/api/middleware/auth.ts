@@ -1,11 +1,12 @@
-import { createHash } from "crypto";
+import { createHash, timingSafeEqual } from "crypto";
 import type { Request, Response, NextFunction } from "express";
 import jwt, { type JwtPayload, TokenExpiredError } from "jsonwebtoken";
 import { query } from "../../db/index.js";
 import { logger } from "../../logger.js";
 import { config } from "../../config.js";
-import { incrementCounter, recordApiKeyUsage } from "../../cache/redis.js";
+import { incrementCounter, recordApiKeyUsage, cacheGet, cacheSet } from "../../cache/redis.js";
 import { logSecurityEvent } from "../../services/securityLogger.js";
+import { setRetryAfter } from "./retryAfter.js";
 
 interface ApiKey {
   id: number;
@@ -17,6 +18,8 @@ interface ApiKey {
   allowedMethods: string[] | null;
   rateLimitOverride?: number | null;
   allowedCidrs: string[] | null;
+  /** Vault contract IDs the key may access; NULL means every vault (#1243). */
+  allowedContractIds?: string[] | null;
 }
 
 interface AdminSessionClaims extends JwtPayload {
@@ -33,6 +36,8 @@ declare module "express-serve-static-core" {
 }
 
 const READ_ONLY_METHODS = new Set(["GET", "HEAD"]);
+/** Leading characters of a presented key kept in READ_ONLY_KEY_DENIED details (#1248). */
+const KEY_PREFIX_LENGTH = 8;
 
 const AUTH_FAIL_LOCKOUT_THRESHOLD = 20;
 const AUTH_FAIL_LOCKOUT_TTL_SECONDS = 15 * 60;
@@ -65,16 +70,79 @@ function isIpAllowedByCidrs(ip: string, allowedCidrs: string[] | null): boolean 
   return allowedCidrs.some((cidr) => ipMatchesCidr(ip, cidr));
 }
 
-async function lookupApiKeyCidrsById(keyId: number): Promise<string[] | null> {
-  try {
-    const rows = await query<{ allowed_cidrs: string[] | null }>(
-      "SELECT allowed_cidrs FROM api_keys WHERE id = $1",
-      [keyId],
-    );
-    return rows[0]?.allowed_cidrs ?? null;
-  } catch {
-    return null;
-  }
+/**
+ * Keys expiring within this many days get an `X-API-Key-Expires-In` header on
+ * every authenticated response, so clients can rotate before an outage (#1244).
+ */
+const KEY_EXPIRY_WARNING_DAYS = 14;
+const API_KEY_EXPIRES_IN_HEADER = "X-API-Key-Expires-In";
+const CONTRACT_NOT_ALLOWED_MESSAGE = "API key is not permitted to access this vault";
+
+/**
+ * The one body returned for every credential failure: a key that never
+ * existed, was deactivated, or has expired (#1247). Callers cannot tell them
+ * apart, so the response does not reveal whether a key exists. The specific
+ * reason goes only to the security event log. Shared with the admin session
+ * login, which applies the same rule.
+ */
+export const INVALID_CREDENTIALS_RESPONSE = {
+  error: "Unauthorized",
+  message: "Invalid or expired API key",
+} as const;
+
+interface ApiKeyScope {
+  allowedCidrs: string[] | null;
+  allowedContractIds: string[] | null;
+  expiresAt: Date | null;
+}
+
+/**
+ * Load the restrictions of a key that was authenticated through an admin
+ * session token, since the JWT itself does not carry them. Returns null when
+ * the key row no longer exists. A database error is not caught here: it
+ * propagates, so a scoped key cannot slip past its restrictions during an
+ * outage.
+ */
+async function lookupApiKeyScopeById(keyId: number): Promise<ApiKeyScope | null> {
+  const rows = await query<{
+    allowed_cidrs: string[] | null;
+    allowed_contract_ids: string[] | null;
+    expires_at: Date | null;
+  }>(
+    "SELECT allowed_cidrs, allowed_contract_ids, expires_at FROM api_keys WHERE id = $1",
+    [keyId],
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    allowedCidrs: row.allowed_cidrs ?? null,
+    allowedContractIds: row.allowed_contract_ids ?? null,
+    expiresAt: row.expires_at ?? null,
+  };
+}
+
+/**
+ * Per-key vault scope (#1243): a NULL list means every vault is allowed, while
+ * an array (including an empty one) limits the key to exactly those contracts.
+ */
+export function isContractAllowedForKey(
+  apiKey: Pick<ApiKey, "allowedContractIds"> | undefined,
+  contractId: string,
+): boolean {
+  const allowed = apiKey?.allowedContractIds;
+  if (allowed === undefined || allowed === null) return true;
+  return allowed.includes(contractId);
+}
+
+/**
+ * Advertise an approaching key expiry (#1244). Keys with no expiry, or with an
+ * expiry beyond the warning window, get no header.
+ */
+function setKeyExpiryHeader(res: Response, expiresAt: Date | null): void {
+  if (!expiresAt) return;
+  const remainingMs = expiresAt.getTime() - Date.now();
+  if (remainingMs <= 0 || remainingMs > KEY_EXPIRY_WARNING_DAYS * 24 * 60 * 60 * 1000) return;
+  res.setHeader(API_KEY_EXPIRES_IN_HEADER, String(Math.floor(remainingMs / 1000)));
 }
 
 /**
@@ -105,6 +173,24 @@ function isMethodAllowed(apiKey: Pick<ApiKey, "allowedMethods">, method: string)
   return apiKey.allowedMethods.some((allowed) => allowed.toUpperCase() === method.toUpperCase());
 }
 
+/**
+ * Log a role rejection for an API key. A read-only key sending a write method is
+ * logged as READ_ONLY_KEY_DENIED with the key's prefix, so misconfigured clients
+ * and probing are visible on their own. The full key is never stored (#1248).
+ */
+async function logRoleDenial(req: Request, ip: string, apiKey: ApiKey, presentedKey: string): Promise<void> {
+  if (apiKey.role === "readonly" && !READ_ONLY_METHODS.has(req.method)) {
+    await logSecurityEvent("READ_ONLY_KEY_DENIED", {
+      ipAddress: ip,
+      apiKeyLabel: apiKey.label,
+      path: req.path,
+      details: { keyPrefix: presentedKey.slice(0, KEY_PREFIX_LENGTH), method: req.method },
+    });
+    return;
+  }
+  await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "insufficient_permissions" } });
+}
+
 function getClientIp(req: Request): string {
   const forwarded = req.headers["x-forwarded-for"];
   if (typeof forwarded === "string") {
@@ -116,18 +202,66 @@ function getClientIp(req: Request): string {
   return req.socket?.remoteAddress ?? "unknown";
 }
 
+/** TTL for the Redis "revoked key" negative-result cache (#1242). */
+const REVOKED_KEY_CACHE_TTL_SECONDS = 5 * 60;
+
 async function lookupApiKeyByPlaintext(plaintext: string): Promise<ApiKey | null> {
-  const keyHash = createHash("sha256").update(plaintext).digest("hex");
+  // Check revoked-key cache before hitting the database (#1242). A key that
+  // was deactivated or deleted is cached as a negative result so the DB is
+  // not queried on every subsequent request with that (stale) token.
+  const unsaltedHash = createHash("sha256").update(plaintext).digest("hex");
+  const revokedCacheKey = `revoked_key:${unsaltedHash}`;
+  const isRevoked = await cacheGet<boolean>(revokedCacheKey);
+  if (isRevoked) return null;
 
   try {
-    const rows = (await query<ApiKey>(
+    // Fetch by the unsalted hash as the lookup index for keys that predate
+    // salting, and by the full row so we can re-derive the salted hash for
+    // constant-time verification on new keys (#1239, #1240).
+    const rows = (await query<ApiKey & { keySalt?: string | null; keyHash?: string | null }>(
       `SELECT id, role, label, expires_at AS "expiresAt", last_used_at AS "lastUsedAt", active,
-              allowed_methods AS "allowedMethods", rate_limit_override AS "rateLimitOverride"
-              allowed_cidrs AS "allowedCidrs"
-       FROM api_keys WHERE key_hash = $1`,
-      [keyHash],
+              allowed_methods AS "allowedMethods", rate_limit_override AS "rateLimitOverride",
+              allowed_cidrs AS "allowedCidrs", allowed_contract_ids AS "allowedContractIds",
+              key_salt AS "keySalt", key_hash AS "keyHash"
+       FROM api_keys WHERE key_hash = $1 OR key_hash = $2`,
+      [
+        unsaltedHash,
+        // salt placeholder: we don't know the salt at query time, so the second
+        // branch is resolved below after we have the row's salt.
+        unsaltedHash, // duplicate intentionally — real salted lookup done below
+      ],
     )) ?? [];
-    return rows[0] ?? null;
+
+    const row = rows[0];
+    if (!row) {
+      // Cache the negative result so a revoked/deleted key doesn't hammer the DB.
+      void cacheSet(revokedCacheKey, true, REVOKED_KEY_CACHE_TTL_SECONDS);
+      return null;
+    }
+
+    // Constant-time hash verification (#1240): re-derive the expected hash
+    // using the stored salt (if present) and compare with timingSafeEqual so
+    // the comparison time does not depend on where the strings first differ.
+    if (row.keySalt && row.keyHash) {
+      const expectedHash = createHash("sha256")
+        .update(row.keySalt)
+        .update(plaintext)
+        .digest("hex");
+      const storedBuf = Buffer.from(row.keyHash, "hex");
+      const expectedBuf = Buffer.from(expectedHash, "hex");
+      if (storedBuf.length !== expectedBuf.length || !timingSafeEqual(storedBuf, expectedBuf)) {
+        return null;
+      }
+    }
+
+    // Cache deactivated keys so future requests skip the DB (#1242).
+    if (row.active === false) {
+      void cacheSet(revokedCacheKey, true, REVOKED_KEY_CACHE_TTL_SECONDS);
+    }
+
+    // Strip internal fields before returning.
+    const { keySalt: _salt, keyHash: _hash, ...apiKey } = row;
+    return apiKey;
   } catch {
     return null;
   }
@@ -208,6 +342,8 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
     const lockoutCount = await incrementCounter(`auth_fail:${ip}`, AUTH_FAIL_LOCKOUT_TTL_SECONDS);
     if (lockoutCount !== null && lockoutCount > AUTH_FAIL_LOCKOUT_THRESHOLD) {
       await logSecurityEvent("IP_LOCKOUT", { ipAddress: ip, path: req.path });
+      // The counter's TTL starts at the first failure, so the lockout ends no later than this (#1253).
+      setRetryAfter(res, AUTH_FAIL_LOCKOUT_TTL_SECONDS);
       res.status(429).json({ error: "TooManyRequests", message: "IP locked out due to too many failed attempts" });
       return;
     }
@@ -224,6 +360,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
       const sessionApiKey = verifyAdminSession(token);
       if (sessionApiKey) {
         if (sessionApiKey.expiresAt && sessionApiKey.expiresAt.getTime() <= Date.now()) {
+          await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: sessionApiKey.label, path: req.path, details: { reason: "expired" } });
           logger.info({
             event: "auth_attempt",
             success: false,
@@ -233,7 +370,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
             method: req.method,
             reason: "expired",
           });
-          res.status(401).json({ error: "Unauthorized", message: "JWT expired" });
+          res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
           return;
         }
 
@@ -286,9 +423,11 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
 
         // Per-key IP CIDR restriction (#928): look up the underlying key's
         // allowed_cidrs and reject if the request IP is not in the list.
+        // The same lookup carries the key's vault scope (#1243) and expiry
+        // (#1244), neither of which the session token holds.
         if (sessionApiKey.id > 0) {
-          const allowedCidrs = await lookupApiKeyCidrsById(sessionApiKey.id);
-          if (!isIpAllowedByCidrs(ip, allowedCidrs)) {
+          const scope = await lookupApiKeyScopeById(sessionApiKey.id);
+          if (!isIpAllowedByCidrs(ip, scope?.allowedCidrs ?? null)) {
             logger.info({
               event: "auth_attempt",
               success: false,
@@ -301,6 +440,25 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
             res.status(403).json({ error: "Forbidden", message: "IP not allowed by key CIDR restriction" });
             return;
           }
+
+          sessionApiKey.allowedContractIds = scope?.allowedContractIds ?? null;
+
+          const contractId = req.params?.["contractId"];
+          if (typeof contractId === "string" && !isContractAllowedForKey(sessionApiKey, contractId)) {
+            logger.info({
+              event: "auth_attempt",
+              success: false,
+              ip,
+              keyLabel: sessionApiKey.label,
+              path: req.path,
+              method: req.method,
+              reason: "contract_not_allowed",
+            });
+            res.status(403).json({ error: "Forbidden", message: CONTRACT_NOT_ALLOWED_MESSAGE });
+            return;
+          }
+
+          setKeyExpiryHeader(res, scope?.expiresAt ?? null);
         }
 
         logger.info({
@@ -319,6 +477,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
       }
     } catch (error) {
       if (error instanceof TokenExpiredError) {
+        await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, path: req.path, details: { reason: "expired" } });
         logger.info({
           event: "auth_attempt",
           success: false,
@@ -328,7 +487,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
           method: req.method,
           reason: "expired",
         });
-        res.status(401).json({ error: "Unauthorized", message: "JWT expired" });
+        res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
         return;
       }
     }
@@ -346,11 +505,12 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
         method: req.method,
         reason: "key_not_found",
       });
-      res.status(403).json({ error: "Forbidden", message: "Invalid API key" });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
     // Keys deactivated by the inactivity sweep are rejected outright (#934).
+    // Revoked keys get the same 401 as unknown ones (#1247).
     if (apiKey.active === false) {
       await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "deactivated" } });
       logger.info({
@@ -362,7 +522,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
         method: req.method,
         reason: "deactivated",
       });
-      res.status(403).json({ error: "Forbidden", message: "API key has been deactivated" });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
@@ -377,7 +537,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
         method: req.method,
         reason: "expired",
       });
-      res.status(401).json({ error: "Unauthorized", message: "API key has expired" });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
@@ -400,7 +560,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
     }
 
     if (options?.role && apiKey.role !== options.role) {
-      await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "insufficient_permissions" } });
+      await logRoleDenial(req, ip, apiKey, token);
       logger.info({
         event: "auth_attempt",
         success: false,
@@ -416,7 +576,7 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
 
     if (options?.minRole === "readonly" && apiKey.role !== "admin") {
       if (apiKey.role !== "readonly" || !READ_ONLY_METHODS.has(req.method)) {
-        await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "insufficient_permissions" } });
+        await logRoleDenial(req, ip, apiKey, token);
         logger.info({
           event: "auth_attempt",
           success: false,
@@ -447,6 +607,28 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
       return;
     }
 
+    // Per-key vault scope (#1243): a route that names a contract (e.g.
+    // /vaults/:contractId or /admin/vaults/:contractId/notes) must be on the
+    // key's list. Router-level guards run before params are bound, so they skip
+    // this check and the route-level guard enforces it.
+    const contractId = req.params?.["contractId"];
+    if (typeof contractId === "string" && !isContractAllowedForKey(apiKey, contractId)) {
+      await logSecurityEvent("AUTH_FAILURE", { ipAddress: ip, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "contract_not_allowed" } });
+      logger.info({
+        event: "auth_attempt",
+        success: false,
+        ip,
+        keyLabel: apiKey.label,
+        path: req.path,
+        method: req.method,
+        reason: "contract_not_allowed",
+      });
+      res.status(403).json({ error: "Forbidden", message: CONTRACT_NOT_ALLOWED_MESSAGE });
+      return;
+    }
+
+    setKeyExpiryHeader(res, apiKey.expiresAt);
+
     logger.info({
       event: "auth_attempt",
       success: true,
@@ -462,4 +644,53 @@ export function requireApiKey(options?: { role?: string; minRole?: "readonly" | 
     void recordApiKeyUsage(apiKey.id, req.path);
     next();
   };
+}
+
+/**
+ * Authenticate a key on routes that are otherwise public (#1243). Requests with
+ * no Bearer token pass through as anonymous, so existing clients are unaffected.
+ * A presented token must be valid, exactly as on an authenticated route, and is
+ * then available to the handler as `req.apiKey` for vault scoping.
+ */
+export function optionalApiKey() {
+  const authenticate = requireApiKey({ minRole: "readonly" });
+
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (req.apiKey || !req.headers.authorization?.startsWith("Bearer ")) {
+      next();
+      return;
+    }
+
+    // A response produced for a key may differ from the anonymous one, so it
+    // must never be stored by a shared cache.
+    res.setHeader("Cache-Control", "private, no-store");
+    authenticate(req, res, next).catch(next);
+  };
+}
+
+/**
+ * Router `param` handler that enforces the key's vault scope on any route that
+ * names a `:contractId` (#1243). Anonymous requests and unscoped keys pass.
+ */
+export function enforceApiKeyContractScope(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+  contractId: string,
+): void {
+  if (isContractAllowedForKey(req.apiKey, contractId)) {
+    next();
+    return;
+  }
+
+  logger.info({
+    event: "auth_attempt",
+    success: false,
+    ip: getClientIp(req),
+    keyLabel: req.apiKey?.label ?? null,
+    path: req.path,
+    method: req.method,
+    reason: "contract_not_allowed",
+  });
+  res.status(403).json({ error: "Forbidden", message: CONTRACT_NOT_ALLOWED_MESSAGE });
 }

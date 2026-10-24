@@ -393,6 +393,12 @@ interface ListVaultsOptions {
   filter?: FilterTree;
   /** Sparse fieldset — camelCase field names to include (#860). */
   fields?: string[];
+  /** Limit the list to these contract IDs, for a key scoped to some vaults (#1243). */
+  contractIds?: string[];
+  /** Filter by admin tag (#1283). */
+  tag?: string;
+  /** Whether using default ordering (#1286). */
+  isDefaultSort?: boolean;
 }
 
 /** Row-selection filters shared by the vault list query and its COUNT companion. */
@@ -403,6 +409,10 @@ interface VaultListFilters {
   createdTo?: string;
   minTotalAssets?: string;
   maxTotalAssets?: string;
+  /** Restrict to these contract IDs; an empty array matches nothing (#1243). */
+  contractIds?: string[];
+  /** Filter by admin tag (#1283). */
+  tag?: string;
 }
 
 /**
@@ -439,6 +449,17 @@ function buildVaultListFilters(
   if (filters.minTotalAssets) add((p) => `v.total_assets >= ${p}::numeric`, filters.minTotalAssets);
   if (filters.maxTotalAssets) add((p) => `v.total_assets <= ${p}::numeric`, filters.maxTotalAssets);
 
+  // Per-key vault scope (#1243). Checked by `!== undefined` so an empty list
+  // still adds a condition and matches no rows.
+  if (filters.contractIds !== undefined) {
+    add((p) => `v.contract_id = ANY(${p}::text[])`, filters.contractIds);
+  }
+
+  // Filter vaults by admin tag (#1283)
+  if (filters.tag) {
+    add((p) => `${p} = ANY(v.tags)`, filters.tag);
+  }
+
   return { conditions, params, nextIdx: idx };
 }
 
@@ -468,6 +489,11 @@ interface VaultRow {
   logo_uri: string | null;
   created_at: Date;
   updated_at: Date;
+  settlement_status: string | null;
+  supply_at_maturity?: string | null;
+  unlisted?: boolean;
+  featured_rank?: number | null;
+  tags?: string[];
 }
 
 function computeFundingProgress(totalAssets: string, fundingTarget: string | null): number | null {
@@ -475,6 +501,27 @@ function computeFundingProgress(totalAssets: string, fundingTarget: string | nul
   const target = parseFloat(fundingTarget);
   if (!target) return 0;
   return Math.min(100, (parseFloat(totalAssets) / target) * 100);
+}
+
+/**
+ * Fraction of the supply redeemed since maturity (#1275): 1 - totalSupply /
+ * supplyAtMaturity, clamped to [0, 1]. Returns undefined for non-matured
+ * vaults so the field is omitted from the response entirely, and for a
+ * matured vault that has no supplyAtMaturity baseline recorded yet.
+ */
+function computeRedeemedPct(
+  state: string,
+  totalSupply: string,
+  supplyAtMaturity: string | null | undefined,
+): number | undefined {
+  if (state !== "Matured") return undefined;
+  if (!supplyAtMaturity) return undefined;
+
+  const maturitySupply = parseFloat(supplyAtMaturity);
+  if (!maturitySupply) return 0;
+
+  const currentSupply = parseFloat(totalSupply ?? "0");
+  return Math.max(0, Math.min(1, 1 - currentSupply / maturitySupply));
 }
 
 function extractAddressFromScVal(topic: unknown): string {
@@ -489,6 +536,8 @@ function extractAddressFromScVal(topic: unknown): string {
 }
 
 function mapVaultRow(row: VaultRow): Vault {
+  const redeemedPct = computeRedeemedPct(row.state, row.total_supply, row.supply_at_maturity);
+
   return {
     id: row.id,
     contractId: row.contract_id,
@@ -518,6 +567,11 @@ function mapVaultRow(row: VaultRow): Vault {
     logoUri: row.logo_uri ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    settlementStatus: (row.settlement_status as Vault["settlementStatus"]) ?? null,
+    ...(redeemedPct !== undefined ? { redeemedPct } : {}),
+    ...(row.unlisted !== undefined ? { unlisted: row.unlisted } : {}),
+    ...(row.featured_rank !== undefined ? { featuredRank: row.featured_rank } : {}),
+    ...(row.tags !== undefined ? { tags: row.tags } : {}),
   };
 }
 
@@ -569,9 +623,12 @@ export class VaultService {
     if (!sortResult.ok) {
       throw new Error(`Invalid sort parameter: ${sortResult.message}`);
     }
-    const orderByClause = sortResult.specs
+    let orderByClause = sortResult.specs
       .map((spec) => `v.${spec.field} ${spec.direction === "asc" ? "ASC" : "DESC"}`)
       .join(", ");
+    if (opts.isDefaultSort ?? !opts.sort) {
+      orderByClause = `v.featured_rank ASC NULLS LAST, ${orderByClause}`;
+    }
 
     // Cursor pagination keys off (created_at, id), so the tiebreaker and the
     // cursor comparison both follow the primary sort field's direction.
@@ -599,6 +656,8 @@ export class VaultService {
       createdTo: opts.createdTo,
       minTotalAssets: opts.minTotalAssets,
       maxTotalAssets: opts.maxTotalAssets,
+      contractIds: opts.contractIds,
+      tag: opts.tag,
     };
     const filtered = buildVaultListFilters(filters);
     const conditions = filtered.conditions;
@@ -607,6 +666,8 @@ export class VaultService {
 
     // Filter out archived vaults from standard list queries (#674)
     conditions.push(`v.archived = FALSE`);
+    // Exclude unlisted vaults from public listings (#1285)
+    conditions.push(`v.unlisted = FALSE`);
 
     // Compound filter tree (#859)
     if (opts.filter) {
@@ -646,6 +707,9 @@ export class VaultService {
                v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
                v.description, v.logo_uri,
+               v.settlement_status,
+               v.supply_at_maturity,
+               v.unlisted, v.featured_rank, v.tags,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -664,6 +728,9 @@ export class VaultService {
                v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
                v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
                v.description, v.logo_uri,
+               v.settlement_status,
+               v.supply_at_maturity,
+               v.unlisted, v.featured_rank, v.tags,
                COALESCE((
                  SELECT COUNT(*)::int
                  FROM user_vault_positions uvp
@@ -698,6 +765,7 @@ export class VaultService {
       let countIdx = countFilters.nextIdx;
 
       countConditions.push(`v.archived = FALSE`);
+      countConditions.push(`v.unlisted = FALSE`);
 
       if (opts.filter) {
         const { sql: filterSql, nextIdx } = applyFilterTree(opts.filter, countParams, countIdx + 1);
@@ -779,13 +847,14 @@ export class VaultService {
               v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
               v.zkme_verifier_address,
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
+              v.unlisted, v.featured_rank, v.tags,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp
                 WHERE uvp.vault_id = v.id AND uvp.shares > 0
               ), 0) AS depositor_count
        FROM vaults v
-       WHERE v.factory_id = $1 AND v.archived = FALSE
+       WHERE v.factory_id = $1 AND v.archived = FALSE AND v.unlisted = FALSE
        ORDER BY v.created_at DESC`,
       [factoryId],
       timeoutMs ? { timeoutMs } : undefined,
@@ -817,6 +886,9 @@ export class VaultService {
               v.zkme_verifier_address,
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
               v.description, v.logo_uri,
+              v.settlement_status,
+              v.supply_at_maturity,
+              v.unlisted, v.featured_rank, v.tags,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp
@@ -1269,6 +1341,184 @@ export class VaultService {
     }));
   }
 
+  /**
+   * Redemption processing latency stats — closes #1271.
+   *
+   * GET /api/v1/vaults/:contractId/redemption-stats
+   *
+   * Returns avg, median (p50), and p95 processing latency in hours for all
+   * *processed* redemption requests, plus the count of processed requests.
+   * Requests without a `processed_at` timestamp are excluded.
+   * Returns `null` durations and zero counts when no processed requests exist.
+   */
+  async getRedemptionStats(contractId: string): Promise<{
+    avgHours: number | null;
+    medianHours: number | null;
+    p95Hours: number | null;
+    processedCount: number;
+  }> {
+    const rows = await query<{
+      avg_hours: string | null;
+      median_hours: string | null;
+      p95_hours: string | null;
+      processed_count: string;
+    }>(
+      `SELECT
+         AVG(EXTRACT(EPOCH FROM (rr.processed_at - rr.request_time)) / 3600)::text          AS avg_hours,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (
+           ORDER BY EXTRACT(EPOCH FROM (rr.processed_at - rr.request_time)) / 3600
+         )::text                                                                             AS median_hours,
+         PERCENTILE_CONT(0.95) WITHIN GROUP (
+           ORDER BY EXTRACT(EPOCH FROM (rr.processed_at - rr.request_time)) / 3600
+         )::text                                                                             AS p95_hours,
+         COUNT(*)::text                                                                      AS processed_count
+       FROM redemption_requests rr
+       JOIN vaults v ON rr.vault_id = v.id
+       WHERE v.contract_id = $1
+         AND rr.processed = TRUE
+         AND rr.processed_at IS NOT NULL`,
+      [contractId],
+    );
+
+    const row = rows[0];
+    const processedCount = parseInt(row?.processed_count ?? "0", 10);
+
+    if (processedCount === 0) {
+      return { avgHours: null, medianHours: null, p95Hours: null, processedCount: 0 };
+    }
+
+    return {
+      avgHours: row.avg_hours != null ? parseFloat(row.avg_hours) : null,
+      medianHours: row.median_hours != null ? parseFloat(row.median_hours) : null,
+      p95Hours: row.p95_hours != null ? parseFloat(row.p95_hours) : null,
+      processedCount,
+    };
+  }
+
+  /**
+   * Redemption cancellation rate — closes #1272.
+   *
+   * Adds `cancellationRate` (cancelled ÷ total requested) to the redemption
+   * stats endpoint. Rate is in [0, 1]; returns `null` when no requests exist.
+   */
+  async getRedemptionCancellationRate(contractId: string): Promise<{
+    cancellationRate: number | null;
+    cancelledCount: number;
+    totalRequested: number;
+  }> {
+    const rows = await query<{
+      cancelled_count: string;
+      total_count: string;
+    }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE rr.cancelled = TRUE)::text AS cancelled_count,
+         COUNT(*)::text                                     AS total_count
+       FROM redemption_requests rr
+       JOIN vaults v ON rr.vault_id = v.id
+       WHERE v.contract_id = $1`,
+      [contractId],
+    );
+
+    const row = rows[0];
+    const totalRequested = parseInt(row?.total_count ?? "0", 10);
+    const cancelledCount = parseInt(row?.cancelled_count ?? "0", 10);
+
+    if (totalRequested === 0) {
+      return { cancellationRate: null, cancelledCount: 0, totalRequested: 0 };
+    }
+
+    return {
+      cancellationRate: cancelledCount / totalRequested,
+      cancelledCount,
+      totalRequested,
+    };
+  }
+
+  /**
+   * Holder retention across epochs — closes #1263.
+   *
+   * GET /api/v1/vaults/:contractId/retention?epochs=5
+   *
+   * For each of the last `epochCount` epochs, returns:
+   *   - epochId          — the epoch number
+   *   - holders          — distinct addresses with shares > 0 at that epoch
+   *   - retainedNextEpoch — of those, how many also held shares > 0 at epoch+1
+   *   - retentionRate    — retainedNextEpoch / holders  (null for the latest epoch)
+   */
+  async getHolderRetention(
+    contractId: string,
+    epochCount: number,
+  ): Promise<
+    Array<{
+      epochId: number;
+      holders: number;
+      retainedNextEpoch: number | null;
+      retentionRate: number | null;
+    }>
+  > {
+    // Resolve vault id
+    const vaultRows = await query<{ id: number }>(
+      `SELECT id FROM vaults WHERE contract_id = $1`,
+      [contractId],
+    );
+    if (vaultRows.length === 0) return [];
+
+    const vaultId = vaultRows[0].id;
+
+    // Fetch the latest epoch present in snapshots for this vault
+    const maxEpochRows = await query<{ max_epoch: number | null }>(
+      `SELECT MAX(epoch)::int AS max_epoch FROM share_balance_snapshots WHERE vault_id = $1`,
+      [vaultId],
+    );
+    const maxEpoch = maxEpochRows[0]?.max_epoch;
+    if (maxEpoch == null) return [];
+
+    const minEpoch = Math.max(0, maxEpoch - epochCount + 1);
+
+    // For each epoch in the window, count holders and retained holders
+    const rows = await query<{
+      epoch: number;
+      holders: string;
+      retained: string | null;
+    }>(
+      `WITH epochs AS (
+         SELECT generate_series($2::int, $3::int) AS epoch
+       ),
+       holders_per_epoch AS (
+         SELECT epoch, user_address
+         FROM share_balance_snapshots
+         WHERE vault_id = $1 AND shares > 0
+       )
+       SELECT
+         e.epoch,
+         COUNT(DISTINCT h.user_address)::text                      AS holders,
+         COUNT(DISTINCT hn.user_address)::text                     AS retained
+       FROM epochs e
+       LEFT JOIN holders_per_epoch h  ON h.epoch = e.epoch
+       LEFT JOIN holders_per_epoch hn ON hn.epoch = e.epoch + 1
+                                     AND hn.user_address = h.user_address
+       GROUP BY e.epoch
+       ORDER BY e.epoch ASC`,
+      [vaultId, minEpoch, maxEpoch],
+    );
+
+    return rows.map((row) => {
+      const holders = parseInt(row.holders, 10);
+      const retained = row.retained != null ? parseInt(row.retained, 10) : null;
+      const isLatestEpoch = row.epoch === maxEpoch;
+
+      return {
+        epochId: row.epoch,
+        holders,
+        retainedNextEpoch: isLatestEpoch ? null : (retained ?? 0),
+        retentionRate:
+          isLatestEpoch || holders === 0
+            ? null
+            : (retained ?? 0) / holders,
+      };
+    });
+  }
+
   async getVaultOperators(contractId: string): Promise<VaultOperator[]> {
     const rows = await query<{
       address: string;
@@ -1311,10 +1561,10 @@ export class VaultService {
       payload: Record<string, unknown>;
       created_at: Date;
     }>(
-      `SELECT ledger, event_type, payload, created_at
+       `SELECT ledger, event_type, payload, created_at
        FROM indexed_events
        WHERE contract_id = $1 AND event_type IN ('op_add', 'op_rem')
-       ORDER BY created_at DESC
+       ORDER BY ledger DESC, tx_index DESC NULLS LAST, event_index DESC NULLS LAST, id DESC
        LIMIT $2 OFFSET $3`,
       [contractId, pageSize, offset],
     );
@@ -1388,6 +1638,8 @@ export class VaultService {
 
     // Filter out archived vaults (#674)
     conditions.push(`v.archived = FALSE`);
+    // Exclude unlisted vaults (#1285)
+    conditions.push(`v.unlisted = FALSE`);
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -1397,6 +1649,7 @@ export class VaultService {
               v.created_at, v.updated_at,
               v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
+              v.unlisted, v.featured_rank, v.tags,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp
@@ -1458,6 +1711,7 @@ export class VaultService {
        WHERE ie.event_type = 'deposit'
          AND ie.created_at > NOW() - INTERVAL '24 hours'
          AND v.archived = FALSE
+         AND v.unlisted = FALSE
        GROUP BY v.contract_id, v.name
        ORDER BY total_deposited DESC
        LIMIT 10`,
@@ -1479,13 +1733,14 @@ export class VaultService {
               v.created_at, v.updated_at,
               v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
+              v.unlisted, v.featured_rank, v.tags,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp
                 WHERE uvp.vault_id = v.id AND uvp.shares > 0
               ), 0) AS depositor_count
        FROM vaults v
-       WHERE v.created_at > $1 AND v.archived = FALSE
+       WHERE v.created_at > $1 AND v.archived = FALSE AND v.unlisted = FALSE
        ORDER BY v.created_at DESC`,
       [cutoff],
     );
@@ -1501,6 +1756,7 @@ export class VaultService {
               v.created_at, v.updated_at,
               v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
+              v.unlisted, v.featured_rank, v.tags,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp
@@ -1512,6 +1768,7 @@ export class VaultService {
          AND v.maturity_date > NOW()
          AND v.maturity_date <= NOW() + ($1::int * INTERVAL '1 day')
          AND v.archived = FALSE
+         AND v.unlisted = FALSE
        ORDER BY v.maturity_date ASC`,
       [days],
     );
@@ -1530,6 +1787,7 @@ export class VaultService {
               v.created_at, v.updated_at,
               v.funding_target, v.funding_deadline, v.min_deposit, v.max_deposit_per_user,
               v.rwa_name, v.rwa_symbol, v.rwa_document_uri, v.rwa_category,
+              v.unlisted, v.featured_rank, v.tags,
               COALESCE((
                 SELECT COUNT(*)::int
                 FROM user_vault_positions uvp
@@ -1541,6 +1799,7 @@ export class VaultService {
          AND v.funding_target::numeric > 0
          AND v.total_assets::numeric >= v.funding_target::numeric
          AND v.archived = FALSE
+         AND v.unlisted = FALSE
        ORDER BY (v.total_assets::numeric / v.funding_target::numeric) DESC`,
     );
 
@@ -1580,6 +1839,7 @@ export class VaultService {
          AND state = 'Active'
          AND contract_id != $2
          AND archived = FALSE
+         AND unlisted = FALSE
        ORDER BY ABS(total_assets::numeric - $3::numeric) ASC
        LIMIT 5`,
       [rwa_category, contractId, total_assets],
@@ -1817,5 +2077,291 @@ export class VaultService {
       uniqueSenders: parseInt(row?.unique_senders ?? "0", 10),
       uniqueRecipients: parseInt(row?.unique_recipients ?? "0", 10),
     };
+  }
+
+  // ── Issue #1264: Average holding duration ─────────────────────────────────
+  /**
+   * Compute average and median holding duration across all distinct holders of
+   * a vault.
+   *
+   * - Active holders: duration = NOW() − first_entry_at
+   * - Fully-exited holders (last_exit_at IS NOT NULL): duration = last_exit_at − first_entry_at
+   * - Only holders with a recorded first_entry_at are included in the sample.
+   *
+   * Median is computed with the percentile_cont aggregate to avoid pulling all
+   * rows into the application layer.
+   */
+  async getHoldingDuration(contractId: string): Promise<{
+    averageDays: number;
+    medianDays: number;
+    sampleSize: number;
+  } | null> {
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1 LIMIT 1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) return null;
+    const vaultId = vaultRows[0].id;
+
+    const rows = await query<{
+      average_days: string | null;
+      median_days: string | null;
+      sample_size: string;
+    }>(
+      `SELECT
+         AVG(
+           EXTRACT(EPOCH FROM
+             COALESCE(uvp.last_exit_at, NOW()) - uvp.first_entry_at
+           ) / 86400.0
+         )::text AS average_days,
+         PERCENTILE_CONT(0.5) WITHIN GROUP (
+           ORDER BY
+             EXTRACT(EPOCH FROM
+               COALESCE(uvp.last_exit_at, NOW()) - uvp.first_entry_at
+             ) / 86400.0
+         )::text AS median_days,
+         COUNT(*)::text AS sample_size
+       FROM user_vault_positions uvp
+       WHERE uvp.vault_id = $1
+         AND uvp.first_entry_at IS NOT NULL`,
+      [vaultId],
+    );
+
+    const row = rows[0];
+    const sampleSize = parseInt(row?.sample_size ?? "0", 10);
+    if (sampleSize === 0) {
+      return { averageDays: 0, medianDays: 0, sampleSize: 0 };
+    }
+
+    return {
+      averageDays: Math.round(parseFloat(row?.average_days ?? "0") * 100) / 100,
+      medianDays: Math.round(parseFloat(row?.median_days ?? "0") * 100) / 100,
+      sampleSize,
+    };
+  }
+
+  // ── Issue #1267: Withdrawal-to-deposit ratio ──────────────────────────────
+  /**
+   * Compute the withdrawal-to-deposit volume ratio over 7-day and 30-day
+   * trailing windows.  Values are derived from indexed_events where
+   * event_type is 'deposit' or 'withdraw'.
+   *
+   * Amounts are stored in the JSONB payload under
+   * `{value,vec,0,i128,lo}` (low 64 bits of a u128 — sufficient for practical
+   * vault sizes; the same path is used throughout the codebase for deposit
+   * totals).
+   *
+   * Returns null for a window where no deposits occurred.
+   */
+  async getWithdrawalRatios(contractId: string): Promise<{
+    withdrawalRatio7d: number | null;
+    withdrawalRatio30d: number | null;
+  } | null> {
+    // Verify vault exists
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1 LIMIT 1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) return null;
+
+    const rows = await query<{
+      period_days: string;
+      deposited: string;
+      withdrawn: string;
+    }>(
+      `SELECT
+         period_days,
+         COALESCE(SUM(CASE WHEN event_type = 'deposit'  THEN amount ELSE 0 END), 0)::text AS deposited,
+         COALESCE(SUM(CASE WHEN event_type = 'withdraw' THEN amount ELSE 0 END), 0)::text AS withdrawn
+       FROM (
+         SELECT
+           event_type,
+           7 AS period_days,
+           (payload #>> '{value,vec,0,i128,lo}')::numeric AS amount
+         FROM indexed_events
+         WHERE contract_id = $1
+           AND event_type IN ('deposit', 'withdraw')
+           AND created_at >= NOW() - INTERVAL '7 days'
+         UNION ALL
+         SELECT
+           event_type,
+           30 AS period_days,
+           (payload #>> '{value,vec,0,i128,lo}')::numeric AS amount
+         FROM indexed_events
+         WHERE contract_id = $1
+           AND event_type IN ('deposit', 'withdraw')
+           AND created_at >= NOW() - INTERVAL '30 days'
+       ) combined
+       GROUP BY period_days`,
+      [contractId],
+    );
+
+    let withdrawalRatio7d: number | null = null;
+    let withdrawalRatio30d: number | null = null;
+
+    for (const r of rows) {
+      const deposited = parseFloat(r.deposited);
+      const withdrawn = parseFloat(r.withdrawn);
+      const ratio = deposited > 0 ? Math.round((withdrawn / deposited) * 10000) / 10000 : null;
+
+      if (r.period_days === "7") {
+        withdrawalRatio7d = ratio;
+      } else if (r.period_days === "30") {
+        withdrawalRatio30d = ratio;
+      }
+    }
+
+    return { withdrawalRatio7d, withdrawalRatio30d };
+  }
+
+  // ── Issue #1268: Funding velocity ─────────────────────────────────────────
+  /**
+   * Compute funding velocity for a vault in the Funding state.
+   *
+   * Velocity = total deposits in the last 7 days ÷ 7 (average per day).
+   * projectedFundingDate is estimated by:
+   *   remaining = fundingTarget − totalAssets
+   *   daysNeeded = remaining / velocityPerDay
+   *   projectedFundingDate = NOW + daysNeeded
+   *
+   * Returns null for non-funding vaults.
+   * Returns projectedFundingDate = null when velocity is zero.
+   */
+  async getFundingVelocity(contractId: string): Promise<{
+    fundingVelocityPerDay: number;
+    projectedFundingDate: string | null;
+  } | null> {
+    const vaultRows = await query<{
+      id: number;
+      state: string;
+      total_assets: string | null;
+      funding_target: string | null;
+    }>(
+      `SELECT id, state, total_assets, funding_target
+       FROM vaults WHERE contract_id = $1 LIMIT 1`,
+      [contractId],
+    );
+
+    if (vaultRows.length === 0) return null;
+    const vault = vaultRows[0];
+    if (vault.state !== "Funding") return null;
+
+    // Sum deposits over the trailing 7 days
+    const depositRows = await query<{ total_deposited: string }>(
+      `SELECT COALESCE(
+         SUM((payload #>> '{value,vec,0,i128,lo}')::numeric), 0
+       )::text AS total_deposited
+       FROM indexed_events
+       WHERE contract_id = $1
+         AND event_type = 'deposit'
+         AND created_at >= NOW() - INTERVAL '7 days'`,
+      [contractId],
+    );
+
+    const totalDeposited = parseFloat(depositRows[0]?.total_deposited ?? "0");
+    const velocityPerDay = totalDeposited / 7;
+
+    let projectedFundingDate: string | null = null;
+    if (velocityPerDay > 0 && vault.funding_target !== null) {
+      const remaining = parseFloat(vault.funding_target) - parseFloat(vault.total_assets ?? "0");
+      if (remaining > 0) {
+        const daysNeeded = remaining / velocityPerDay;
+        const projectedMs = Date.now() + daysNeeded * 24 * 60 * 60 * 1000;
+        projectedFundingDate = new Date(projectedMs).toISOString();
+      } else {
+        // Already at or past target
+        projectedFundingDate = new Date().toISOString();
+      }
+    }
+
+    return {
+      fundingVelocityPerDay: Math.round(velocityPerDay * 100) / 100,
+      projectedFundingDate,
+    };
+  }
+
+  // ── Issue #1269: Redemption queue ETA ─────────────────────────────────────
+  /**
+   * Estimate the processing wait time for a specific address in the
+   * early-redemption queue.
+   *
+   * Position is based on request_time ASC (FIFO).  Throughput is computed as
+   * the number of requests processed (processed = TRUE) divided by the span
+   * between the oldest and newest processed_at timestamps.  Returns null for
+   * the estimate when fewer than 5 requests have been processed (insufficient
+   * history).
+   */
+  async getRedemptionQueueEta(
+    contractId: string,
+    userAddress: string,
+  ): Promise<{
+    position: number;
+    amountAhead: string;
+    estimatedProcessingDate: string | null;
+  } | null> {
+    // Verify vault exists
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1 LIMIT 1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) return null;
+    const vaultId = vaultRows[0].id;
+
+    // Find the user's earliest unprocessed request
+    const userRows = await query<{ request_time: Date; shares: string }>(
+      `SELECT request_time, shares
+       FROM redemption_requests
+       WHERE vault_id = $1 AND user_address = $2 AND processed = FALSE
+       ORDER BY request_time ASC
+       LIMIT 1`,
+      [vaultId, userAddress],
+    );
+
+    if (userRows.length === 0) return null;
+    const userRequestTime = userRows[0].request_time;
+
+    // Count requests ahead (submitted strictly before the user's earliest request)
+    const aheadRows = await query<{ position: string; amount_ahead: string }>(
+      `SELECT
+         COUNT(*)::text AS position,
+         COALESCE(SUM(shares), 0)::text AS amount_ahead
+       FROM redemption_requests
+       WHERE vault_id = $1
+         AND processed = FALSE
+         AND request_time < $2`,
+      [vaultId, userRequestTime],
+    );
+
+    const position = parseInt(aheadRows[0]?.position ?? "0", 10) + 1;
+    const amountAhead = aheadRows[0]?.amount_ahead ?? "0";
+
+    // Compute throughput from processed requests using processed_at
+    const throughputRows = await query<{
+      processed_count: string;
+      span_seconds: string | null;
+    }>(
+      `SELECT
+         COUNT(*)::text AS processed_count,
+         EXTRACT(EPOCH FROM (MAX(processed_at) - MIN(processed_at)))::text AS span_seconds
+       FROM redemption_requests
+       WHERE vault_id = $1 AND processed = TRUE AND processed_at IS NOT NULL`,
+      [vaultId],
+    );
+
+    const processedCount = parseInt(throughputRows[0]?.processed_count ?? "0", 10);
+    const spanSeconds = parseFloat(throughputRows[0]?.span_seconds ?? "0");
+
+    let estimatedProcessingDate: string | null = null;
+
+    if (processedCount >= 5 && spanSeconds > 0) {
+      // Requests per second throughput
+      const throughputPerSecond = processedCount / spanSeconds;
+      const secondsUntilProcessed = position / throughputPerSecond;
+      const estimatedMs = Date.now() + secondsUntilProcessed * 1000;
+      estimatedProcessingDate = new Date(estimatedMs).toISOString();
+    }
+    // < 5 processed → estimatedProcessingDate stays null
+
+    return { position, amountAhead, estimatedProcessingDate };
   }
 }

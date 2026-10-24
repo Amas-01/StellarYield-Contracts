@@ -11,6 +11,7 @@ const JOB_TYPES: Record<string, SendOptions> = {
   "report-generate": { retryLimit: 2, retryDelay: 60, retryBackoff: false },
   "document-accessibility-check": { retryLimit: 3, retryDelay: 60, retryBackoff: true },
   "api-key-inactivity-sweep": { retryLimit: 3, retryDelay: 300, retryBackoff: false },
+  "api-key-expiry-reminder": { retryLimit: 3, retryDelay: 300, retryBackoff: false },
   "archival": { retryLimit: 3, retryDelay: 300, retryBackoff: false },
   "sanctions-auto-blacklist": { retryLimit: 3, retryDelay: 300, retryBackoff: true },
   "transfer-velocity-anomaly-check": { retryLimit: 3, retryDelay: 60, retryBackoff: false },
@@ -74,6 +75,14 @@ class JobQueue {
       await this.boss.schedule("api-key-inactivity-sweep", "0 3 * * *", {});
     } catch (err) {
       logger.warn({ err }, "Could not register api-key-inactivity-sweep schedule on boss start");
+    }
+
+    // Schedule the daily API key expiry reminder at 05:00 UTC (#1245), after the
+    // inactivity sweep so a key it retires is not reported as expiring.
+    try {
+      await this.boss.schedule("api-key-expiry-reminder", "0 5 * * *", {});
+    } catch (err) {
+      logger.warn({ err }, "Could not register api-key-expiry-reminder schedule on boss start");
     }
 
     // Schedule daily sanctions screening at 01:00 UTC (#1113)
@@ -164,6 +173,15 @@ class JobQueue {
       for (const _job of jobs) {
         await runWithMetrics("api-key-inactivity-sweep", async () => {
           await deactivateInactiveApiKeys();
+        });
+      }
+    });
+
+    await this.boss.work<Record<string, unknown>>("api-key-expiry-reminder", async (jobs: Job<Record<string, unknown>>[]) => {
+      const { logApiKeysExpiringSoon } = await import("./apiKeyExpiryReminder.js");
+      for (const _job of jobs) {
+        await runWithMetrics("api-key-expiry-reminder", async () => {
+          await logApiKeysExpiringSoon();
         });
       }
     });

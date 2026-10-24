@@ -80,25 +80,25 @@ describe("requireApiKey middleware (#693)", () => {
 
       await requireApiKey()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({
-        error: "Forbidden",
-        message: "Invalid API key",
+        error: "Unauthorized",
+        message: "Invalid or expired API key",
       });
       expect(next).not.toHaveBeenCalled();
     });
 
-    it("treats a database error as an invalid key (fails closed with 403)", async () => {
+    it("treats a database error as an invalid key (fails closed with 401)", async () => {
       const { query, requireApiKey } = await getTestContext();
       query.mockRejectedValue(new Error("connection refused"));
       const { req, res, next } = makeReqRes("Bearer some-key");
 
       await requireApiKey()(req, res, next);
 
-      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({
-        error: "Forbidden",
-        message: "Invalid API key",
+        error: "Unauthorized",
+        message: "Invalid or expired API key",
       });
       expect(next).not.toHaveBeenCalled();
     });
@@ -175,6 +175,38 @@ describe("requireApiKey middleware (#693)", () => {
       expect(next).not.toHaveBeenCalled();
     });
 
+    it("logs READ_ONLY_KEY_DENIED with only the key prefix when a readonly key writes (#1248)", async () => {
+      const { query, requireApiKey } = await getTestContext();
+      query.mockResolvedValue([{ id: 1, role: "readonly", label: "dashboard" }]);
+      const plaintext = `a1b2c3d4${"e".repeat(56)}`;
+      const { req, res, next } = makeReqRes(`Bearer ${plaintext}`);
+      req.method = "POST";
+      req.path = "/api/v1/vaults/bulk/status";
+
+      await requireApiKey({ minRole: "readonly" })(req, res, next);
+
+      const insert = query.mock.calls.find(([sql]) => String(sql).includes("INSERT INTO security_events"));
+      expect(insert).toBeDefined();
+      const params = insert![1] as unknown[];
+      expect(params[0]).toBe("READ_ONLY_KEY_DENIED");
+      expect(params[2]).toBe("dashboard");
+      expect(params[3]).toBe("/api/v1/vaults/bulk/status");
+      expect(JSON.parse(params[4] as string)).toEqual({ keyPrefix: "a1b2c3d4", method: "POST" });
+      expect(JSON.stringify(query.mock.calls)).not.toContain(plaintext);
+    });
+
+    it("does not log READ_ONLY_KEY_DENIED for a readonly key on a GET route (#1248)", async () => {
+      const { query, requireApiKey } = await getTestContext();
+      query.mockResolvedValue([{ id: 1, role: "readonly", label: null }]);
+      const { req, res, next } = makeReqRes("Bearer readonly-key");
+      req.method = "GET";
+
+      await requireApiKey({ minRole: "readonly" })(req, res, next);
+
+      const denied = query.mock.calls.some(([sql]) => String(sql).includes("INSERT INTO security_events"));
+      expect(denied).toBe(false);
+    });
+
     it("allows an admin key to call a POST route under minRole: readonly", async () => {
       const { query, requireApiKey } = await getTestContext();
       query.mockResolvedValue([{ id: 1, role: "admin", label: null }]);
@@ -201,7 +233,7 @@ describe("requireApiKey middleware (#693)", () => {
       expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({
         error: "Unauthorized",
-        message: "API key has expired",
+        message: "Invalid or expired API key",
       });
       expect(next).not.toHaveBeenCalled();
     });
@@ -280,7 +312,7 @@ describe("requireApiKey middleware (#693)", () => {
       expect(res.status).toHaveBeenCalledWith(401);
       expect(res.json).toHaveBeenCalledWith({
         error: "Unauthorized",
-        message: "JWT expired",
+        message: "Invalid or expired API key",
       });
       expect(next).not.toHaveBeenCalled();
     });

@@ -10,6 +10,11 @@ import { jobQueue } from "./services/jobQueue.js";
 import { EventsPruner } from "./services/eventsPruner.js";
 import { JobQueueDepthPoller } from "./services/jobQueueDepthPoller.js";
 import { runDeploymentBenchmarksIfNeeded } from "./services/queryBenchmarks.js";
+import { registerProcessErrorHandlers } from "./services/processErrors.js";
+import { startRpcHealthProbes, stopRpcHealthProbes } from "./services/rpcHealth.js";
+
+// Registered before any startup work, so a rejection in warmUpPool or the listen callback is logged at fatal level (#1249).
+registerProcessErrorHandlers();
 
 const app = createApp();
 const pruner = new EventsPruner();
@@ -36,6 +41,7 @@ const server = app.listen(config.port, async () => {
   void indexer.start();
   pruner.start();
   jobQueueDepthPoller.start();
+  startRpcHealthProbes();
 });
 
 /**

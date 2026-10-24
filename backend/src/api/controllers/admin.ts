@@ -14,12 +14,15 @@ import { indexer } from "../../services/indexerSingleton.js";
 import { KNOWN_EVENT_TYPES } from "../../services/indexerEventTypes.js";
 import { EpochAnomalyService } from "../../services/epochAnomaly.js";
 import { jobQueue } from "../../services/jobQueue.js";
+import { findApiKeysExpiringWithin, type ApiKeyListRow } from "../../services/apiKeyExpiryReminder.js";
 import { sseManager } from "../../services/sseManager.js";
 import { logger } from "../../logger.js";
-import { createAdminSessionToken, refreshAdminSessionToken } from "../middleware/auth.js";
+import { createAdminSessionToken, INVALID_CREDENTIALS_RESPONSE, refreshAdminSessionToken } from "../middleware/auth.js";
 import { getApiKeyUsage } from "../../cache/redis.js";
 import { logAdminAudit } from "../../services/adminAuditLog.js";
+import { logSecurityEvent } from "../../services/securityLogger.js";
 import { generateWebhookSecret, secretRotationWindowHours } from "../../services/webhookSignature.js";
+import { setPaginationLinks } from "../middleware/paginationLinks.js";
 
 const OPENAPI_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "../../openapi");
 
@@ -150,26 +153,33 @@ export async function createAdminSession(req: Request, res: Response, next: Next
       return;
     }
 
+    // Unknown, deactivated and expired keys all get the same 401 body and each
+    // records a security event, so the response and its timing do not reveal
+    // which case applied (#1247). The lifecycle checks run before the role
+    // check, so the 403 below only ever answers a key that is live.
     const apiKey = await findApiKeyByValue(parsed.data.apiKey);
     if (!apiKey) {
-      res.status(401).json({ error: "Unauthorized", message: "Invalid API key" });
+      await logSecurityEvent("AUTH_FAILURE", { ipAddress: req.ip ?? null, path: req.path, details: { reason: "key_not_found" } });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
     // A session must never outlive the key it is minted from, so the same
     // lifecycle checks the auth middleware applies run here too (#934).
     if (!apiKey.active) {
-      res.status(403).json({ error: "Forbidden", message: "API key has been deactivated" });
+      await logSecurityEvent("AUTH_FAILURE", { ipAddress: req.ip ?? null, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "deactivated" } });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
+      return;
+    }
+
+    if (apiKey.expiresAt && apiKey.expiresAt.getTime() <= Date.now()) {
+      await logSecurityEvent("AUTH_FAILURE", { ipAddress: req.ip ?? null, apiKeyLabel: apiKey.label, path: req.path, details: { reason: "expired" } });
+      res.status(401).json(INVALID_CREDENTIALS_RESPONSE);
       return;
     }
 
     if (apiKey.role !== "admin") {
       res.status(403).json({ error: "Forbidden", message: "Admin API key required" });
-      return;
-    }
-
-    if (apiKey.expiresAt && apiKey.expiresAt.getTime() <= Date.now()) {
-      res.status(401).json({ error: "Unauthorized", message: "API key has expired" });
       return;
     }
 
@@ -283,7 +293,43 @@ export async function getAdminIndexer(_req: Request, res: Response, next: NextFu
     const lastTickAt = lastTickAtDate ? lastTickAtDate.toISOString() : null;
     const eventsIndexed = await indexer.getEventsIndexedCount();
 
-    res.json({ running, lastLedger, lastTickAt, eventsIndexed });
+    res.json({
+      running,
+      lastLedger,
+      lastTickAt,
+      eventsIndexed,
+      // #1213: current adaptive ledger batch size.
+      batchSize: indexer.getBatchSize(),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getIndexerDeadLetters(req: Request, res: Response, next: NextFunction) {
+  try {
+    const rawLimit = parseInt(String(req.query["limit"] ?? "50"), 10);
+    const limit = Math.max(1, Math.min(200, Number.isNaN(rawLimit) ? 50 : rawLimit));
+    const rawOffset = parseInt(String(req.query["offset"] ?? "0"), 10);
+    const offset = Math.max(0, Number.isNaN(rawOffset) ? 0 : rawOffset);
+
+    const [rows, countRows] = await Promise.all([
+      query(
+        `SELECT id, contract_id, ledger, raw_event, error_message, created_at
+         FROM indexer_dead_letters
+         ORDER BY created_at DESC, id DESC
+         LIMIT $1 OFFSET $2`,
+        [limit, offset],
+      ),
+      query<{ count: string }>("SELECT COUNT(*)::text AS count FROM indexer_dead_letters"),
+    ]);
+
+    res.json({
+      data: rows,
+      total: parseInt(countRows[0]?.count ?? "0", 10),
+      limit,
+      offset,
+    });
   } catch (err) {
     next(err);
   }
@@ -580,25 +626,32 @@ export async function deleteApiKey(req: Request, res: Response, next: NextFuncti
   }
 }
 
-export async function getApiKeys(_req: Request, res: Response, next: NextFunction) {
+// Optional window for the expiring-keys listing (#1245). Bounded so a caller
+// cannot ask for an unbounded scan; the daily reminder uses 7 days.
+const expiringWithinDaysSchema = z.coerce.number().int().min(1).max(365);
+
+export async function getApiKeys(req: Request, res: Response, next: NextFunction) {
   try {
-    const rows = await query<{
-      id: number;
-      label: string | null;
-      role: string;
-      created_at: Date;
-      expires_at: Date | null;
-      last_used_at: Date | null;
-      active: boolean;
-      deactivated_at: Date | null;
-      allowed_methods: string[] | null;
-      allowed_cidrs: string[] | null;
-            description: string | null;
-    }>(
-            `SELECT id, label, role, description, created_at, expires_at, last_used_at, active, deactivated_at,
-              allowed_methods, allowed_cidrs
-       FROM api_keys ORDER BY created_at DESC`,
-    );
+    const rawWindow = req.query?.["expiringWithinDays"];
+
+    let rows: ApiKeyListRow[];
+    if (rawWindow === undefined) {
+      rows = await query<ApiKeyListRow>(
+        `SELECT id, label, role, description, created_at, expires_at, last_used_at, active, deactivated_at,
+                allowed_methods, allowed_cidrs, allowed_contract_ids
+         FROM api_keys ORDER BY created_at DESC`,
+      );
+    } else {
+      const parsed = expiringWithinDaysSchema.safeParse(rawWindow);
+      if (!parsed.success) {
+        res.status(400).json({
+          error: "BadRequest",
+          message: "expiringWithinDays must be an integer between 1 and 365",
+        });
+        return;
+      }
+      rows = await findApiKeysExpiringWithin(parsed.data);
+    }
 
     res.json(
       rows.map((row) => ({
@@ -617,6 +670,8 @@ export async function getApiKeys(_req: Request, res: Response, next: NextFunctio
         ...(row.allowed_methods !== undefined ? { allowedMethods: row.allowed_methods ?? null } : {}),
         // null means the key may be used from any IP (#928)
         ...(row.allowed_cidrs !== undefined ? { allowedCidrs: row.allowed_cidrs ?? null } : {}),
+        // null means the key may access every vault (#1243)
+        ...(row.allowed_contract_ids !== undefined ? { allowedContractIds: row.allowed_contract_ids ?? null } : {}),
       })),
     );
   } catch (err) {
@@ -973,7 +1028,7 @@ export async function getAdminEvents(req: Request, res: Response, next: NextFunc
       `SELECT id, ledger, tx_hash, contract_id, event_type, payload, created_at
        FROM indexed_events
        ${whereClause}
-       ORDER BY created_at DESC
+       ORDER BY ledger DESC, tx_index DESC NULLS LAST, event_index DESC NULLS LAST, id DESC
        LIMIT 50`,
       params,
     );
@@ -1177,16 +1232,179 @@ export async function deleteUser(req: Request, res: Response, next: NextFunction
   }
 }
 
+interface AuditLogFilters {
+  action?: string;
+  actor?: string;
+  from?: string;
+  to?: string;
+}
+
+function buildAuditLogFilters(filters: AuditLogFilters, startIdx = 0): {
+  conditions: string[];
+  params: any[];
+  nextIdx: number;
+} {
+  const conditions: string[] = [];
+  const params: any[] = [];
+  let idx = startIdx;
+
+  if (filters.action && filters.action.trim() !== "") {
+    idx++;
+    conditions.push(`action = $${idx}`);
+    params.push(filters.action.trim());
+  }
+
+  if (filters.actor && filters.actor.trim() !== "") {
+    idx++;
+    conditions.push(`api_key_label = $${idx}`);
+    params.push(filters.actor.trim());
+  }
+
+  if (filters.from && filters.from.trim() !== "") {
+    idx++;
+    conditions.push(`created_at >= $${idx}::timestamptz`);
+    params.push(filters.from.trim());
+  }
+
+  if (filters.to && filters.to.trim() !== "") {
+    idx++;
+    conditions.push(`created_at <= $${idx}::timestamptz`);
+    params.push(filters.to.trim());
+  }
+
+  return { conditions, params, nextIdx: idx };
+}
+
+function decodeAuditCursor(cursorStr: string): { cursorId: number | null; cursorCreatedAt: Date | null } {
+  try {
+    const raw = Buffer.from(cursorStr, "base64url").toString("utf8");
+    const parsed = JSON.parse(raw);
+    const cursorId = typeof parsed.id === "number" ? parsed.id : null;
+    const cursorCreatedAt = parsed.created_at ? new Date(parsed.created_at) : null;
+    if (cursorId !== null) {
+      return { cursorId, cursorCreatedAt };
+    }
+  } catch {
+    // not base64url JSON
+  }
+  const idNum = parseInt(cursorStr, 10);
+  if (!isNaN(idNum)) {
+    return { cursorId: idNum, cursorCreatedAt: null };
+  }
+  return { cursorId: null, cursorCreatedAt: null };
+}
+
+function encodeAuditCursor(id: number, createdAt: Date): string {
+  return Buffer.from(
+    JSON.stringify({
+      id,
+      created_at: createdAt instanceof Date ? createdAt.toISOString() : new Date(createdAt).toISOString(),
+    }),
+  ).toString("base64url");
+}
+
 export async function getAdminAuditLog(req: Request, res: Response, next: NextFunction) {
   try {
+    const action = typeof req.query["action"] === "string" ? req.query["action"] : undefined;
+    const actor = typeof req.query["actor"] === "string" ? req.query["actor"] : undefined;
+    const from = typeof req.query["from"] === "string" ? req.query["from"] : undefined;
+    const to = typeof req.query["to"] === "string" ? req.query["to"] : undefined;
+    const cursorParam = typeof req.query["cursor"] === "string" && req.query["cursor"].trim() !== ""
+      ? req.query["cursor"].trim()
+      : undefined;
+
+    const rawLimit = parseInt(String(req.query["limit"] ?? req.query["pageSize"] ?? "20"), 10);
+    const limit = Math.max(1, Math.min(100, isNaN(rawLimit) ? 20 : rawLimit));
+
+    const { conditions, params, nextIdx } = buildAuditLogFilters({ action, actor, from, to });
+    let paramIdx = nextIdx;
+
+    const countWhere = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const countRows = await query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM admin_audit_log ${countWhere}`,
+      params,
+    );
+    const total = parseInt(countRows[0]?.count ?? "0", 10);
+
+    const queryConditions = [...conditions];
+    const queryParams = [...params];
+
+    if (cursorParam) {
+      const { cursorId, cursorCreatedAt } = decodeAuditCursor(cursorParam);
+      if (cursorCreatedAt !== null && cursorId !== null) {
+        paramIdx++;
+        queryConditions.push(`(created_at, id) < ($${paramIdx}::timestamptz, $${paramIdx + 1})`);
+        queryParams.push(cursorCreatedAt.toISOString(), cursorId);
+        paramIdx++;
+      } else if (cursorId !== null) {
+        paramIdx++;
+        queryConditions.push(`id < $${paramIdx}`);
+        queryParams.push(cursorId);
+      }
+
+      const whereClause = queryConditions.length > 0 ? `WHERE ${queryConditions.join(" AND ")}` : "";
+      paramIdx++;
+      queryParams.push(limit + 1);
+
+      const rows = await query<{
+        id: number;
+        api_key_label: string | null;
+        action: string;
+        target: string;
+        ip_address: string | null;
+        request_body_hash: string;
+        details: any;
+        created_at: Date;
+      }>(
+        `SELECT id, api_key_label, action, target, ip_address, request_body_hash, details, created_at
+         FROM admin_audit_log
+         ${whereClause}
+         ORDER BY created_at DESC, id DESC
+         LIMIT $${paramIdx}`,
+        queryParams,
+      );
+
+      let nextCursor: string | null = null;
+      if (rows.length > limit) {
+        rows.pop();
+        const lastRow = rows[rows.length - 1];
+        nextCursor = encodeAuditCursor(lastRow.id, lastRow.created_at);
+      }
+
+      if (nextCursor) {
+        res.set("X-Next-Cursor", nextCursor);
+      }
+      setPaginationLinks(res, req, { nextCursor });
+
+      res.json({
+        data: rows.map((row) => ({
+          id: row.id,
+          apiKeyLabel: row.api_key_label,
+          actor: row.api_key_label,
+          action: row.action,
+          target: row.target,
+          ipAddress: row.ip_address,
+          requestBodyHash: row.request_body_hash,
+          details: row.details ?? null,
+          createdAt: row.created_at,
+        })),
+        nextCursor,
+        total,
+        limit,
+        pageSize: limit,
+      });
+      return;
+    }
+
     const rawPage = parseInt(String(req.query["page"] ?? "1"), 10);
     const page = Math.max(1, isNaN(rawPage) ? 1 : rawPage);
-    const rawPageSize = parseInt(String(req.query["pageSize"] ?? "20"), 10);
-    const pageSize = Math.max(1, Math.min(100, isNaN(rawPageSize) ? 20 : rawPageSize));
-    const offset = (page - 1) * pageSize;
+    const offset = (page - 1) * limit;
 
-    const countRows = await query<{ count: string }>("SELECT COUNT(*)::text AS count FROM admin_audit_log");
-    const total = parseInt(countRows[0]?.count ?? "0", 10);
+    const whereClause = queryConditions.length > 0 ? `WHERE ${queryConditions.join(" AND ")}` : "";
+    queryParams.push(limit + 1);
+    const limitIdx = queryParams.length;
+    queryParams.push(offset);
+    const offsetIdx = queryParams.length;
 
     const rows = await query<{
       id: number;
@@ -1195,28 +1413,357 @@ export async function getAdminAuditLog(req: Request, res: Response, next: NextFu
       target: string;
       ip_address: string | null;
       request_body_hash: string;
+      details: any;
       created_at: Date;
     }>(
-      `SELECT id, api_key_label, action, target, ip_address, request_body_hash, created_at
+      `SELECT id, api_key_label, action, target, ip_address, request_body_hash, details, created_at
        FROM admin_audit_log
-       ORDER BY created_at DESC
-       LIMIT $1 OFFSET $2`,
-      [pageSize, offset],
+       ${whereClause}
+       ORDER BY created_at DESC, id DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+      queryParams,
     );
+
+    let nextCursor: string | null = null;
+    if (rows.length > limit) {
+      rows.pop();
+      const lastRow = rows[rows.length - 1];
+      nextCursor = encodeAuditCursor(lastRow.id, lastRow.created_at);
+    }
+
+    if (nextCursor) {
+      res.set("X-Next-Cursor", nextCursor);
+    }
+    setPaginationLinks(res, req, { nextCursor });
 
     res.json({
       data: rows.map((row) => ({
         id: row.id,
         apiKeyLabel: row.api_key_label,
+        actor: row.api_key_label,
         action: row.action,
         target: row.target,
         ipAddress: row.ip_address,
         requestBodyHash: row.request_body_hash,
+        details: row.details ?? null,
         createdAt: row.created_at,
       })),
+      nextCursor,
       total,
       page,
-      pageSize,
+      pageSize: limit,
+      limit,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+const AUDIT_LOG_EXPORT_COLUMNS = [
+  "timestamp",
+  "actor",
+  "action",
+  "target",
+  "details",
+] as const;
+
+export async function exportAdminAuditLogCsv(req: Request, res: Response, next: NextFunction) {
+  const action = typeof req.query["action"] === "string" ? req.query["action"] : undefined;
+  const actor = typeof req.query["actor"] === "string" ? req.query["actor"] : undefined;
+  const from = typeof req.query["from"] === "string" ? req.query["from"] : undefined;
+  const to = typeof req.query["to"] === "string" ? req.query["to"] : undefined;
+
+  const { conditions, params } = buildAuditLogFilters({ action, actor, from, to });
+  const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  let client: any;
+  try {
+    client = await pool.connect();
+  } catch (err) {
+    next(err);
+    return;
+  }
+
+  const cursor = client.query(
+    new Cursor(
+      `SELECT created_at,
+              api_key_label AS actor,
+              action,
+              target,
+              details
+         FROM admin_audit_log
+        ${whereClause}
+        ORDER BY created_at DESC, id DESC`,
+      params,
+    ),
+  );
+
+  let released = false;
+  const cleanup = async (): Promise<void> => {
+    if (released) return;
+    released = true;
+    try {
+      await cursor.close();
+    } catch {
+      /* connection may already be gone */
+    }
+    client.release();
+  };
+
+  const stringifier = stringify({ header: true, columns: [...AUDIT_LOG_EXPORT_COLUMNS] });
+
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", 'attachment; filename="audit-log.csv"');
+  res.setHeader("Transfer-Encoding", "chunked");
+
+  stringifier.on("error", (err) => {
+    void cleanup();
+    res.destroy(err);
+  });
+  res.on("close", () => {
+    void cleanup();
+  });
+  stringifier.pipe(res);
+
+  try {
+    for (;;) {
+      const rows = await cursor.read(500);
+      if (!rows || rows.length === 0) break;
+      for (const row of rows) {
+        const timestamp = row.created_at instanceof Date
+          ? row.created_at.toISOString()
+          : row.created_at ? new Date(row.created_at).toISOString() : "";
+        const formattedRow = {
+          timestamp,
+          actor: row.actor ?? "",
+          action: row.action ?? "",
+          target: row.target ?? "",
+          details: row.details != null
+            ? (typeof row.details === "object" ? JSON.stringify(row.details) : String(row.details))
+            : "",
+        };
+        if (!stringifier.write(formattedRow)) {
+          await once(stringifier, "drain");
+        }
+      }
+    }
+    stringifier.end();
+    await cleanup();
+  } catch (err) {
+    await cleanup();
+    if (!res.headersSent) {
+      next(err);
+      return;
+    }
+    res.destroy(err as Error);
+  }
+}
+
+export async function getVaultNotes(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    const rows = await query<{
+      id: number;
+      contract_id: string;
+      author: string;
+      note: string;
+      created_at: Date;
+    }>(
+      `SELECT id, contract_id, author, note, created_at
+         FROM vault_admin_notes
+        WHERE contract_id = $1
+        ORDER BY created_at DESC, id DESC`,
+      [contractId],
+    );
+
+    res.json(
+      rows.map((r) => ({
+        id: r.id,
+        contractId: r.contract_id,
+        author: r.author,
+        note: r.note,
+        createdAt: r.created_at,
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function createVaultNote(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    const { note, author } = (req.body ?? {}) as { note?: unknown; author?: unknown };
+    if (typeof note !== "string" || note.trim().length === 0) {
+      res.status(400).json({ error: "BadRequest", message: "Note is required and cannot be empty" });
+      return;
+    }
+
+    const noteAuthor =
+      typeof author === "string" && author.trim().length > 0
+        ? author.trim()
+        : req.apiKey?.label ?? "admin";
+
+    const rows = await query<{
+      id: number;
+      contract_id: string;
+      author: string;
+      note: string;
+      created_at: Date;
+    }>(
+      `INSERT INTO vault_admin_notes (contract_id, author, note, created_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING id, contract_id, author, note, created_at`,
+      [contractId, noteAuthor, note.trim()],
+    );
+
+    await logAdminAudit(req, "create_vault_note", `/api/v1/admin/vaults/${contractId}/notes`);
+
+    const created = rows[0];
+    res.status(201).json({
+      id: created.id,
+      contractId: created.contract_id,
+      author: created.author,
+      note: created.note,
+      createdAt: created.created_at,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function getVaultTags(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const rows = await query<{ tags: string[] | null }>(
+      "SELECT tags FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (rows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    res.json({
+      contractId,
+      tags: rows[0].tags ?? [],
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function updateVaultTags(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const vaultRows = await query<{ id: number }>(
+      "SELECT id FROM vaults WHERE contract_id = $1",
+      [contractId],
+    );
+    if (vaultRows.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    const rawTags = Array.isArray(req.body)
+      ? req.body
+      : req.body?.tags;
+
+    if (!Array.isArray(rawTags)) {
+      res.status(422).json({
+        error: "UnprocessableEntity",
+        message: "tags must be an array of strings",
+      });
+      return;
+    }
+
+    if (rawTags.length > 10) {
+      res.status(422).json({
+        error: "UnprocessableEntity",
+        message: "A vault may have at most 10 tags",
+      });
+      return;
+    }
+
+    const normalizedTags: string[] = [];
+    for (const tag of rawTags) {
+      if (typeof tag !== "string") {
+        res.status(422).json({
+          error: "UnprocessableEntity",
+          message: "Each tag must be a string",
+        });
+        return;
+      }
+      const trimmed = tag.trim();
+      if (trimmed.length === 0 || trimmed.length > 32) {
+        res.status(422).json({
+          error: "UnprocessableEntity",
+          message: "Tag length must be between 1 and 32 characters",
+        });
+        return;
+      }
+      if (!/^[a-z0-9_-]+$/i.test(trimmed)) {
+        res.status(422).json({
+          error: "UnprocessableEntity",
+          message: `Invalid tag characters in "${trimmed}". Tags may only contain alphanumeric characters, hyphens, and underscores.`,
+        });
+        return;
+      }
+      normalizedTags.push(trimmed.toLowerCase());
+    }
+
+    const updateRows = await query<{ tags: string[] }>(
+      "UPDATE vaults SET tags = $1 WHERE contract_id = $2 RETURNING tags",
+      [normalizedTags, contractId],
+    );
+
+    await logAdminAudit(req, "update_vault_tags", `/api/v1/admin/vaults/${contractId}/tags`);
+
+    res.json({
+      contractId,
+      tags: updateRows[0]?.tags ?? normalizedTags,
     });
   } catch (err) {
     next(err);
@@ -2509,6 +3056,174 @@ export async function exportVaultsCsv(_req: Request, res: Response, next: NextFu
     }
 
     csvStream.end();
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── Admin Watchlist (#1284) ──────────────────────────────────────────────
+export async function getAdminWatchlist(req: Request, res: Response, next: NextFunction) {
+  try {
+    const adminKeyId = req.apiKey?.id;
+    if (!adminKeyId) {
+      res.status(401).json({ error: "Unauthorized", message: "Admin key required" });
+      return;
+    }
+    const rows = await query<{
+      contract_id: string;
+      added_at: Date;
+      name: string | null;
+      symbol: string | null;
+      status: string | null;
+      tvl: string | null;
+    }>(
+      `SELECT w.contract_id, w.added_at, v.name, v.symbol, v.state AS status, v.total_assets AS tvl
+       FROM admin_watchlist w
+       LEFT JOIN vaults v ON w.contract_id = v.contract_id
+       WHERE w.admin_key_id = $1
+       ORDER BY w.added_at DESC`,
+      [adminKeyId],
+    );
+    res.json({
+      watchlist: rows.map((r) => ({
+        contractId: r.contract_id,
+        addedAt: r.added_at,
+        name: r.name,
+        symbol: r.symbol,
+        status: r.status,
+        tvl: r.tvl ?? "0",
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function addToAdminWatchlist(req: Request, res: Response, next: NextFunction) {
+  try {
+    const adminKeyId = req.apiKey?.id;
+    if (!adminKeyId) {
+      res.status(401).json({ error: "Unauthorized", message: "Admin key required" });
+      return;
+    }
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    await query(
+      `INSERT INTO admin_watchlist (admin_key_id, contract_id, added_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (admin_key_id, contract_id) DO NOTHING`,
+      [adminKeyId, contractId],
+    );
+
+    await logAdminAudit(req, "add_watchlist", `/api/v1/admin/watchlist/${contractId}`);
+
+    res.json({ success: true, contractId });
+  } catch (err) {
+    next(err);
+  }
+}
+
+export async function removeFromAdminWatchlist(req: Request, res: Response, next: NextFunction) {
+  try {
+    const adminKeyId = req.apiKey?.id;
+    if (!adminKeyId) {
+      res.status(401).json({ error: "Unauthorized", message: "Admin key required" });
+      return;
+    }
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    await query(
+      "DELETE FROM admin_watchlist WHERE admin_key_id = $1 AND contract_id = $2",
+      [adminKeyId, contractId],
+    );
+
+    await logAdminAudit(req, "remove_watchlist", `/api/v1/admin/watchlist/${contractId}`);
+
+    res.json({ success: true, contractId });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── Admin Vault Unlisted Flag (#1285) ────────────────────────────────────────
+export async function toggleVaultUnlisted(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    const unlisted = typeof req.body?.unlisted === "boolean" ? req.body.unlisted : true;
+
+    const result = await query<{ contract_id: string; unlisted: boolean }>(
+      "UPDATE vaults SET unlisted = $1, updated_at = NOW() WHERE contract_id = $2 RETURNING contract_id, unlisted",
+      [unlisted, contractId],
+    );
+
+    if (result.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    await cacheDel(`vault:${contractId}*`);
+    await cacheDel("vaults:list:*");
+
+    await logAdminAudit(req, "toggle_vault_unlisted", `/api/v1/admin/vaults/${contractId}/unlisted`);
+
+    res.json({ success: true, contractId, unlisted: result[0].unlisted });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── Admin Featured Vault Ordering (#1286) ──────────────────────────────────
+export async function setVaultFeaturedRank(req: Request, res: Response, next: NextFunction) {
+  try {
+    const parsed = contractAddressSchema.safeParse(req.params["contractId"]);
+    if (!parsed.success) {
+      res.status(400).json({ error: "BadRequest", message: "Invalid contractId format" });
+      return;
+    }
+    const contractId = parsed.data;
+
+    let featuredRank: number | null = null;
+    if (req.body?.featuredRank !== null && req.body?.featuredRank !== undefined) {
+      const parsedRank = Number(req.body.featuredRank);
+      if (!Number.isInteger(parsedRank) || parsedRank < 0) {
+        res.status(400).json({ error: "BadRequest", message: "featuredRank must be a non-negative integer or null" });
+        return;
+      }
+      featuredRank = parsedRank;
+    }
+
+    const result = await query<{ contract_id: string; featured_rank: number | null }>(
+      "UPDATE vaults SET featured_rank = $1, updated_at = NOW() WHERE contract_id = $2 RETURNING contract_id, featured_rank",
+      [featuredRank, contractId],
+    );
+
+    if (result.length === 0) {
+      res.status(404).json({ error: "NotFound", message: `Vault ${contractId} not found` });
+      return;
+    }
+
+    await cacheDel(`vault:${contractId}*`);
+    await cacheDel("vaults:list:*");
+
+    await logAdminAudit(req, "set_vault_featured_rank", `/api/v1/admin/vaults/${contractId}/featured-rank`);
+
+    res.json({ success: true, contractId, featuredRank: result[0].featured_rank });
   } catch (err) {
     next(err);
   }

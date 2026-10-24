@@ -32,6 +32,20 @@ export interface Vault {
   logoUri: string | null;
   createdAt: Date;
   updatedAt: Date;
+  /** #1274 – post-maturity settlement status. null until vault reaches Matured state. */
+  settlementStatus: "not_started" | "in_progress" | "complete" | null;
+  /**
+   * #1275 – fraction of the supply redeemed since maturity: 1 - totalSupply /
+   * supplyAtMaturity. Omitted (undefined) for non-matured vaults, or for a
+   * matured vault with no recorded supplyAtMaturity baseline.
+   */
+  redeemedPct?: number;
+  /** #1285 – flag to hide vault from public listings */
+  unlisted?: boolean;
+  /** #1286 – priority ordering rank for default listings */
+  featuredRank?: number | null;
+  /** #1283 – admin tags on the vault */
+  tags?: string[];
 }
 
 export interface VaultOperator {

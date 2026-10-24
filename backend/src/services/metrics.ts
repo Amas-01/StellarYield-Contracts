@@ -92,6 +92,13 @@ export const indexerEventsProcessedTotal = new client.Counter({
   registers: [register],
 });
 
+export const indexerUnknownEventsTotal = new client.Counter({
+  name: "indexer_unknown_events_total",
+  help: "Total number of on-chain events with an unrecognized topic",
+  labelNames: ["contract_id", "topic"] as const,
+  registers: [register],
+});
+
 // Per-batch processing time (#1109): one observation per polling tick or
 // backfill batch, covering the event fetch and processing of every event in it.
 export const indexerProcessingDurationSeconds = new client.Histogram({
@@ -104,6 +111,35 @@ export const indexerProcessingDurationSeconds = new client.Histogram({
 export const indexerLastLedger = new client.Gauge({
   name: "indexer_last_ledger",
   help: "Last indexed ledger sequence number",
+  registers: [register],
+});
+
+// #1217 — how far the indexer lags behind the chain tip, in seconds.
+// Stellar ledgers close roughly every 5 s, so lag_ledgers * 5 ≈ lag_seconds,
+// but using real close times would require an extra RPC call. The gauge is
+// reset to 0 when there is no lag (lastLedger == latestLedger) so alerts
+// can fire on any non-zero value.
+export const indexerLagSeconds = new client.Gauge({
+  name: "indexer_lag_seconds",
+  help: "Estimated indexer lag behind chain tip in seconds (ledger_lag * 5 s/ledger)",
+  registers: [register],
+});
+
+// #1203 — per-method Soroban RPC telemetry. `method` is the RPC method name
+// (getEvents, simulateTransaction, ...), so a failing or slow method can be
+// told apart from the overall error rate that #345 alerts on.
+export const rpcCallsTotal = new client.Counter({
+  name: "rpc_calls_total",
+  help: "Total number of Soroban RPC calls by method and outcome",
+  labelNames: ["method", "outcome"] as const,
+  registers: [register],
+});
+
+export const rpcCallDurationSeconds = new client.Histogram({
+  name: "rpc_call_duration_seconds",
+  help: "Soroban RPC call duration in seconds by method",
+  labelNames: ["method"] as const,
+  buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
   registers: [register],
 });
 
@@ -154,6 +190,17 @@ export async function updateJobQueuePendingMetrics(): Promise<void> {
     // Ignore errors when database is unavailable in test environments
   }
 }
+
+// Event loop lag (#1252): p50 and p99 over a sliding 60 s window. Observations
+// are fed by the sampler in services/eventLoopLag.ts.
+export const eventLoopLagSeconds = new client.Summary({
+  name: "nodejs_event_loop_lag_seconds",
+  help: "Event loop lag in seconds (p50 and p99 over a sliding window)",
+  percentiles: [0.5, 0.99],
+  maxAgeSeconds: 60,
+  ageBuckets: 6,
+  registers: [register],
+});
 
 export const nodejsHeapUsedBytes = new client.Gauge({
   name: "nodejs_heap_used_bytes",
@@ -234,6 +281,76 @@ export function updatePgPoolMetrics(
     // Ignore error
   }
 }
+
+// Missing metric declarations that are referenced in functions below
+let sseConnections = 0;
+
+export const http5xxTotal = new client.Counter({
+  name: "http_5xx_total",
+  help: "Total number of 5xx HTTP responses",
+  labelNames: ["method", "route"] as const,
+  registers: [register],
+});
+
+export const sseActiveConnections = new client.Gauge({
+  name: "sse_active_connections",
+  help: "Number of active SSE connections",
+  registers: [register],
+});
+
+export const pgbossJobsCreated = new client.Gauge({
+  name: "pgboss_jobs_created",
+  help: "Number of pg-boss jobs in created state",
+  registers: [register],
+});
+
+export const pgbossJobsActive = new client.Gauge({
+  name: "pgboss_jobs_active",
+  help: "Number of pg-boss jobs in active state",
+  registers: [register],
+});
+
+export const pgbossJobsFailed = new client.Gauge({
+  name: "pgboss_jobs_failed",
+  help: "Number of pg-boss jobs in failed state",
+  registers: [register],
+});
+
+export const httpErrorsTotal = new client.Counter({
+  name: "http_errors_total",
+  help: "Total number of HTTP error responses",
+  labelNames: ["statusClass", "route"] as const,
+  registers: [register],
+});
+
+// ── RPC metrics (#new) ────────────────────────────────────────────────────────
+
+export const rpcMonitorCallsTotal = new client.Counter({
+  name: "rpc_monitor_calls_total",
+  help: "Total number of RPC calls made",
+  labelNames: ["method", "status"] as const,
+  registers: [register],
+});
+
+export const rpcMonitorCallDurationSeconds = new client.Histogram({
+  name: "rpc_monitor_call_duration_seconds",
+  help: "RPC call duration in seconds by method",
+  labelNames: ["method"] as const,
+  buckets: [0.1, 0.25, 0.5, 1, 2, 5, 10, 30],
+  registers: [register],
+});
+
+export const rpcActiveRequests = new client.Gauge({
+  name: "rpc_active_requests",
+  help: "Number of active RPC requests",
+  registers: [register],
+});
+
+export const rpcConcurrentRequestsLimited = new client.Counter({
+  name: "rpc_concurrent_requests_limited",
+  help: "Number of times RPC requests were throttled due to concurrent limit",
+  registers: [register],
+});
 
 export async function getMetrics(): Promise<string> {
   updateProcessMemoryMetrics();
@@ -346,7 +463,10 @@ export function httpStatusClass(statusCode: number): "4xx" | "5xx" | null {
  * the request path. Never throws: metrics must not be able to turn a handled
  * error into a failed response.
  */
-export function recordHttpError(route: string | undefined, statusCode: number): void {
+export function recordHttpError(
+  route: string | undefined,
+  statusCode: number,
+): void {
   const statusClass = httpStatusClass(statusCode);
   if (statusClass === null) return;
 
@@ -356,5 +476,3 @@ export function recordHttpError(route: string | undefined, statusCode: number): 
     // Ignore: never let a metrics failure affect the response
   }
 }
-
-

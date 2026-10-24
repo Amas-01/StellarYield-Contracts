@@ -624,11 +624,13 @@ API keys for programmatic access.
 | `active` | `BOOLEAN` | NOT NULL | `TRUE` | `FALSE` once the inactivity sweep retires the key; inactive keys are rejected with 403 (#934) |
 | `expires_at` | `TIMESTAMPTZ` | YES | — | Key expiration timestamp |
 | `last_used_at` | `TIMESTAMPTZ` | YES | — | Last successful authentication with this key; `NULL` if never used (#933) |
+| `allowed_contract_ids` | `TEXT[]` | YES | — | Vault contract IDs the key may access; `NULL` means every vault, an empty array means none (#1243) |
 | `created_at` | `TIMESTAMPTZ` | YES | `NOW()` | Row creation timestamp |
 
 **Primary key:** `id`  
 **Unique constraints:** `key_hash`  
-**Check constraints:** `role IN ('admin', 'readonly')`
+**Check constraints:** `role IN ('admin', 'readonly')`  
+**Note:** `label` is not unique. A label may hold up to two active keys during a rotation grace period (#1246).
 
 ---
 

@@ -2,6 +2,7 @@ import { Router } from "express";
 import {
   getAdminStats,
   getAdminIndexer,
+  getIndexerDeadLetters,
   getIndexerEventCounts,
   getQuarterlyYieldReport,
   getTransferAlerts,
@@ -57,13 +58,25 @@ import {
   getApiDiff,
   getApiKeyUsageStats,
   exportVaultsCsv,
+  exportAdminAuditLogCsv,
+  getVaultNotes,
+  createVaultNote,
+  getVaultTags,
+  updateVaultTags,
+  getAdminWatchlist,
+  addToAdminWatchlist,
+  removeFromAdminWatchlist,
+  toggleVaultUnlisted,
+  setVaultFeaturedRank,
 } from "../controllers/admin.js";
 import { getRequestArchive } from "../controllers/debugArchive.js";
+import { createAnnouncement, deleteAnnouncement } from "../controllers/announcements.js";
 import { postArchiveRestore, getArchiveStatusHandler } from "../controllers/archiveAdmin.js";
 import { getHolderConcentrationReport } from "../controllers/regulatoryReports.js";
 import { requireApiKey } from "../middleware/auth.js";
 import { adminFeesRouter } from "./fees.js";
 import { ipAllowlist } from "../middleware/ipAllowlist.js";
+import { idempotency } from "../middleware/idempotency.js";
 import { config } from "../../config.js";
 import { jobQueue } from "../../services/jobQueue.js";
 
@@ -73,10 +86,13 @@ adminRouter.post("/session", createAdminSession);
 adminRouter.post("/session/refresh", refreshAdminSession);
 adminRouter.use(ipAllowlist());
 adminRouter.use(requireApiKey({ minRole: "readonly" }));
+// Replays stored responses for retried POSTs carrying an Idempotency-Key (#1186).
+adminRouter.use(idempotency());
 
 adminRouter.get("/stats", getAdminStats);
 adminRouter.get("/reports/vaults.csv", exportVaultsCsv);
 adminRouter.get("/indexer", getAdminIndexer);
+adminRouter.get("/indexer/dead-letters", getIndexerDeadLetters);
 // Issue #1108: event counts per contract
 adminRouter.get("/indexer/event-counts", getIndexerEventCounts);
 adminRouter.get("/indexer/stream", streamIndexerProgress);
@@ -104,6 +120,12 @@ adminRouter.get("/vaults/:contractId/audit", getVaultAudit);
 // Epoch yield outliers detected by the daily scan (#1073). Read-only, so the
 // router-wide readonly requirement is enough.
 adminRouter.get("/vaults/:contractId/epoch-anomalies", getEpochAnomalies);
+// Internal admin notes (#1281)
+adminRouter.get("/vaults/:contractId/notes", getVaultNotes);
+adminRouter.post("/vaults/:contractId/notes", requireApiKey({ role: "admin" }), createVaultNote);
+// Internal admin tags (#1282)
+adminRouter.get("/vaults/:contractId/tags", getVaultTags);
+adminRouter.put("/vaults/:contractId/tags", requireApiKey({ role: "admin" }), updateVaultTags);
 adminRouter.get("/vaults/archived", getArchivedVaults);
 adminRouter.patch("/vaults/:contractId/archive-exclusion", requireApiKey({ role: "admin" }), toggleVaultArchiveExclusion);
 adminRouter.get("/archive/verify", verifyArchiveConsistency);
@@ -128,6 +150,7 @@ adminRouter.get("/db/slow-queries", getSlowQueries);
 adminRouter.get("/fees", getAdminFees);
 adminRouter.get("/fees/dashboard", requireApiKey({ role: "admin" }), getAdminFeesDashboard);
 adminRouter.delete("/users/:address", requireApiKey({ role: "admin" }), deleteUser);
+adminRouter.get("/audit-log/export.csv", requireApiKey({ role: "admin" }), exportAdminAuditLogCsv);
 adminRouter.get("/audit-log", requireApiKey({ role: "admin" }), getAdminAuditLog);
 
 adminRouter.post("/users/:address/aml-flag", flagUserAml);
@@ -178,5 +201,20 @@ adminRouter.use("/vaults", adminFeesRouter);
 // Issues #1077, #1078: Transfer alerts
 adminRouter.get("/transfer-alerts", getTransferAlerts);
 adminRouter.patch("/transfer-alerts/:id/acknowledge", acknowledgeTransferAlert);
+
+// Issue #1287: operator announcements (publish / remove)
+adminRouter.post("/announcements", requireApiKey({ role: "admin" }), createAnnouncement);
+adminRouter.delete("/announcements/:id", requireApiKey({ role: "admin" }), deleteAnnouncement);
+
+// Issue #1284: Admin watchlist
+adminRouter.get("/watchlist", getAdminWatchlist);
+adminRouter.post("/watchlist/:contractId", addToAdminWatchlist);
+adminRouter.delete("/watchlist/:contractId", removeFromAdminWatchlist);
+
+// Issue #1285: Vault unlisted flag toggle
+adminRouter.patch("/vaults/:contractId/unlisted", requireApiKey({ role: "admin" }), toggleVaultUnlisted);
+
+// Issue #1286: Featured vault ordering
+adminRouter.patch("/vaults/:contractId/featured-rank", requireApiKey({ role: "admin" }), setVaultFeaturedRank);
 
 

@@ -4,11 +4,15 @@ import { query } from "../db/index.js";
 
 const HTTP_METHODS = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
 
+// Same shape the vault routes accept for :contractId (#1243).
+const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
+
 function parseArgs(argv: string[]) {
   let role = "admin";
   let expiresInDays: number | null = null;
   let allowedMethods: string[] | null = null;
   let allowedCidrs: string[] | null = null;
+  let allowedContractIds: string[] | null = null;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -54,24 +58,52 @@ function parseArgs(argv: string[]) {
       if (allowedCidrs.length === 0) {
         throw new Error("--allowed-cidrs requires at least one CIDR range");
       }
+    } else if (arg === "--allowed-contract-ids") {
+      // Comma-separated vault contract IDs the key may access; omit to allow all (#1243).
+      const value = argv[++i];
+      if (!value) {
+        throw new Error("--allowed-contract-ids requires a comma-separated list of contract IDs");
+      }
+      allowedContractIds = value
+        .split(",")
+        .map((contractId) => contractId.trim())
+        .filter(Boolean);
+      const invalid = allowedContractIds.filter((contractId) => !CONTRACT_ID_PATTERN.test(contractId));
+      if (invalid.length > 0) {
+        throw new Error(`Invalid --allowed-contract-ids value(s): ${invalid.join(", ")}`);
+      }
+      if (allowedContractIds.length === 0) {
+        throw new Error("--allowed-contract-ids requires at least one contract ID");
+      }
     }
   }
 
-  return { role, expiresInDays, allowedMethods, allowedCidrs };
+  return { role, expiresInDays, allowedMethods, allowedCidrs, allowedContractIds };
 }
 
-const { role, expiresInDays, allowedMethods, allowedCidrs } = parseArgs(process.argv.slice(2));
+const { role, expiresInDays, allowedMethods, allowedCidrs, allowedContractIds } = parseArgs(process.argv.slice(2));
 
-const plaintext = randomBytes(32).toString("hex");
-const keyHash = createHash("sha256").update(plaintext).digest("hex");
+// Prefix makes keys instantly recognisable in logs and leak-detection scanners.
+const KEY_PREFIX = "sky_";
+const rawToken = randomBytes(32).toString("hex");
+const plaintext = `${KEY_PREFIX}${rawToken}`;
+
+// Per-key random salt: HMAC-SHA-256(key=salt, data=plaintext) so two keys with
+// the same underlying token produce different stored hashes (#1239).
+const salt = randomBytes(16).toString("hex");
+const keyHash = createHash("sha256")
+  .update(salt)
+  .update(plaintext)
+  .digest("hex");
+
 const expiresAt = expiresInDays !== null
   ? new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000)
   : null;
 
 await query(
-  `INSERT INTO api_keys (key_hash, role, label, expires_at, allowed_methods, allowed_cidrs)
-   VALUES ($1, $2, $3, $4, $5, $6)`,
-  [keyHash, role, `generated-${Date.now()}`, expiresAt, allowedMethods, allowedCidrs],
+  `INSERT INTO api_keys (key_hash, key_salt, role, label, expires_at, allowed_methods, allowed_cidrs, allowed_contract_ids)
+   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+  [keyHash, salt, role, `generated-${Date.now()}`, expiresAt, allowedMethods, allowedCidrs, allowedContractIds],
 );
 
 console.log(plaintext);

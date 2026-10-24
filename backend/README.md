@@ -74,8 +74,43 @@ npm run dev
 - `npm run lint` - lint files under `src/`.
 - `npm test` - run the Vitest suite.
 - `npm run db:migrate` - apply `src/db/schema.sql` to PostgreSQL.
+- `npm run db:migrate:down` - drop every table/view/type the migrations created (revert script).
+- `npm run db:seed` - insert sample vault and user rows (idempotent; safe to run twice).
 - `npm run indexer` - run the event indexer.
 - `npm run operator-expiry-task` - run operator expiry background task.
+- `npm run mock-rpc` - run the mock Soroban RPC server (see below).
+
+## Mock Soroban RPC Server
+
+Instead of pointing the API and indexer at testnet (slow and rate-limited), you
+can run a local mock that answers the RPC methods they actually call:
+`getHealth`, `getLatestLedger`, `getEvents`, and `simulateTransaction`.
+
+```sh
+npm run mock-rpc
+```
+
+The server listens on `http://localhost:8001` (override with `MOCK_RPC_PORT`)
+and answers JSON-RPC with data loaded from `dev/fixtures/*.json`
+(`getHealth.json`, `getLatestLedger.json`, `getEvents.json`,
+`simulateTransaction.json`). Edit those files to change the mock's chain tip,
+event stream, or contract read results. `getEvents` fixture events are written
+with plain native values (strings/numbers/arrays); the mock encodes them into
+base64 XDR `ScVal`s so the Stellar SDK decodes them exactly like real chain
+data. Methods outside the supported list get a standard JSON-RPC
+`"Method not found"` error (`-32601`).
+
+Then run the API or indexer against the mock:
+
+```sh
+STELLAR_RPC_URL=http://localhost:8001 npm run dev
+STELLAR_RPC_URL=http://localhost:8001 npm run indexer
+```
+
+With the fixture events targeting the vault contract configured in
+`VAULT_FACTORY_CONTRACT_ID` (and `DATABASE_URL` migrated), the indexer will
+process the fixture `deposit`/`withdraw`/`yield_dis`/`st_chg` events on every
+poll cycle — no network access needed.
 
 ## Environment Variables
 
@@ -93,7 +128,9 @@ npm run dev
 | `INDEXER_POLL_INTERVAL_MS` | No | `5000` | Indexer polling interval. |
 | `WEBHOOK_SECRET` | No | empty | Optional webhook signing secret. |
 | `ADMIN_API_KEY` | No | empty | Admin API authentication key. |
-| `KEY_INACTIVITY_DAYS` | No | unset (never) | Days an API key may go unused before the daily sweep deactivates it. Never-used keys are measured from `created_at`. Deactivated keys are rejected with 403. |
+| `KEY_INACTIVITY_DAYS` | No | unset (never) | Days an API key may go unused before the daily sweep deactivates it. Never-used keys are measured from `created_at`. Deactivated keys are rejected with 401, the same response as an unknown or expired key. |
+| `REQUEST_TIMEOUT_MS` | No | `30000` | Longest a request may run before it gets a 503 with `Retry-After: 5`. SSE streams are exempt. |
+| `LOAD_SHED_LAG_MS` | No | `250` | Event loop p99 lag, in ms, above which non-essential requests get a 503 with `Retry-After: 5`. `/health`, `/metrics` and `/api/v1/admin` are never shed. |
 | `DEBUG_ARCHIVE_ROUTES` | No | empty | Comma-separated route patterns to archive, such as `/api/v1/admin/*`. Archived requests are retained FIFO up to 1000 rows. |
 
 Docker Compose reads `.env.example` and overrides `DATABASE_URL` so the backend

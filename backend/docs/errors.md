@@ -45,6 +45,18 @@ Generic not found error for resources.
 ### INTERNAL_SERVER_ERROR (500)
 An unexpected server error occurred.
 
+### SERVICE_UNAVAILABLE (503)
+The database could not be reached. Responses carry `Retry-After` (seconds) and
+clients should back off for that long before retrying. Public vault list and
+detail reads may instead return the last successful copy, with
+`X-Cache: STALE` and `Warning: 110`, for up to `STALE_TTL_SECONDS` (default 600).
+
+### Rate-limit and retry headers
+
+Every 429 carries `Retry-After`: for a window limit it counts down to the window
+reset, and for an IP lockout it is the lockout period. A 503 always carries
+`Retry-After` (30 seconds by default).
+
 ## Usage in Client Code
 
 ```typescript

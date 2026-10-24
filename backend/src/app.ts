@@ -1,4 +1,5 @@
 import { serverTiming } from "./api/middleware/serverTiming.js";
+import { optionalApiKey } from "./api/middleware/auth.js";
 import compression from "compression";
 import cors from "cors";
 import express, { type Express } from "express";
@@ -32,6 +33,8 @@ import { requestId } from "./api/middleware/requestId.js";
 import { requestContext } from "./api/middleware/requestContext.js";
 import { responseSizeLimit } from "./api/middleware/responseSizeLimit.js";
 import { cacheControl } from "./api/middleware/cacheControl.js";
+import { requestTimeout } from "./api/middleware/requestTimeout.js";
+import { loadShedder } from "./api/middleware/loadShed.js";
 import { internalAuth } from "./api/middleware/internalAuth.js";
 import { internalRouter } from "./api/routes/internal.js";
 import { publicLimiter, authLimiter } from "./api/middleware/rateLimit.js";
@@ -39,6 +42,13 @@ import { cacheResponse } from "./api/middleware/responseCache.js";
 import { responseSla } from "./api/middleware/routeSla.js";
 import { requestArchive } from "./api/middleware/requestArchive.js";
 import { changelogRouter } from "./api/routes/changelog.js";
+import { announcementsRouter } from "./api/routes/announcements.js";
+import { jsonNestingDepthLimit } from "./api/middleware/jsonNestingDepthLimit.js";
+import { queryArraySizeLimit } from "./api/middleware/queryArraySizeLimit.js";
+import { webhookHttpsEnforcement } from "./api/middleware/webhookHttpsEnforcement.js";
+import { enforceJsonContentType } from "./api/middleware/enforceJsonContentType.js";
+import { serializeAmounts } from "./utils/serializeAmounts.js";
+import { normalizeTrailingSlash } from "./api/middleware/trailingSlash.js";
 
 // Cache static responses at startup
 function initStaticCache(): void {
@@ -86,6 +96,11 @@ export function createApp(): Express {
   );
 
   app.use(express.json({ limit: config.requestBodyLimit }));
+  app.set("json replacer", serializeAmounts);
+  app.use(enforceJsonContentType());
+  app.use(jsonNestingDepthLimit());
+  app.use(queryArraySizeLimit());
+  app.use(normalizeTrailingSlash());
 
   const origins = config.allowedOrigins;
   if (origins.length > 0) {
@@ -93,6 +108,8 @@ export function createApp(): Express {
     app.use(cors({
       origin,
       maxAge: config.cors.maxAge,
+      // Lets browser clients read the key-expiry warning header (#1244).
+      exposedHeaders: ["X-API-Key-Expires-In"],
     }));
   }
 
@@ -135,16 +152,25 @@ export function createApp(): Express {
   });
 
 
+  // Overload protection (#1251) and the per-request timeout (#1250). Both sit
+  // after the metrics hook above, so their 503s still reach http_requests_total.
+  app.use(loadShedder());
+  app.use(requestTimeout());
+
   app.use("/health", publicLimiter, healthRouter);
   // Versioned alias for SDK clients and integration tests (#874).
   app.use("/api/v1/health", publicLimiter, healthRouter);
   app.use("/api/changelog", publicLimiter, changelogRouter);
+  // Public active-announcements feed (#1288).
+  app.use("/api/v1/announcements", publicLimiter, announcementsRouter);
   app.use("/api/status", publicLimiter, statusRouter);
   // Fee endpoints (#1099, #1101, #1102, #1103). Their paths all have a second
   // segment, so they are mounted first and never shadow a /:contractId route.
   app.use("/api/v1/platform", publicLimiter, platformFeesRouter);
-  app.use("/api/v1/vaults", publicLimiter, vaultFeesRouter);
-  app.use("/api/v1/vaults", publicLimiter, vaultsRouter);
+  // Vault routes stay public; a Bearer key, when presented, scopes what it can
+  // read (#1243). See optionalApiKey.
+  app.use("/api/v1/vaults", publicLimiter, optionalApiKey(), vaultFeesRouter);
+  app.use("/api/v1/vaults", publicLimiter, optionalApiKey(), vaultsRouter);
   app.use("/api/v2/vaults", publicLimiter, vaultsV2Router);
   app.use("/api/v1/users", publicLimiter, usersRouter);
   app.use("/api/v1/yields", publicLimiter, yieldsRouter);
@@ -162,7 +188,7 @@ export function createApp(): Express {
   // avoid the admin auth middleware consuming /api/v1/admin/feature-flags (#916)
   app.use("/api/v1/admin/feature-flags", authLimiter, featureFlagsRouter);
   app.use("/api/v1/admin", authLimiter, adminRouter);
-  app.use("/api/v1/webhooks", authLimiter, webhooksRouter);
+  app.use("/api/v1/webhooks", authLimiter, webhookHttpsEnforcement(), webhooksRouter);
   // Request body dry run — validation only, never a side effect (#941)
   app.use("/api/v1/validate", publicLimiter, validateRouter);
   // Display-formatting utilities (#1132)

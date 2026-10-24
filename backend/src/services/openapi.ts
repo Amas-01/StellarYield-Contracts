@@ -32,6 +32,8 @@ const vaultSchema = z.object({
   logoUri: z.string().nullable().optional().openapi({ example: "https://example.com/logo.png" }),
   createdAt: z.string().openapi({ example: "2026-01-15T00:00:00.000Z" }),
   updatedAt: z.string().openapi({ example: "2026-09-20T00:00:00.000Z" }),
+  // #1275 – 1 - totalSupply / supplyAtMaturity. Present only for Matured vaults.
+  redeemedPct: z.number().optional().openapi({ example: 0.35 }),
 });
 
 const paginatedVaultsSchema = z.object({
@@ -359,8 +361,7 @@ function registerPaths(): void {
     parameters: [{ name: "contractId", in: "path", required: true, schema: { type: "string" } }],
     responses: {
       200: { description: "CSV attachment with active holders", content: { "text/csv": { schema: z.string() } } },
-      401: { description: "Missing API key", content: { "application/json": { schema: errorResponseSchema } } },
-      403: { description: "Invalid API key", content: { "application/json": { schema: errorResponseSchema } } },
+      401: { description: "Missing, invalid or expired API key", content: { "application/json": { schema: errorResponseSchema } } },
       404: { description: "Vault not found", content: { "application/json": { schema: errorResponseSchema } } },
     },
   });
@@ -702,6 +703,7 @@ function registerPaths(): void {
         description: "Epochs in ascending epoch order",
         headers: {
           "X-Next-Cursor": { description: "Cursor for the next page. Absent on the last page.", schema: { type: "string" } },
+          "Link": { description: "RFC 8288 Web Linking with rel=\"next\" for pagination.", schema: { type: "string" } },
         },
         content: { "application/json": { schema: z.array(epochSchema) } },
       },

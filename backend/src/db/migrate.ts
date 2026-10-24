@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import pg from "pg";
 import { pool } from "./index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -14,10 +15,15 @@ const CREATE_MIGRATIONS_TABLE = `
   );
 `;
 
-async function migrate() {
-  await pool.query(CREATE_MIGRATIONS_TABLE);
+/**
+ * Apply every not-yet-applied migration in `MIGRATIONS_DIR`, in filename
+ * order, each inside its own transaction. Idempotent: already applied
+ * migrations are skipped.
+ */
+export async function applyMigrations(dbPool: pg.Pool): Promise<void> {
+  await dbPool.query(CREATE_MIGRATIONS_TABLE);
 
-  const { rows: applied } = await pool.query<{ name: string }>(
+  const { rows: applied } = await dbPool.query<{ name: string }>(
     "SELECT name FROM migrations ORDER BY id",
   );
   const appliedSet = new Set(applied.map((r) => r.name));
@@ -33,7 +39,7 @@ async function migrate() {
     }
 
     const sql = readFileSync(resolve(MIGRATIONS_DIR, file), "utf8");
-    const client = await pool.connect();
+    const client = await dbPool.connect();
     try {
       await client.query("BEGIN");
       await client.query(sql);
@@ -49,10 +55,57 @@ async function migrate() {
   }
 
   console.log("Migration complete.");
-  await pool.end();
 }
 
-migrate().catch((err) => {
-  console.error("Migration failed:", err);
-  process.exit(1);
-});
+/**
+ * Revert every migration on the database. The migration files ship up-only
+ * SQL, so a full "down" pass drops every view, table and enum type the
+ * migrations created (and the `migrations` table itself). Intended for
+ * schemes/tests that rebuild a schema from scratch — never pointed at data
+ * you intend to keep.
+ */
+export async function revertMigrations(dbPool: pg.Pool): Promise<void> {
+  await dbPool.query(`
+    DO $$
+    DECLARE r RECORD;
+    BEGIN
+      -- Tables first: CASCADE removes their dependent views too.
+      FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'public' LOOP
+        EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', r.tablename);
+      END LOOP;
+      -- Any remaining views (two rounds for view-on-view dependencies).
+      FOR r IN SELECT viewname FROM pg_views WHERE schemaname = 'public' LOOP
+        EXECUTE format('DROP VIEW IF EXISTS public.%I CASCADE', r.viewname);
+      END LOOP;
+      FOR r IN SELECT viewname FROM pg_views WHERE schemaname = 'public' LOOP
+        EXECUTE format('DROP VIEW IF EXISTS public.%I CASCADE', r.viewname);
+      END LOOP;
+      FOR r IN (
+        SELECT t.typname
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'public' AND t.typtype = 'e'
+      ) LOOP
+        EXECUTE format('DROP TYPE IF EXISTS public.%I', r.typname);
+      END LOOP;
+    END
+    $$;
+  `);
+  console.log("Migration revert complete.");
+}
+
+const isDirectScriptRun = (() => {
+  const scriptPath = process.argv[1] ? resolve(process.argv[1]) : null;
+  return scriptPath !== null && scriptPath === fileURLToPath(import.meta.url);
+})();
+
+if (isDirectScriptRun) {
+  applyMigrations(pool)
+    .then(async () => {
+      await pool.end();
+    })
+    .catch((err) => {
+      console.error("Migration failed:", err);
+      process.exit(1);
+    });
+}
