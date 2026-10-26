@@ -287,6 +287,12 @@ export class Indexer {
   lastLedger: number;
   private running = false;
   private lastTickAt: Date | null = null;
+  /**
+   * The tick (or backfill) currently in flight, if any. Tracked so `drain()` can
+   * wait for it to finish before shutdown tears down the database pool it writes
+   * through (#1294).
+   */
+  private inFlightTick: Promise<void> | null = null;
   private readonly vaultFactoryContractId: string;
   private watchedContractIds: Set<string>;
   private vaultService: VaultService;
@@ -346,7 +352,7 @@ export class Indexer {
       if (!this.vaultFactoryContractId) {
         logger.info("Indexer started in state-only mode (no contract ID configured)");
         while (this.running) {
-          await this.tickStateOnly();
+          await this.track(() => this.tickStateOnly());
           await this.sleepWhileRunning(config.indexer.pollIntervalMs);
         }
         return;
@@ -356,12 +362,12 @@ export class Indexer {
       const { sequence: tipLedger } = await withBackoff(() => timedRpcCall("getLatestLedger", () => server.getLatestLedger()));
       const gap = tipLedger - this.lastLedger;
 
-      if (gap > this.currentBatchSize) {
-        await this.backfill(tipLedger);
+      if (gap > config.indexer.batchSize) {
+        await this.track(() => this.backfill(tipLedger));
       }
 
       while (this.running) {
-        await this.tick();
+        await this.track(() => this.tick());
         await this.sleepWhileRunning(config.indexer.pollIntervalMs);
       }
     } catch (err) {
@@ -375,43 +381,34 @@ export class Indexer {
     this.running = false;
   }
 
-  /** Current adaptive ledger batch size (#1213). Exposed for the admin API. */
-  getBatchSize(): number {
-    return this.currentBatchSize;
+  /**
+   * Stop polling and wait for the in-flight tick or backfill to settle (#1294).
+   *
+   * Shutdown drains the indexer before it closes the database pool and job
+   * queue, so a tick that is already mid-flight cannot write through a pool that
+   * has since been ended. Safe to call when nothing is running.
+   */
+  async drain(): Promise<void> {
+    this.stop();
+    const pending = this.inFlightTick;
+    if (pending) await pending;
   }
 
   /**
-   * Adapt the batch size to observed throughput (#1213).
-   *
-   * While catching up the RPC is the bottleneck, so a fast batch (under one
-   * second) signals headroom: after three in a row the batch doubles, capped at
-   * `maxBatchSize`. A slow batch — or a failed/timed-out fetch, which is the
-   * usual symptom of asking for too much at the chain tip — resets the fast
-   * streak and halves the batch, floored at `minBatchSize`.
+   * Run a tick/backfill while exposing it through {@link inFlightTick} so
+   * {@link drain} can await it.
    */
-  private tuneBatchSize(durationMs: number, failed = false): void {
-    if (failed || durationMs >= 1000) {
-      this.consecutiveFastBatches = 0;
-      const shrunk = Math.max(this.minBatchSize, Math.floor(this.currentBatchSize / 2));
-      if (shrunk !== this.currentBatchSize) {
-        logger.info(
-          { from: this.currentBatchSize, to: shrunk, durationMs, failed },
-          "Indexer batch size reduced",
-        );
-      }
-      this.currentBatchSize = shrunk;
-      return;
-    }
-
-    this.consecutiveFastBatches += 1;
-    if (this.consecutiveFastBatches >= 3 && this.currentBatchSize < this.maxBatchSize) {
-      const grown = Math.min(this.maxBatchSize, this.currentBatchSize * 2);
-      logger.info(
-        { from: this.currentBatchSize, to: grown, durationMs },
-        "Indexer batch size increased",
-      );
-      this.currentBatchSize = grown;
-      this.consecutiveFastBatches = 0;
+  private async track<T>(work: () => Promise<T>): Promise<T> {
+    const inFlight = work();
+    const settled = inFlight.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.inFlightTick = settled;
+    try {
+      return await inFlight;
+    } finally {
+      if (this.inFlightTick === settled) this.inFlightTick = null;
     }
   }
 
